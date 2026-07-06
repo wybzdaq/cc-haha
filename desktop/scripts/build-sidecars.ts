@@ -11,7 +11,7 @@ const targetTriple =
   process.env.CARGO_BUILD_TARGET ||
   (await detectHostTriple())
 
-const bunTarget = mapTargetTripleToBun(targetTriple)
+const bunTarget = process.env.SIDECAR_BUN_TARGET || mapTargetTripleToBun(targetTriple)
 
 // 编译前先扫一遍 src/ 把所有缺失的 ant-internal 模块在磁盘上 stub 出来。
 // 见 desktop/scripts/scan-missing-imports.ts。
@@ -132,6 +132,8 @@ async function compileExecutable({
       'fflate',
       'sharp',
       'react-devtools-core',
+      'libsignal',
+      'libsignal/src/curve.js',
     ],
     compile: {
       target: bunTarget,

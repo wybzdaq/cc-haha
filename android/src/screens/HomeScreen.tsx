@@ -1,9 +1,11 @@
 
-import React from 'react'
-import { View, Text, StyleSheet, SafeAreaView, ScrollView } from 'react-native'
+import React, { useEffect, useState } from 'react'
+import { View, Text, StyleSheet, SafeAreaView, ScrollView, ActivityIndicator } from 'react-native'
 import Button from '../components/shared/Button'
 import { useNavigation } from '@react-navigation/native'
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack'
+import { initBaseUrl, testConnection } from '../api/client'
+import { useSessionStore } from '../stores/sessionStore'
 
 type RootStackParamList = {
   Home: undefined
@@ -16,6 +18,41 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Home'>
 
 export default function HomeScreen() {
   const navigation = useNavigation<NavigationProp>()
+  const fetchSessions = useSessionStore((state) => state.fetchSessions)
+  const [autoConnectStatus, setAutoConnectStatus] = useState<'checking' | 'connected' | 'failed'>('checking')
+  const [autoConnectMessage, setAutoConnectMessage] = useState('Connecting to desktop server...')
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function connectOnLaunch() {
+      setAutoConnectStatus('checking')
+      setAutoConnectMessage('Connecting to desktop server...')
+      await initBaseUrl()
+
+      const connected = await testConnection()
+      if (cancelled) return
+
+      if (!connected) {
+        setAutoConnectStatus('failed')
+        setAutoConnectMessage('Desktop server is not reachable. Check the server URL, token, Wi-Fi, and firewall.')
+        return
+      }
+
+      setAutoConnectStatus('connected')
+      setAutoConnectMessage('Connected. Loading sessions...')
+      await fetchSessions()
+      if (!cancelled) {
+        navigation.navigate('SessionList')
+      }
+    }
+
+    void connectOnLaunch()
+
+    return () => {
+      cancelled = true
+    }
+  }, [fetchSessions, navigation])
 
   return (
     <SafeAreaView style={styles.container}>
@@ -24,6 +61,18 @@ export default function HomeScreen() {
         <Text style={styles.subtitle}>Remote AI Assistant</Text>
         
         <View style={styles.buttonContainer}>
+          <View style={styles.statusCard}>
+            {autoConnectStatus === 'checking' ? (
+              <ActivityIndicator size="small" color="#007AFF" />
+            ) : null}
+            <Text style={[
+              styles.statusText,
+              autoConnectStatus === 'connected' && styles.statusConnected,
+              autoConnectStatus === 'failed' && styles.statusFailed,
+            ]}>
+              {autoConnectMessage}
+            </Text>
+          </View>
           <Button
             title="View Sessions"
             onPress={() => navigation.navigate('SessionList')}
@@ -85,6 +134,30 @@ const styles = StyleSheet.create({
   buttonContainer: {
     gap: 16,
     marginBottom: 40,
+  },
+  statusCard: {
+    minHeight: 52,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderWidth: 1,
+    borderColor: '#E2E2E2',
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: '#F8F8F8',
+  },
+  statusText: {
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#666666',
+  },
+  statusConnected: {
+    color: '#248A3D',
+  },
+  statusFailed: {
+    color: '#C7352E',
   },
   primaryButton: {
     backgroundColor: '#007AFF',

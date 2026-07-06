@@ -17,6 +17,8 @@
  * launcher-only 参数。
  */
 
+import fs from 'node:fs'
+import path from 'node:path'
 import { parseLauncherArgs, resolveSidecarInvocation } from './launcherRouting'
 
 const rawArgs = process.argv.slice(2)
@@ -166,14 +168,18 @@ async function runAdapters(rawArgs: string[]): Promise<void> {
   }
 
   if (enableWhatsApp) {
-    const { hasWhatsAppAuth } = await import('../../adapters/whatsapp/session.ts')
-    if (!hasWhatsAppAuth(config.whatsapp.authDir)) {
+    const credsPath = path.join(config.whatsapp.authDir, 'creds.json')
+    if (!fs.existsSync(credsPath)) {
       console.warn(
         '[claude-sidecar] --whatsapp requested but no QR-linked WhatsApp account found in env or ~/.claude/adapters.json — skipping',
       )
     } else {
       console.log('[claude-sidecar] starting WhatsApp adapter')
-      await import('../../adapters/whatsapp/index.ts')
+      const whatsappAdapterPath = ['../../adapters', 'whatsapp/index.ts'].join('/')
+      const importRuntime = Function('specifier', 'return import(specifier)') as (
+        specifier: string,
+      ) => Promise<unknown>
+      await importRuntime(whatsappAdapterPath)
       started += 1
     }
   }

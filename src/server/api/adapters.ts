@@ -5,6 +5,7 @@
  * PUT  /api/adapters  → 更新配置（浅合并），返回更新后的脱敏配置
  */
 
+import * as fs from 'node:fs/promises'
 import { adapterService } from '../services/adapterService.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import {
@@ -12,11 +13,6 @@ import {
   startWechatLoginWithQr,
   WECHAT_DEFAULT_BASE_URL,
 } from '../../../adapters/wechat/protocol.js'
-import {
-  logoutWhatsAppAuth,
-  pollWhatsAppLoginWithQr,
-  startWhatsAppLoginWithQr,
-} from '../../../adapters/whatsapp/protocol.js'
 import { loadConfig } from '../../../adapters/common/config.js'
 
 const ALLOWED_TOP_KEYS = new Set(['serverUrl', 'defaultProjectDir', 'telegram', 'feishu', 'wechat', 'dingtalk', 'whatsapp', 'pairing'])
@@ -241,6 +237,7 @@ async function handleWechatAdaptersApi(req: Request, tail: string[]): Promise<Re
 
 async function handleWhatsAppAdaptersApi(req: Request, tail: string[]): Promise<Response> {
   if (req.method === 'POST' && tail[0] === 'login' && tail[1] === 'start') {
+    const { startWhatsAppLoginWithQr } = await import('../../../adapters/whatsapp/protocol.js')
     const config = loadConfig()
     const result = await startWhatsAppLoginWithQr({
       authDir: config.whatsapp.authDir,
@@ -253,6 +250,7 @@ async function handleWhatsAppAdaptersApi(req: Request, tail: string[]): Promise<
   }
 
   if (req.method === 'POST' && tail[0] === 'login' && tail[1] === 'poll') {
+    const { pollWhatsAppLoginWithQr } = await import('../../../adapters/whatsapp/protocol.js')
     const body = (await req.json()) as { sessionKey?: string }
     if (!body.sessionKey) throw ApiError.badRequest('Missing sessionKey')
     const result = await pollWhatsAppLoginWithQr({ sessionKey: body.sessionKey })
@@ -274,7 +272,7 @@ async function handleWhatsAppAdaptersApi(req: Request, tail: string[]): Promise<
 
   if (req.method === 'POST' && tail[0] === 'unbind') {
     const config = loadConfig()
-    await logoutWhatsAppAuth(config.whatsapp.authDir)
+    await fs.rm(config.whatsapp.authDir, { recursive: true, force: true })
     await adapterService.updateConfig({
       whatsapp: {
         accountJid: undefined,

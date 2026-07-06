@@ -204,6 +204,11 @@ function currentWindow(event: Electron.IpcMainInvokeEvent) {
   return window
 }
 
+function formatDisplayVersion(version: string) {
+  const localLabel = process.env.CC_HAHA_LOCAL_VERSION_LABEL?.trim()
+  return localLabel ? `${version} ${localLabel}` : version
+}
+
 function registerHandler<T>(
   channel: ElectronIpcChannel,
   handler: (event: Electron.IpcMainInvokeEvent, payload: unknown) => T | Promise<T>,
@@ -255,7 +260,7 @@ function registerIpcHandlers() {
   ipcMain.on(ELECTRON_INTERNAL_CHANNELS.previewMessageFromView, (event, raw) => {
     void getPreviewService().sendMessageToRenderer(event.sender, raw, mainWindow?.webContents)
   })
-  registerHandler(ELECTRON_IPC_CHANNELS.appGetVersion, () => app.getVersion())
+  registerHandler(ELECTRON_IPC_CHANNELS.appGetVersion, () => formatDisplayVersion(app.getVersion()))
   registerHandler(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl, () => getServerRuntime().getServerUrl())
   registerHandler(ELECTRON_IPC_CHANNELS.commandInvoke, (_event, payload) => handleCommandInvoke(payload))
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
