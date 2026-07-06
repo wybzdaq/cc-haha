@@ -342,6 +342,12 @@ async function handleUserMessage(
     return
   }
 
+  sendToSessionExcept(sessionId, ws, {
+    type: 'user_message_received',
+    content: message.content,
+    ...(message.attachments ? { attachments: message.attachments } : {}),
+  })
+
   // Send thinking status
   sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
 
@@ -2741,6 +2747,24 @@ export function sendToSession(sessionId: string, message: ServerMessage): boolea
     ws.send(payload)
   }
   return true
+}
+
+function sendToSessionExcept(
+  sessionId: string,
+  except: ServerWebSocket<WebSocketData>,
+  message: ServerMessage,
+): boolean {
+  const clients = activeSessions.get(sessionId)
+  if (!clients || clients.size === 0) return false
+
+  let sent = false
+  const payload = JSON.stringify(message)
+  for (const ws of clients) {
+    if (ws === except) continue
+    ws.send(payload)
+    sent = true
+  }
+  return sent
 }
 
 export function updateSessionSlashCommands(

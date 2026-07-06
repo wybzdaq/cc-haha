@@ -96,6 +96,36 @@ describe('WebSocket handler session isolation', () => {
     expect(cancelComputerUse).not.toHaveBeenCalled()
   })
 
+  it('broadcasts user messages to other clients watching the same session', () => {
+    const sessionId = `remote-user-${crypto.randomUUID()}`
+    const android = makeClientSocket(sessionId)
+    const desktop = makeClientSocket(sessionId)
+    spyOn(conversationService, 'hasSession').mockReturnValue(true)
+    spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'sendMessage').mockReturnValue(true)
+
+    handleWebSocket.open(android)
+    handleWebSocket.open(desktop)
+    android.sent.length = 0
+    desktop.sent.length = 0
+
+    handleWebSocket.message(android, JSON.stringify({
+      type: 'user_message',
+      content: 'hello from Android',
+    }))
+
+    expect(desktop.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'user_message_received',
+      content: 'hello from Android',
+    })
+    expect(android.sent.map((payload) => JSON.parse(payload))).not.toContainEqual({
+      type: 'user_message_received',
+      content: 'hello from Android',
+    })
+  })
+
   it('closes and removes an active client socket when a session is deleted', () => {
     const sessionId = `delete-${crypto.randomUUID()}`
     const ws = makeClientSocket(sessionId)
