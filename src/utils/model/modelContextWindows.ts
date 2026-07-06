@@ -10,19 +10,20 @@ const DIRECT_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'deepseek-v4-flash': 1_000_000,
   'deepseek-chat': 1_000_000,
   'deepseek-reasoner': 1_000_000,
+  'kimi-k2.7-code': 262_144,
+  'kimi-k2.7-code-highspeed': 262_144,
   'kimi-k2.6': 262_144,
   'kimi-k2.5': 262_144,
   'kimi-k2-0905-preview': 262_144,
   'kimi-k2-turbo-preview': 262_144,
   'kimi-k2-thinking': 262_144,
   'kimi-k2-thinking-turbo': 262_144,
+  'minimax-m3': 1_000_000,
   'minimax-m2.7': 204_800,
   'minimax-m2.7-highspeed': 204_800,
-  'minimax-m2.5': 204_800,
-  'minimax-m2.5-highspeed': 204_800,
-  'minimax-m2.1': 204_800,
-  'minimax-m2.1-highspeed': 204_800,
-  'minimax-m2': 204_800,
+  'qwen/qwen3.6-27b': 262_144,
+  'qwen3.6:27b': 262_144,
+  'glm-5.2': 1_000_000,
   'glm-5.1': 200_000,
   'glm-5': 200_000,
   'glm-5-turbo': 200_000,
@@ -40,10 +41,14 @@ const PATTERN_MODEL_CONTEXT_WINDOWS: Array<[RegExp, number]> = [
   [/^openai\/gpt-5(?:[.-]\d+)?\b/i, 400_000],
   [/^google\/gemini-(?:2\.0|2\.5|3)/i, 1_048_576],
   [/^gemini-(?:2\.0|2\.5|3)/i, 1_048_576],
-  [/^qwen\/qwen3\.5-(?:plus|flash)\b/i, 1_000_000],
-  [/^qwen3\.5-(?:plus|flash)\b/i, 1_000_000],
-  [/^qwen\/qwen3-max\b/i, 262_144],
-  [/^qwen3-max\b/i, 262_144],
+  [/^zai-org\/glm-5\.2\b/i, 1_000_000],
+  [/^(?:qwen\/)?qwen3\.7-(?:max|plus)(?:[-.][\w.-]+)?\b/i, 1_000_000],
+  [/^(?:qwen\/)?qwen3\.6-(?:plus|flash)(?:[-.][\w.-]+)?\b/i, 1_000_000],
+  [/^(?:qwen\/)?qwen3\.6-max-preview\b/i, 262_144],
+  [/^(?:qwen\/)?qwen3\.5-(?:plus|flash)(?:[-.][\w.-]+)?\b/i, 1_000_000],
+  [/^(?:qwen\/)?qwen3-max(?:[-.][\w.-]+)?\b/i, 262_144],
+  [/^(?:qwen\/)?qwen3-coder-plus(?:[-.][\w.-]+)?\b/i, 1_000_000],
+  [/^(?:qwen\/)?qwen3-coder-next(?:[-.][\w.-]+)?\b/i, 262_144],
   [/qwen-long/i, 10_000_000],
 ]
 
@@ -65,33 +70,25 @@ function normalizeWindow(value: unknown): number | undefined {
   return value
 }
 
-function parseConfiguredContextWindows(): Record<string, number> {
-  const raw = process.env[MODEL_CONTEXT_WINDOWS_ENV_KEY]
-  if (!raw?.trim()) {
+function normalizeConfiguredContextWindows(parsed: unknown): Record<string, number> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {}
   }
 
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return {}
+  const windows: Record<string, number> = {}
+  for (const [model, value] of Object.entries(parsed)) {
+    const normalized = normalizeWindow(value)
+    if (normalized !== undefined) {
+      windows[normalizeModelContextKey(model)] = normalized
     }
-
-    const windows: Record<string, number> = {}
-    for (const [model, value] of Object.entries(parsed)) {
-      const normalized = normalizeWindow(value)
-      if (normalized !== undefined) {
-        windows[normalizeModelContextKey(model)] = normalized
-      }
-    }
-    return windows
-  } catch {
-    return {}
   }
+  return windows
 }
 
-function getConfiguredModelContextWindow(model: string): number | undefined {
-  const configured = parseConfiguredContextWindows()
+function findConfiguredModelContextWindow(
+  model: string,
+  configured: Record<string, number>,
+): number | undefined {
   const normalizedModel = normalizeModelContextKey(model)
   const exact = configured[normalizedModel]
   if (exact !== undefined) {
@@ -107,6 +104,42 @@ function getConfiguredModelContextWindow(model: string): number | undefined {
     }
   }
   return undefined
+}
+
+export function getModelContextWindowFromEnvValue(
+  model: string,
+  raw: string | undefined,
+): number | undefined {
+  if (!raw?.trim()) {
+    return undefined
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    return findConfiguredModelContextWindow(
+      model,
+      normalizeConfiguredContextWindows(parsed),
+    )
+  } catch {
+    return undefined
+  }
+}
+
+function parseConfiguredContextWindows(): Record<string, number> {
+  const raw = process.env[MODEL_CONTEXT_WINDOWS_ENV_KEY]
+  if (!raw?.trim()) {
+    return {}
+  }
+
+  try {
+    return normalizeConfiguredContextWindows(JSON.parse(raw) as Record<string, unknown>)
+  } catch {
+    return {}
+  }
+}
+
+function getConfiguredModelContextWindow(model: string): number | undefined {
+  return findConfiguredModelContextWindow(model, parseConfiguredContextWindows())
 }
 
 function getBuiltInModelContextWindow(model: string): number | undefined {

@@ -7,7 +7,12 @@ import { anthropicToOpenaiChat } from '../proxy/transform/anthropicToOpenaiChat.
 import { anthropicToOpenaiResponses } from '../proxy/transform/anthropicToOpenaiResponses.js'
 import { openaiChatToAnthropic } from '../proxy/transform/openaiChatToAnthropic.js'
 import { openaiResponsesToAnthropic } from '../proxy/transform/openaiResponsesToAnthropic.js'
+import { stripLeadingBillingHeader } from '../proxy/transform/billingHeader.js'
+import { openaiUsageToAnthropic } from '../proxy/transform/usage.js'
+import { resolvePromptCacheKey } from '../proxy/promptCacheKey.js'
 import type { AnthropicRequest, OpenAIChatResponse, OpenAIResponsesResponse } from '../proxy/transform/types.js'
+
+const BILLING_HEADER = 'x-anthropic-billing-header: cc_version=2.1.92.693; cc_entrypoint=cli; cch=00000;'
 
 // ─── anthropicToOpenaiChat ──────────────────────────────────────
 
@@ -56,6 +61,34 @@ describe('anthropicToOpenaiChat', () => {
     }
     const result = anthropicToOpenaiChat(req)
     expect(result.stop).toEqual(['END', 'STOP'])
+  })
+
+  test('omits Anthropic sampling params by default for OpenAI-compatible providers', () => {
+    const req: AnthropicRequest = {
+      model: 'glm-5.2',
+      max_tokens: 100,
+      temperature: 0.7,
+      top_p: 0.9,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    const result = anthropicToOpenaiChat(req)
+    expect(result.temperature).toBeUndefined()
+    expect(result.top_p).toBeUndefined()
+  })
+
+  test('can explicitly pass sampling params for chat providers that accept them', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4',
+      max_tokens: 100,
+      temperature: 0.7,
+      top_p: 0.9,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    const result = anthropicToOpenaiChat(req, { passSamplingParams: true })
+    expect(result.temperature).toBe(0.7)
+    expect(result.top_p).toBe(0.9)
   })
 
   test('tools conversion', () => {
@@ -139,6 +172,43 @@ describe('anthropicToOpenaiChat', () => {
     expect(anthropicToOpenaiChat(highReq).reasoning_effort).toBe('high')
   })
 
+  test('passes explicit thinking toggle for DeepSeek-compatible chat proxies', () => {
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-flash',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      thinking: { type: 'disabled' },
+    }
+
+    expect(anthropicToOpenaiChat(req).thinking).toBeUndefined()
+    expect(anthropicToOpenaiChat(req, { passThinkingToggle: true }).thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('maps output_config effort to reasoning_effort for OpenAI-compatible chat providers', () => {
+    const req: AnthropicRequest = {
+      model: 'longcat',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'high' },
+    }
+
+    const result = anthropicToOpenaiChat(req)
+    expect(result.reasoning_effort).toBe('high')
+  })
+
+  test('clamps max output_config effort to high for OpenAI-compatible chat providers', () => {
+    const req: AnthropicRequest = {
+      model: 'longcat',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      output_config: { effort: 'max' },
+    }
+
+    const result = anthropicToOpenaiChat(req)
+    expect(result.reasoning_effort).toBe('high')
+  })
+
   test('assistant message with tool_use', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4',
@@ -159,6 +229,32 @@ describe('anthropicToOpenaiChat', () => {
     expect(msg.tool_calls![0].id).toBe('tc_1')
     expect(msg.tool_calls![0].function.name).toBe('get_weather')
     expect(msg.tool_calls![0].function.arguments).toBe('{"city":"NYC"}')
+  })
+
+  test('round-trips assistant thinking as reasoning_content for DeepSeek tool-call history', () => {
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-pro',
+      max_tokens: 100,
+      messages: [{
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'Need the date first. ' },
+          { type: 'thinking', thinking: 'Then call weather.' },
+          { type: 'text', text: 'Let me check that.' },
+          { type: 'tool_use', id: 'call_1', name: 'get_weather', input: { location: 'Hangzhou' } },
+        ],
+      }],
+    }
+
+    const defaultResult = anthropicToOpenaiChat(req)
+    expect(defaultResult.messages[0].reasoning_content).toBeUndefined()
+
+    const result = anthropicToOpenaiChat(req, { roundTripReasoningContent: true })
+    const msg = result.messages[0]
+    expect(msg.role).toBe('assistant')
+    expect(msg.content).toBe('Let me check that.')
+    expect(msg.reasoning_content).toBe('Need the date first. Then call weather.')
+    expect(msg.tool_calls?.[0].id).toBe('call_1')
   })
 
   test('user message with tool_result', () => {
@@ -193,6 +289,26 @@ describe('anthropicToOpenaiChat', () => {
     const content = result.messages[0].content as Array<{ type: string; image_url?: { url: string } }>
     expect(content[0].type).toBe('image_url')
     expect(content[0].image_url!.url).toBe('data:image/png;base64,abc123')
+  })
+
+  test('text-only chat endpoints omit image payloads instead of emitting image_url parts', () => {
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-pro',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is in this screenshot?' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+        ],
+      }],
+    }
+    const result = anthropicToOpenaiChat(req, { imageContentMode: 'text_only' })
+    expect(result.messages[0].content).toBe(
+      'What is in this screenshot?\n[Image omitted: this OpenAI-compatible chat endpoint only supports text content.]',
+    )
+    expect(JSON.stringify(result)).not.toContain('image_url')
+    expect(JSON.stringify(result)).not.toContain('abc123')
   })
 })
 
@@ -344,6 +460,34 @@ describe('anthropicToOpenaiResponses', () => {
     expect(result.input).toEqual([{ type: 'message', role: 'user', content: 'Hello' }])
   })
 
+  test('omits Anthropic sampling params by default for Responses-compatible providers', () => {
+    const req: AnthropicRequest = {
+      model: 'glm-5.2',
+      max_tokens: 100,
+      temperature: 0.7,
+      top_p: 0.9,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.temperature).toBeUndefined()
+    expect(result.top_p).toBeUndefined()
+  })
+
+  test('can explicitly pass sampling params for Responses providers that accept them', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4o',
+      max_tokens: 100,
+      temperature: 0.7,
+      top_p: 0.9,
+      messages: [{ role: 'user', content: 'Hi' }],
+    }
+
+    const result = anthropicToOpenaiResponses(req, { passSamplingParams: true })
+    expect(result.temperature).toBe(0.7)
+    expect(result.top_p).toBe(0.9)
+  })
+
   test('tools conversion uses top-level name', () => {
     const req: AnthropicRequest = {
       model: 'gpt-4o',
@@ -413,6 +557,31 @@ describe('anthropicToOpenaiResponses', () => {
       messages: [{ role: 'user', content: 'Hi' }],
       thinking: { type: 'enabled', budget_tokens: 10000 },
     }
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.reasoning).toEqual({ effort: 'high' })
+  })
+
+  test('output_config effort → reasoning effort', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.5',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'high' },
+    }
+
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.reasoning).toEqual({ effort: 'high' })
+  })
+
+  test('clamps max output_config effort for Responses API', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.5',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'Hi' }],
+      output_config: { effort: 'max' },
+    }
+
     const result = anthropicToOpenaiResponses(req)
     expect(result.reasoning).toEqual({ effort: 'high' })
   })
@@ -549,5 +718,257 @@ describe('openaiResponsesToAnthropic', () => {
     }
     const result = openaiResponsesToAnthropic(res, 'gpt-4o')
     expect(result.content).toEqual([{ type: 'text', text: '' }])
+  })
+})
+
+// ─── stripLeadingBillingHeader ──────────────────────────────────
+
+describe('stripLeadingBillingHeader', () => {
+  test('returns text unchanged when no billing header prefix', () => {
+    expect(stripLeadingBillingHeader('You are helpful')).toBe('You are helpful')
+  })
+
+  test('strips a single-line billing header to empty string', () => {
+    expect(stripLeadingBillingHeader(BILLING_HEADER)).toBe('')
+  })
+
+  test('strips leading header line and its blank separator', () => {
+    expect(stripLeadingBillingHeader(`${BILLING_HEADER}\n\nYou are helpful`)).toBe('You are helpful')
+  })
+
+  test('strips leading header line followed directly by text', () => {
+    expect(stripLeadingBillingHeader(`${BILLING_HEADER}\nYou are helpful`)).toBe('You are helpful')
+  })
+
+  test('handles CRLF line endings', () => {
+    expect(stripLeadingBillingHeader(`${BILLING_HEADER}\r\n\r\nYou are helpful`)).toBe('You are helpful')
+  })
+
+  test('keeps later occurrences inside user-authored text', () => {
+    const text = `You are helpful.\n${BILLING_HEADER}`
+    expect(stripLeadingBillingHeader(text)).toBe(text)
+  })
+})
+
+// ─── resolvePromptCacheKey ──────────────────────────────────────
+
+describe('resolvePromptCacheKey', () => {
+  const baseRequest = (metadata?: AnthropicRequest['metadata']): AnthropicRequest => ({
+    model: 'gpt-5.4',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'hi' }],
+    ...(metadata ? { metadata } : {}),
+  })
+
+  test('extracts session suffix from metadata.user_id', () => {
+    const body = baseRequest({ user_id: 'user_3f7a_account_9b2c_session_sess-42aa' })
+    expect(resolvePromptCacheKey(body)).toBe('sess-42aa')
+  })
+
+  test('falls back to metadata.session_id', () => {
+    const body = baseRequest({ session_id: 'direct-session-id' })
+    expect(resolvePromptCacheKey(body)).toBe('direct-session-id')
+  })
+
+  test('falls back to the CLI session header', () => {
+    expect(resolvePromptCacheKey(baseRequest(), ' header-session ')).toBe('header-session')
+  })
+
+  test('prefers user_id session over session_id and header', () => {
+    const body = baseRequest({ user_id: 'user_x_session_from-user-id', session_id: 'from-metadata' })
+    expect(resolvePromptCacheKey(body, 'from-header')).toBe('from-user-id')
+  })
+
+  test('returns undefined without any client session identity', () => {
+    expect(resolvePromptCacheKey(baseRequest())).toBeUndefined()
+    expect(resolvePromptCacheKey(baseRequest(), '   ')).toBeUndefined()
+    expect(resolvePromptCacheKey(baseRequest({ user_id: 'user_without_marker' }))).toBeUndefined()
+  })
+
+  test('ignores empty session suffix in user_id', () => {
+    expect(resolvePromptCacheKey(baseRequest({ user_id: 'user_x_session_' }))).toBeUndefined()
+  })
+})
+
+// ─── openaiUsageToAnthropic ─────────────────────────────────────
+
+describe('openaiUsageToAnthropic', () => {
+  test('maps Responses-style cached tokens and excludes them from input', () => {
+    const usage = openaiUsageToAnthropic({
+      input_tokens: 100,
+      output_tokens: 5,
+      input_tokens_details: { cached_tokens: 80 },
+    })
+    expect(usage).toEqual({ input_tokens: 20, output_tokens: 5, cache_read_input_tokens: 80 })
+  })
+
+  test('maps Chat-style cached tokens as fallback', () => {
+    const usage = openaiUsageToAnthropic({
+      prompt_tokens: 100,
+      completion_tokens: 5,
+      prompt_tokens_details: { cached_tokens: 30 },
+    })
+    expect(usage).toEqual({ input_tokens: 70, output_tokens: 5, cache_read_input_tokens: 30 })
+  })
+
+  test('prefers direct Anthropic-style cache fields over nested details', () => {
+    const usage = openaiUsageToAnthropic({
+      input_tokens: 100,
+      output_tokens: 5,
+      input_tokens_details: { cached_tokens: 80 },
+      cache_read_input_tokens: 60,
+      cache_creation_input_tokens: 10,
+    })
+    expect(usage).toEqual({
+      input_tokens: 30,
+      output_tokens: 5,
+      cache_read_input_tokens: 60,
+      cache_creation_input_tokens: 10,
+    })
+  })
+
+  test('leaves input untouched and omits cache fields without cache activity', () => {
+    expect(openaiUsageToAnthropic({ input_tokens: 10, output_tokens: 5 }))
+      .toEqual({ input_tokens: 10, output_tokens: 5 })
+  })
+
+  test('clamps input at zero when cached exceeds reported input', () => {
+    const usage = openaiUsageToAnthropic({
+      input_tokens: 50,
+      output_tokens: 5,
+      input_tokens_details: { cached_tokens: 80 },
+    })
+    expect(usage.input_tokens).toBe(0)
+    expect(usage.cache_read_input_tokens).toBe(80)
+  })
+
+  test('returns zeros for missing usage', () => {
+    expect(openaiUsageToAnthropic(undefined)).toEqual({ input_tokens: 0, output_tokens: 0 })
+  })
+})
+
+// ─── prompt caching semantics in request transforms ─────────────
+
+describe('prompt caching semantics', () => {
+  test('responses transform strips leading billing header from system array', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.4',
+      max_tokens: 64,
+      system: [
+        { type: 'text', text: BILLING_HEADER },
+        { type: 'text', text: 'You are helpful' },
+      ],
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.instructions).toBe('You are helpful')
+  })
+
+  test('responses transform strips leading billing header from system string', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.4',
+      max_tokens: 64,
+      system: `${BILLING_HEADER}\n\nYou are helpful`,
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.instructions).toBe('You are helpful')
+  })
+
+  test('responses transform omits instructions when system is only a billing header', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.4',
+      max_tokens: 64,
+      system: [{ type: 'text', text: BILLING_HEADER }],
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const result = anthropicToOpenaiResponses(req)
+    expect(result.instructions).toBeUndefined()
+  })
+
+  test('responses transform injects prompt_cache_key when provided', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-5.4',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    expect(anthropicToOpenaiResponses(req, { cacheKey: 'sess-1' }).prompt_cache_key).toBe('sess-1')
+    expect(anthropicToOpenaiResponses(req).prompt_cache_key).toBeUndefined()
+  })
+
+  test('chat transform strips leading billing header from system', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4',
+      max_tokens: 64,
+      system: [
+        { type: 'text', text: BILLING_HEADER },
+        { type: 'text', text: 'You are helpful' },
+      ],
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const result = anthropicToOpenaiChat(req)
+    expect(result.messages[0]).toEqual({ role: 'system', content: 'You are helpful' })
+  })
+
+  test('chat transform omits system message when system is only a billing header', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4',
+      max_tokens: 64,
+      system: BILLING_HEADER,
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const result = anthropicToOpenaiChat(req)
+    expect(result.messages[0]).toEqual({ role: 'user', content: 'hi' })
+  })
+
+  test('chat transform requests stream usage explicitly', () => {
+    const req: AnthropicRequest = {
+      model: 'gpt-4',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    expect(anthropicToOpenaiChat(req, {}).stream_options).toBeUndefined()
+    expect(anthropicToOpenaiChat({ ...req, stream: true }).stream_options).toEqual({ include_usage: true })
+  })
+
+  test('responses non-streaming maps cached tokens into Anthropic usage', () => {
+    const res: OpenAIResponsesResponse = {
+      id: 'resp_cache',
+      object: 'response',
+      created_at: 0,
+      model: 'gpt-5.4',
+      status: 'completed',
+      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] }],
+      usage: {
+        input_tokens: 1200,
+        output_tokens: 40,
+        input_tokens_details: { cached_tokens: 1000 },
+      },
+    }
+    const result = openaiResponsesToAnthropic(res, 'gpt-5.4')
+    expect(result.usage).toEqual({
+      input_tokens: 200,
+      output_tokens: 40,
+      cache_read_input_tokens: 1000,
+    })
+  })
+
+  test('chat non-streaming subtracts cached tokens from input', () => {
+    const res: OpenAIChatResponse = {
+      id: 'x', object: 'chat.completion', created: 0, model: 'gpt-4',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        prompt_tokens_details: { cached_tokens: 80 },
+      },
+    }
+    const result = openaiChatToAnthropic(res, 'gpt-4')
+    expect(result.usage).toEqual({
+      input_tokens: 20,
+      output_tokens: 50,
+      cache_read_input_tokens: 80,
+    })
   })
 })

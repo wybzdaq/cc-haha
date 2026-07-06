@@ -13,7 +13,7 @@
  * plugins active).
  */
 
-import { dirname, join } from 'path'
+import { dirname, join, resolve, sep } from 'path'
 import { logForDebugging } from '../debug.js'
 import { errorMessage, isENOENT, toError } from '../errors.js'
 import { getFsImplementation } from '../fsOperations.js'
@@ -304,6 +304,35 @@ function migrateV1ToV2(v1Data: InstalledPluginsFileV1): InstalledPluginsFileV2 {
   return { version: 2, plugins: v2Plugins }
 }
 
+function normalizePortableInstallPaths(
+  data: InstalledPluginsFileV2,
+): { data: InstalledPluginsFileV2; changed: boolean } {
+  const fs = getFsImplementation()
+  let changed = false
+  const plugins: InstalledPluginsMapV2 = {}
+
+  for (const [pluginId, entries] of Object.entries(data.plugins)) {
+    plugins[pluginId] = entries.map(entry => {
+      const expectedPath = getVersionedCachePath(pluginId, entry.version)
+      if (resolve(entry.installPath) === resolve(expectedPath)) {
+        return entry
+      }
+
+      if (!fs.existsSync(expectedPath)) {
+        return entry
+      }
+
+      changed = true
+      return {
+        ...entry,
+        installPath: expectedPath,
+      }
+    })
+  }
+
+  return changed ? { data: { ...data, plugins }, changed } : { data, changed }
+}
+
 /**
  * Load installed plugins in V2 format.
  *
@@ -327,16 +356,23 @@ export function loadInstalledPluginsV2(): InstalledPluginsFileV2 {
       if (rawData.version === 2) {
         // V2 format - validate and return
         const validated = InstalledPluginsFileSchemaV2().parse(rawData.data)
-        installedPluginsCacheV2 = validated
+        const normalized = normalizePortableInstallPaths(validated)
+        if (normalized.changed) {
+          saveInstalledPluginsV2(normalized.data)
+          logForDebugging(
+            `Rebased installed plugin cache paths under ${getPluginsDirectory()}`,
+          )
+        }
+        installedPluginsCacheV2 = normalized.data
         logForDebugging(
-          `Loaded ${Object.keys(validated.plugins).length} installed plugins from ${filePath}`,
+          `Loaded ${Object.keys(normalized.data.plugins).length} installed plugins from ${filePath}`,
         )
-        return validated
+        return normalized.data
       }
 
       // V1 format - convert to V2
       const v1Validated = InstalledPluginsFileSchemaV1().parse(rawData.data)
-      const v2Data = migrateV1ToV2(v1Validated)
+      const v2Data = normalizePortableInstallPaths(migrateV1ToV2(v1Validated)).data
       installedPluginsCacheV2 = v2Data
       logForDebugging(
         `Loaded and converted ${Object.keys(v1Validated.plugins).length} plugins from V1 format`,
@@ -506,11 +542,13 @@ export function loadInstalledPluginsFromDisk(): InstalledPluginsFileV2 {
 
     if (rawData) {
       if (rawData.version === 2) {
-        return InstalledPluginsFileSchemaV2().parse(rawData.data)
+        return normalizePortableInstallPaths(
+          InstalledPluginsFileSchemaV2().parse(rawData.data),
+        ).data
       }
       // V1 format - convert to V2
       const v1Data = InstalledPluginsFileSchemaV1().parse(rawData.data)
-      return migrateV1ToV2(v1Data)
+      return normalizePortableInstallPaths(migrateV1ToV2(v1Data)).data
     }
 
     return { version: 2, plugins: {} }
@@ -962,10 +1000,24 @@ export function removeInstalledPlugin(
  */
 export { getGitCommitSha }
 
+function assertPluginCacheDeletionPath(installPath: string): void {
+  const cachePath = resolve(getPluginCachePath())
+  const resolvedInstallPath = resolve(installPath)
+  if (
+    resolvedInstallPath === cachePath ||
+    !resolvedInstallPath.startsWith(cachePath + sep)
+  ) {
+    throw new Error(
+      `Refusing to delete plugin cache outside managed cache directory: ${installPath}`,
+    )
+  }
+}
+
 export function deletePluginCache(installPath: string): void {
   const fs = getFsImplementation()
 
   try {
+    assertPluginCacheDeletionPath(installPath)
     fs.rmSync(installPath, { recursive: true, force: true })
     logForDebugging(`Deleted plugin cache at ${installPath}`)
 

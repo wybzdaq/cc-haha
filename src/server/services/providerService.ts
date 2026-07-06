@@ -10,18 +10,37 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { ApiError } from '../middleware/errorHandler.js'
-import { normalizeJsonObject, readRecoverableJsonFile } from './recoverableJsonFile.js'
+import { readRecoverableJsonFile } from './recoverableJsonFile.js'
+import { ManagedSettingsService } from './managedSettingsService.js'
 import { anthropicToOpenaiChat } from '../proxy/transform/anthropicToOpenaiChat.js'
 import { anthropicToOpenaiResponses } from '../proxy/transform/anthropicToOpenaiResponses.js'
 import { openaiChatToAnthropic } from '../proxy/transform/openaiChatToAnthropic.js'
 import { openaiResponsesToAnthropic } from '../proxy/transform/openaiResponsesToAnthropic.js'
 import type { AnthropicRequest, AnthropicResponse } from '../proxy/transform/types.js'
-import { PROVIDER_PRESETS } from '../config/providerPresets.js'
-import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
+import {
+  OPENAI_OFFICIAL_PROVIDER,
+  isOpenAIOfficialProviderId,
+} from './openaiOfficialProvider.js'
+import { hahaOpenAIOAuthService } from './hahaOpenAIOAuthService.js'
 import {
   CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   ensurePersistentStorageUpgraded,
 } from './persistentStorageMigrations.js'
+import {
+  buildProviderAuthEnv,
+  buildProviderManagedEnv,
+  getManagedEnvKeys,
+  getPresetAuthStrategy,
+  getPresetDefaultEnv,
+  normalizeModelMapping,
+  normalizeProvidersIndex,
+} from './providerRuntimeEnv.js'
+import {
+  getNetworkProxyFetchOptions,
+  loadNetworkSettings,
+  type NetworkSettings,
+} from './networkSettings.js'
+import { normalizeModelStringForAPI } from '../../utils/model/model.js'
 import type {
   SavedProvider,
   ProvidersIndex,
@@ -33,144 +52,81 @@ import type {
   ApiFormat,
   ProviderAuthStrategy,
 } from '../types/provider.js'
-
-const MANAGED_ENV_KEYS = [
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
-  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
-  MODEL_CONTEXT_WINDOWS_ENV_KEY,
-] as const
-
-const CUSTOM_PROVIDER_MODEL_CAPABILITIES = 'thinking,effort,adaptive_thinking,max_effort'
+import {
+  BUILT_IN_PROVIDER_IDS,
+} from '../types/provider.js'
 
 const DEFAULT_INDEX: ProvidersIndex = {
   schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   activeId: null,
   providers: [],
-}
-const AUTH_ENV_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'])
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value)
+  providerOrder: [...BUILT_IN_PROVIDER_IDS],
 }
 
-function isProviderModels(value: unknown): value is SavedProvider['models'] {
+function isPermutation(candidateIds: string[], expectedIds: string[]): boolean {
+  const expectedSet = new Set(expectedIds)
+  const candidateSet = new Set(candidateIds)
   return (
-    isRecord(value) &&
-    typeof value.main === 'string' &&
-    typeof value.haiku === 'string' &&
-    typeof value.sonnet === 'string' &&
-    typeof value.opus === 'string'
+    candidateIds.length === expectedIds.length &&
+    candidateSet.size === candidateIds.length &&
+    expectedIds.every((id) => candidateSet.has(id)) &&
+    candidateIds.every((id) => expectedSet.has(id))
   )
 }
 
-function isSavedProvider(value: unknown): value is SavedProvider {
-  if (!isRecord(value)) return false
-  return (
-    typeof value.id === 'string' &&
-    typeof value.presetId === 'string' &&
-    typeof value.name === 'string' &&
-    typeof value.apiKey === 'string' &&
-    typeof value.baseUrl === 'string' &&
-    isProviderModels(value.models)
+function savedProviderIds(providers: SavedProvider[]): string[] {
+  return providers.map((provider) => provider.id)
+}
+
+function fullProviderOrderIds(providers: SavedProvider[]): string[] {
+  return [
+    ...savedProviderIds(providers),
+    ...BUILT_IN_PROVIDER_IDS,
+  ]
+}
+
+function sortSavedProvidersByOrder(providers: SavedProvider[], providerOrder: string[]): SavedProvider[] {
+  const byId = new Map(providers.map((provider) => [provider.id, provider]))
+  return providerOrder
+    .map((id) => byId.get(id))
+    .filter((provider): provider is SavedProvider => provider !== undefined)
+}
+
+function mergeSavedOrderIntoDisplayOrder(providerOrder: string[], savedOrder: string[]): string[] {
+  const savedSet = new Set(savedOrder)
+  const queue = [...savedOrder]
+  return providerOrder.map((id) => {
+    if (!savedSet.has(id)) return id
+    return queue.shift() ?? id
+  })
+}
+
+function appendNewProviderToOrder(providerOrder: string[], providerId: string, existingProviders: SavedProvider[]): string[] {
+  const existingProviderIds = new Set(existingProviders.map((provider) => provider.id))
+  const lastSavedIndex = providerOrder.reduce(
+    (latest, id, index) => existingProviderIds.has(id) ? index : latest,
+    -1,
   )
-}
-
-function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
-  if (!isRecord(value) || !Array.isArray(value.providers)) {
-    return null
+  if (lastSavedIndex !== -1) {
+    return [
+      ...providerOrder.slice(0, lastSavedIndex + 1),
+      providerId,
+      ...providerOrder.slice(lastSavedIndex + 1),
+    ]
   }
 
-  const { activeProviderId: _legacyActiveProviderId, ...rest } = value
-  const providers = value.providers.filter(isSavedProvider)
-  const rawActiveId =
-    typeof value.activeId === 'string'
-      ? value.activeId
-      : typeof _legacyActiveProviderId === 'string'
-        ? _legacyActiveProviderId
-        : null
-  const activeId = rawActiveId && providers.some((provider) => provider.id === rawActiveId)
-    ? rawActiveId
-    : null
-
-  return {
-    ...rest,
-    schemaVersion: CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
-    activeId,
-    providers,
-  }
-}
-
-function getPresetDefaultEnv(presetId: string): Record<string, string> {
-  return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.defaultEnv ?? {}
-}
-
-function omitAuthEnv(env: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(env).filter(([key]) => !AUTH_ENV_KEYS.has(key.toUpperCase())),
-  )
-}
-
-function getPresetAuthStrategy(presetId: string): ProviderAuthStrategy {
-  return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.authStrategy ?? 'auth_token'
-}
-
-function getPresetModelContextWindows(presetId: string): Record<string, number> {
-  return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.modelContextWindows ?? {}
-}
-
-function buildProviderAuthEnv(
-  provider: SavedProvider,
-  presetDefaultEnv: Record<string, string>,
-  needsProxy: boolean,
-): Record<string, string> {
-  if (needsProxy) {
-    return { ANTHROPIC_API_KEY: 'proxy-managed' }
-  }
-
-  const strategy = provider.authStrategy ?? getPresetAuthStrategy(provider.presetId)
-  const key = provider.apiKey || presetDefaultEnv.ANTHROPIC_AUTH_TOKEN || presetDefaultEnv.ANTHROPIC_API_KEY || ''
-
-  switch (strategy) {
-    case 'api_key':
-      return key ? { ANTHROPIC_API_KEY: key } : {}
-    case 'auth_token':
-      return {
-        ANTHROPIC_API_KEY: '',
-        ...(key ? { ANTHROPIC_AUTH_TOKEN: key } : {}),
-      }
-    case 'auth_token_empty_api_key':
-      return {
-        ANTHROPIC_API_KEY: '',
-        ...(key ? { ANTHROPIC_AUTH_TOKEN: key } : {}),
-      }
-    case 'dual_same_token':
-      return key ? { ANTHROPIC_API_KEY: key, ANTHROPIC_AUTH_TOKEN: key } : {}
-    case 'dual_dummy':
-      return { ANTHROPIC_API_KEY: 'dummy', ANTHROPIC_AUTH_TOKEN: 'dummy' }
-  }
-}
-
-function getManagedEnvKeys(): string[] {
-  const keys = new Set<string>(MANAGED_ENV_KEYS)
-  for (const preset of PROVIDER_PRESETS) {
-    for (const key of Object.keys(preset.defaultEnv ?? {})) {
-      keys.add(key)
-    }
-  }
-  return [...keys]
+  const firstBuiltInIndex = providerOrder.findIndex((id) => BUILT_IN_PROVIDER_IDS.includes(id as typeof BUILT_IN_PROVIDER_IDS[number]))
+  if (firstBuiltInIndex === -1) return [...providerOrder, providerId]
+  return [
+    ...providerOrder.slice(0, firstBuiltInIndex),
+    providerId,
+    ...providerOrder.slice(firstBuiltInIndex),
+  ]
 }
 
 export class ProviderService {
   private static serverPort = 3456
+  private managedSettingsService = new ManagedSettingsService()
 
   static setServerPort(port: number): void {
     ProviderService.serverPort = port
@@ -189,10 +145,6 @@ export class ProviderService {
 
   private getIndexPath(): string {
     return path.join(this.getCcHahaDir(), 'providers.json')
-  }
-
-  private getSettingsPath(): string {
-    return path.join(this.getCcHahaDir(), 'settings.json')
   }
 
   private async readIndex(): Promise<ProvidersIndex> {
@@ -221,28 +173,7 @@ export class ProviderService {
   }
 
   private async readSettings(): Promise<Record<string, unknown>> {
-    await ensurePersistentStorageUpgraded()
-    return readRecoverableJsonFile({
-      filePath: this.getSettingsPath(),
-      label: 'cc-haha managed settings',
-      defaultValue: {},
-      normalize: normalizeJsonObject,
-    })
-  }
-
-  private async writeSettings(settings: Record<string, unknown>): Promise<void> {
-    const filePath = this.getSettingsPath()
-    const dir = path.dirname(filePath)
-    await fs.mkdir(dir, { recursive: true })
-
-    const tmpFile = `${filePath}.tmp.${Date.now()}`
-    try {
-      await fs.writeFile(tmpFile, JSON.stringify(settings, null, 2) + '\n', 'utf-8')
-      await fs.rename(tmpFile, filePath)
-    } catch (err) {
-      await fs.unlink(tmpFile).catch(() => {})
-      throw ApiError.internal(`Failed to write settings.json: ${err}`)
-    }
+    return this.managedSettingsService.readSettings()
   }
 
   async getManagedSettings(): Promise<Record<string, unknown>> {
@@ -250,18 +181,28 @@ export class ProviderService {
   }
 
   async updateManagedSettings(settings: Record<string, unknown>): Promise<void> {
-    const current = await this.readSettings()
-    await this.writeSettings(Object.assign({}, current, settings))
+    await this.managedSettingsService.updateSettings((current) => ({
+      settings: Object.assign({}, current, settings),
+      result: undefined,
+    }))
   }
 
   // --- CRUD ---
 
-  async listProviders(): Promise<{ providers: SavedProvider[]; activeId: string | null }> {
+  async listProviders(): Promise<{ providers: SavedProvider[]; activeId: string | null; providerOrder: string[] }> {
     const index = await this.readIndex()
-    return { providers: index.providers, activeId: index.activeId }
+    return {
+      providers: index.providers,
+      activeId: index.activeId,
+      providerOrder: index.providerOrder,
+    }
   }
 
   async getProvider(id: string): Promise<SavedProvider> {
+    if (isOpenAIOfficialProviderId(id)) {
+      return OPENAI_OFFICIAL_PROVIDER
+    }
+
     const index = await this.readIndex()
     const provider = index.providers.find((p) => p.id === id)
     if (!provider) throw ApiError.notFound(`Provider not found: ${id}`)
@@ -279,12 +220,17 @@ export class ProviderService {
       ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
       baseUrl: input.baseUrl,
       apiFormat: input.apiFormat ?? 'anthropic',
-      models: input.models,
+      runtimeKind: input.runtimeKind ?? 'anthropic_compatible',
+      models: normalizeModelMapping(input.models),
+      ...(input.model1mSupport !== undefined && { model1mSupport: input.model1mSupport }),
       ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
+      toolSearchEnabled: input.toolSearchEnabled ?? true,
+      ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
 
+    index.providerOrder = appendNewProviderToOrder(index.providerOrder, provider.id, index.providers)
     index.providers.push(provider)
     await this.writeIndex(index)
     return provider
@@ -303,16 +249,26 @@ export class ProviderService {
       ...(input.authStrategy !== undefined && { authStrategy: input.authStrategy }),
       ...(input.baseUrl !== undefined && { baseUrl: input.baseUrl }),
       ...(input.apiFormat !== undefined && { apiFormat: input.apiFormat }),
-      ...(input.models !== undefined && { models: input.models }),
+      ...(input.runtimeKind !== undefined && { runtimeKind: input.runtimeKind }),
+      ...(input.models !== undefined && { models: normalizeModelMapping(input.models) }),
+      ...(input.model1mSupport !== undefined && input.model1mSupport !== null && { model1mSupport: input.model1mSupport }),
       ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
+      ...(input.toolSearchEnabled !== undefined && { toolSearchEnabled: input.toolSearchEnabled }),
+      ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
       ...(input.notes !== undefined && { notes: input.notes }),
+    }
+    if (input.model1mSupport === null) {
+      delete updated.model1mSupport
     }
     if (input.autoCompactWindow === null) {
       delete updated.autoCompactWindow
     }
     if (input.modelContextWindows === null) {
       delete updated.modelContextWindows
+    }
+    if (input.disableExperimentalBetas === false) {
+      delete updated.disableExperimentalBetas
     }
 
     index.providers[idx] = updated
@@ -335,20 +291,56 @@ export class ProviderService {
     }
 
     index.providers.splice(idx, 1)
+    index.providerOrder = index.providerOrder.filter((providerId) => providerId !== id)
     await this.writeIndex(index)
+  }
+
+  /**
+   * Reorder providers to match the given display id order.
+   *
+   * New clients send a full display-order permutation including the built-in
+   * official providers. Legacy clients may still send only saved provider ids;
+   * in that case the saved providers are reordered inside the current display
+   * order without moving the built-in official rows.
+   */
+  async reorderProviders(orderedIds: string[]): Promise<{ providers: SavedProvider[]; providerOrder: string[] }> {
+    const index = await this.readIndex()
+
+    const currentSavedIds = savedProviderIds(index.providers)
+    const isFullDisplayPermutation = isPermutation(orderedIds, fullProviderOrderIds(index.providers))
+    const isLegacySavedPermutation = isPermutation(orderedIds, currentSavedIds)
+
+    if (!isFullDisplayPermutation && !isLegacySavedPermutation) {
+      throw ApiError.badRequest('orderedIds must be a permutation of existing provider ids and built-in provider ids')
+    }
+
+    index.providerOrder = isFullDisplayPermutation
+      ? orderedIds
+      : mergeSavedOrderIntoDisplayOrder(index.providerOrder, orderedIds)
+    index.providers = sortSavedProvidersByOrder(index.providers, index.providerOrder)
+    await this.writeIndex(index)
+
+    return {
+      providers: index.providers,
+      providerOrder: index.providerOrder,
+    }
   }
 
   // --- Activation ---
 
   async activateProvider(id: string): Promise<void> {
     const index = await this.readIndex()
-    const provider = index.providers.find((p) => p.id === id)
+    const provider = isOpenAIOfficialProviderId(id)
+      ? OPENAI_OFFICIAL_PROVIDER
+      : index.providers.find((p) => p.id === id)
     if (!provider) throw ApiError.notFound(`Provider not found: ${id}`)
 
     index.activeId = id
     await this.writeIndex(index)
 
-    if (provider.presetId === 'official') {
+    if (provider.runtimeKind === 'openai_oauth') {
+      await this.syncToSettings(provider)
+    } else if (provider.presetId === 'official') {
       await this.clearProviderFromSettings()
     } else {
       await this.syncToSettings(provider)
@@ -368,43 +360,10 @@ export class ProviderService {
     provider: SavedProvider,
     options?: { proxyPath?: string },
   ): Record<string, string> {
-    const needsProxy = provider.apiFormat != null && provider.apiFormat !== 'anthropic'
-    const proxyPath = options?.proxyPath ?? '/proxy'
-    const baseUrl = needsProxy
-      ? `http://127.0.0.1:${ProviderService.serverPort}${proxyPath}`
-      : provider.baseUrl
-
-    const modelContextWindows = {
-      ...getPresetModelContextWindows(provider.presetId),
-      ...(provider.modelContextWindows ?? {}),
-    }
-
-    const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
-    const customProviderCapabilityEnv =
-      provider.presetId === 'custom'
-        ? {
-            ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: CUSTOM_PROVIDER_MODEL_CAPABILITIES,
-            ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: CUSTOM_PROVIDER_MODEL_CAPABILITIES,
-            ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: CUSTOM_PROVIDER_MODEL_CAPABILITIES,
-          }
-        : {}
-
-    return {
-      ...omitAuthEnv(presetDefaultEnv),
-      ...customProviderCapabilityEnv,
-      ...(provider.autoCompactWindow !== undefined && {
-        CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(provider.autoCompactWindow),
-      }),
-      ...(Object.keys(modelContextWindows).length > 0 && {
-        [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows),
-      }),
-      ANTHROPIC_BASE_URL: baseUrl,
-      ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
-      ANTHROPIC_MODEL: provider.models.main,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.models.haiku,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: provider.models.sonnet,
-      ANTHROPIC_DEFAULT_OPUS_MODEL: provider.models.opus,
-    }
+    return buildProviderManagedEnv(provider, {
+      proxyPath: options?.proxyPath,
+      serverPort: ProviderService.serverPort,
+    })
   }
 
   async getProviderRuntimeEnv(id: string): Promise<Record<string, string>> {
@@ -415,36 +374,50 @@ export class ProviderService {
   }
 
   private async syncToSettings(provider: SavedProvider): Promise<void> {
-    const settings = await this.readSettings()
-    const existingEnv = (settings.env as Record<string, string>) || {}
-    const cleanedEnv = { ...existingEnv }
+    await this.managedSettingsService.updateSettings((settings) => {
+      const existingEnv = (settings.env as Record<string, string>) || {}
+      const cleanedEnv = { ...existingEnv }
 
-    for (const key of getManagedEnvKeys()) {
-      delete cleanedEnv[key]
-    }
+      for (const key of getManagedEnvKeys()) {
+        delete cleanedEnv[key]
+      }
 
-    settings.env = {
-      ...cleanedEnv,
-      ...this.buildManagedEnv(provider),
-    }
-
-    await this.writeSettings(settings)
+      return {
+        settings: {
+          ...settings,
+          env: {
+            ...cleanedEnv,
+            ...this.buildManagedEnv(provider),
+          },
+        },
+        result: undefined,
+      }
+    })
   }
 
   private async clearProviderFromSettings(): Promise<void> {
-    const settings = await this.readSettings()
-    const env = (settings.env as Record<string, string>) || {}
+    await this.managedSettingsService.updateSettings((settings) => {
+      const env = { ...((settings.env as Record<string, string>) || {}) }
 
-    for (const key of getManagedEnvKeys()) {
-      delete env[key]
-    }
+      for (const key of getManagedEnvKeys()) {
+        delete env[key]
+      }
 
-    settings.env = env
-    if (Object.keys(env).length === 0) {
-      delete settings.env
-    }
+      const nextSettings: Record<string, unknown> = {
+        ...settings,
+      }
 
-    await this.writeSettings(settings)
+      if (Object.keys(env).length === 0) {
+        delete nextSettings.env
+      } else {
+        nextSettings.env = env
+      }
+
+      return {
+        settings: nextSettings,
+        result: undefined,
+      }
+    })
   }
 
   // --- Auth status ---
@@ -458,12 +431,28 @@ export class ProviderService {
    */
   async checkAuthStatus(): Promise<{
     hasAuth: boolean
-    source: 'cc-haha-provider' | 'original-settings' | 'env' | 'none'
+    source: 'cc-haha-provider' | 'openai-oauth' | 'original-settings' | 'env' | 'none'
     activeProvider?: string
   }> {
     // 1. Check cc-haha active provider
     const index = await this.readIndex()
     if (index.activeId) {
+      if (isOpenAIOfficialProviderId(index.activeId)) {
+        const tokens = await hahaOpenAIOAuthService.ensureFreshTokens()
+        if (tokens?.accessToken && tokens.refreshToken) {
+          return {
+            hasAuth: true,
+            source: 'openai-oauth',
+            activeProvider: OPENAI_OFFICIAL_PROVIDER.name,
+          }
+        }
+        return {
+          hasAuth: false,
+          source: 'none',
+          activeProvider: OPENAI_OFFICIAL_PROVIDER.name,
+        }
+      }
+
       const provider = index.providers.find(p => p.id === index.activeId)
       if (provider) {
         const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
@@ -499,13 +488,20 @@ export class ProviderService {
   // --- Proxy support ---
 
   async getProviderForProxy(providerId?: string): Promise<{
+    id: string
+    name: string
     baseUrl: string
     apiKey: string
     apiFormat: ApiFormat
   } | null> {
     if (providerId) {
+      if (isOpenAIOfficialProviderId(providerId)) {
+        return null
+      }
       const provider = await this.getProvider(providerId)
       return {
+        id: provider.id,
+        name: provider.name,
         baseUrl: provider.baseUrl,
         apiKey: provider.apiKey,
         apiFormat: provider.apiFormat ?? 'anthropic',
@@ -514,9 +510,14 @@ export class ProviderService {
 
     const index = await this.readIndex()
     if (!index.activeId) return null
-    const provider = index.providers.find((p) => p.id === index.activeId)
+    if (isOpenAIOfficialProviderId(index.activeId)) {
+      return null
+    }
+    const provider = await this.getProvider(index.activeId).catch(() => null)
     if (!provider) return null
     return {
+      id: provider.id,
+      name: provider.name,
       baseUrl: provider.baseUrl,
       apiKey: provider.apiKey,
       apiFormat: provider.apiFormat ?? 'anthropic',
@@ -564,10 +565,12 @@ export class ProviderService {
     const format: ApiFormat = input.apiFormat ?? 'anthropic'
     const authStrategy = input.authStrategy ?? 'api_key'
     const base = input.baseUrl.replace(/\/+$/, '')
+    const modelId = normalizeModelStringForAPI(input.modelId)
+    const networkSettings = await loadNetworkSettings()
 
     // ── Step 1: Basic connectivity ───────────────────────────
     // Directly call the upstream API to verify URL, key, and model.
-    const step1 = await this.testConnectivity(base, input.apiKey, input.modelId, format, authStrategy)
+    const step1 = await this.testConnectivity(base, input.apiKey, modelId, format, authStrategy, networkSettings)
 
     // If connectivity failed, no point running step 2
     if (!step1.success) {
@@ -581,7 +584,7 @@ export class ProviderService {
 
     // ── Step 2: Full proxy pipeline ──────────────────────────
     // Anthropic request → transform → upstream → transform back → validate
-    const step2 = await this.testProxyPipeline(base, input.apiKey, input.modelId, format)
+    const step2 = await this.testProxyPipeline(base, input.apiKey, modelId, format, networkSettings)
 
     return { connectivity: step1, proxy: step2 }
   }
@@ -593,15 +596,18 @@ export class ProviderService {
     modelId: string,
     format: ApiFormat,
     authStrategy: ProviderAuthStrategy,
+    networkSettings: NetworkSettings,
   ): Promise<ProviderTestStepResult> {
     const start = Date.now()
     try {
       const { url, headers, body } = buildDirectTestRequest(base, apiKey, modelId, format, authStrategy)
+      const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
       const response = await fetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(networkSettings.aiRequestTimeoutMs),
+        ...proxyOptions,
       })
 
       const latencyMs = Date.now() - start
@@ -625,7 +631,7 @@ export class ProviderService {
     } catch (err: unknown) {
       const latencyMs = Date.now() - start
       if (err instanceof DOMException && err.name === 'TimeoutError') {
-        return { success: false, latencyMs, error: 'Request timed out (30s)', modelUsed: modelId }
+        return { success: false, latencyMs, error: `Request timed out (${Math.round(networkSettings.aiRequestTimeoutMs / 1000)}s)`, modelUsed: modelId }
       }
       return { success: false, latencyMs, error: err instanceof Error ? err.message : String(err), modelUsed: modelId }
     }
@@ -637,6 +643,7 @@ export class ProviderService {
     apiKey: string,
     modelId: string,
     format: 'openai_chat' | 'openai_responses',
+    networkSettings: NetworkSettings,
   ): Promise<ProviderTestStepResult> {
     const start = Date.now()
     try {
@@ -657,13 +664,15 @@ export class ProviderService {
         transformedBody = anthropicToOpenaiResponses(anthropicReq)
         upstreamUrl = `${base}/v1/responses`
       }
+      const proxyOptions = getNetworkProxyFetchOptions(networkSettings, upstreamUrl)
 
       // Call upstream with transformed request
       const response = await fetch(upstreamUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(transformedBody),
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(networkSettings.aiRequestTimeoutMs),
+        ...proxyOptions,
       })
 
       if (!response.ok) {
@@ -691,7 +700,7 @@ export class ProviderService {
     } catch (err: unknown) {
       const latencyMs = Date.now() - start
       if (err instanceof DOMException && err.name === 'TimeoutError') {
-        return { success: false, latencyMs, error: 'Proxy pipeline timed out (30s)', modelUsed: modelId }
+        return { success: false, latencyMs, error: `Proxy pipeline timed out (${Math.round(networkSettings.aiRequestTimeoutMs / 1000)}s)`, modelUsed: modelId }
       }
       return { success: false, latencyMs, error: err instanceof Error ? err.message : String(err), modelUsed: modelId }
     }
@@ -713,7 +722,7 @@ function buildDirectTestRequest(
     return {
       url: `${base}/v1/chat/completions`,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: { model: modelId, max_tokens: 16, messages: [{ role: 'user', content: prompt }] },
+      body: { model: modelId, max_tokens: 16, stream: false, messages: [{ role: 'user', content: prompt }] },
     }
   }
   if (format === 'openai_responses') {

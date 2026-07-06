@@ -1,7 +1,12 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { CONTEXT_1M_BETA_HEADER } from '../constants/betas.js'
-import { getOpenAIContextWindowForModel } from '../services/openaiAuth/models.js'
+import { getOpenAICodexContextWindowForModel } from '../services/openaiAuth/models.js'
 import { getGlobalConfig } from './config.js'
+import {
+  calculateContextBudget,
+  calculateContextPercentagesFromTokens,
+  type ProviderUsageTrust,
+} from './contextBudget.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
@@ -84,7 +89,7 @@ export function getContextWindowForModel(
     return configuredWindow
   }
 
-  const openAIContextWindow = getOpenAIContextWindowForModel(model)
+  const openAIContextWindow = getOpenAICodexContextWindowForModel(model)
   if (openAIContextWindow) {
     return openAIContextWindow
   }
@@ -145,20 +150,12 @@ export function calculateContextPercentages(
     return { used: null, remaining: null }
   }
 
-  const totalInputTokens =
+  return calculateContextPercentagesFromTokens(
     currentUsage.input_tokens +
-    currentUsage.cache_creation_input_tokens +
-    currentUsage.cache_read_input_tokens
-
-  const usedPercentage = Math.round(
-    (totalInputTokens / contextWindowSize) * 100,
+      currentUsage.cache_creation_input_tokens +
+      currentUsage.cache_read_input_tokens,
+    contextWindowSize,
   )
-  const clampedUsed = Math.min(100, Math.max(0, usedPercentage))
-
-  return {
-    used: clampedUsed,
-    remaining: 100 - clampedUsed,
-  }
 }
 
 /**
@@ -170,6 +167,10 @@ export function calculateContextPercentages(
  * immediately after the model finishes responding. The local estimate is kept
  * as a lower bound because it includes system/tool/message material that some
  * provider usage payloads under-report.
+ *
+ * Pass `contextWindow` to clamp the result to the model's context window size.
+ * This prevents display values from exceeding 100% for providers (e.g. DeepSeek)
+ * whose input_tokens already approach the window limit before output is added.
  */
 export function calculateCurrentContextTokenTotal(
   estimatedTokens: number,
@@ -179,7 +180,22 @@ export function calculateCurrentContextTokenTotal(
     cache_creation_input_tokens: number
     cache_read_input_tokens: number
   } | null,
+  contextWindow?: number,
+  options?: { hasMediaInput?: boolean; usageTrust?: ProviderUsageTrust },
 ): number {
+  const hasMediaInput = options?.hasMediaInput ?? false
+  const usageTrust = options?.usageTrust ?? 'high'
+
+  if (contextWindow !== undefined) {
+    return calculateContextBudget({
+      estimatedTokens,
+      contextWindow,
+      currentUsage,
+      usageTrust,
+      hasMediaInput,
+    }).usedTokens
+  }
+
   if (!currentUsage) return estimatedTokens
 
   const totalFromAPI =

@@ -2,18 +2,31 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:te
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
+import { getOriginalCwd, setCwdState, setOriginalCwd } from '../../bootstrap/state.js'
 import * as mcpClient from '../../services/mcp/client.js'
 import * as mcpConfig from '../../services/mcp/config.js'
+import { _setGlobalConfigCacheForTesting, getProjectPathForConfig } from '../../utils/config.js'
+import { getGlobalClaudeFile } from '../../utils/env.js'
 import * as mcpHostPreflight from '../services/mcpHostPreflight.js'
 import { handleMcpApi } from '../api/mcp.js'
+import { conversationService } from '../services/conversationService.js'
 
 let tmpDir: string
 let projectRoot: string
 let originalConfigDir: string | undefined
 let connectSpy: ReturnType<typeof spyOn> | undefined
 let getClaudeCodeMcpConfigsSpy: ReturnType<typeof spyOn> | undefined
+let getAllMcpConfigsSpy: ReturnType<typeof spyOn> | undefined
 let reconnectSpy: ReturnType<typeof spyOn> | undefined
 let hostPreflightSpy: ReturnType<typeof spyOn> | undefined
+let originalRequestControl: typeof conversationService.requestControl
+let originalHasSession: typeof conversationService.hasSession
+
+function clearConfigPathCaches() {
+  getGlobalClaudeFile.cache.clear?.()
+  getProjectPathForConfig.cache.clear?.()
+  _setGlobalConfigCacheForTesting(null)
+}
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-test-'))
@@ -22,6 +35,7 @@ async function setup() {
 
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = tmpDir
+  clearConfigPathCaches()
 }
 
 async function teardown() {
@@ -31,6 +45,7 @@ async function teardown() {
     delete process.env.CLAUDE_CONFIG_DIR
   }
 
+  clearConfigPathCaches()
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
 
@@ -61,6 +76,8 @@ describe('MCP API', () => {
       ok: true,
       resolvedCommand: '/usr/bin/mock-command',
     })
+    originalRequestControl = conversationService.requestControl.bind(conversationService)
+    originalHasSession = conversationService.hasSession.bind(conversationService)
 
     connectSpy = spyOn(mcpClient, 'connectToServer').mockImplementation(async (name, config) => ({
       name,
@@ -77,11 +94,73 @@ describe('MCP API', () => {
     connectSpy = undefined
     getClaudeCodeMcpConfigsSpy?.mockRestore()
     getClaudeCodeMcpConfigsSpy = undefined
+    getAllMcpConfigsSpy?.mockRestore()
+    getAllMcpConfigsSpy = undefined
     reconnectSpy?.mockRestore()
     reconnectSpy = undefined
     hostPreflightSpy?.mockRestore()
     hostPreflightSpy = undefined
+    conversationService.requestControl = originalRequestControl
+    conversationService.hasSession = originalHasSession
     await teardown()
+  })
+
+  it('writes local MCP config and disabled state to the requested cwd project', async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousOriginalCwd = getOriginalCwd()
+    const projectA = path.join(tmpDir, 'project-a')
+    const projectB = path.join(tmpDir, 'project-b')
+    await fs.mkdir(projectA, { recursive: true })
+    await fs.mkdir(projectB, { recursive: true })
+
+    process.env.NODE_ENV = 'development'
+    clearConfigPathCaches()
+    setOriginalCwd(projectA)
+    setCwdState(projectA)
+
+    try {
+      const create = makeRequest('POST', '/api/mcp', {
+        cwd: projectB,
+        name: 'scoped-server',
+        scope: 'local',
+        config: {
+          type: 'stdio',
+          command: 'node',
+          args: ['server.js'],
+          env: {},
+        },
+      })
+
+      const createRes = await handleMcpApi(create.req, create.url, create.segments)
+      expect(createRes.status).toBe(201)
+
+      const disable = makeRequest('POST', '/api/mcp/scoped-server/toggle', {
+        cwd: projectB,
+      })
+      const disableRes = await handleMcpApi(disable.req, disable.url, disable.segments)
+      expect(disableRes.status).toBe(200)
+
+      const rawConfig = JSON.parse(
+        await fs.readFile(path.join(tmpDir, '.claude.json'), 'utf8'),
+      )
+
+      expect(rawConfig.projects?.[projectA]?.mcpServers?.['scoped-server']).toBeUndefined()
+      expect(rawConfig.projects?.[projectA]?.disabledMcpServers ?? []).not.toContain('scoped-server')
+      expect(rawConfig.projects?.[projectB]?.mcpServers?.['scoped-server']).toMatchObject({
+        type: 'stdio',
+        command: 'node',
+      })
+      expect(rawConfig.projects?.[projectB]?.disabledMcpServers).toContain('scoped-server')
+    } finally {
+      if (previousNodeEnv === undefined) {
+        delete process.env.NODE_ENV
+      } else {
+        process.env.NODE_ENV = previousNodeEnv
+      }
+      setOriginalCwd(previousOriginalCwd)
+      setCwdState(previousOriginalCwd)
+      clearConfigPathCaches()
+    }
   })
 
   it('creates and lists local MCP servers for the requested cwd', async () => {
@@ -118,6 +197,130 @@ describe('MCP API', () => {
     expect(connectSpy).not.toHaveBeenCalled()
   })
 
+  it('allows unicode letters and numbers in MCP server names while rejecting separators', async () => {
+    for (const name of ['某某服务器', 'context七', 'テストサーバー', '서버1', 'café-tools']) {
+      const create = makeRequest('POST', '/api/mcp', {
+        cwd: projectRoot,
+        name,
+        scope: 'local',
+        config: {
+          type: 'stdio',
+          command: 'npx',
+          args: [`${name}-mcp`],
+          env: {},
+        },
+      })
+
+      const createRes = await handleMcpApi(create.req, create.url, create.segments)
+      expect(createRes.status).toBe(201)
+      const body = await createRes.json()
+      expect(body.server.name).toBe(name)
+    }
+
+    for (const name of ['bad name', 'bad/name', 'bad.name']) {
+      const create = makeRequest('POST', '/api/mcp', {
+        cwd: projectRoot,
+        name,
+        scope: 'local',
+        config: {
+          type: 'stdio',
+          command: 'npx',
+          args: ['bad-mcp'],
+          env: {},
+        },
+      })
+
+      const createRes = await handleMcpApi(create.req, create.url, create.segments)
+      expect(createRes.status).toBe(400)
+      await expect(createRes.json()).resolves.toMatchObject({
+        message: expect.stringContaining(`Invalid name ${name}`),
+      })
+    }
+  })
+
+  it('lists project paths that contain user-private MCP servers', async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    const projectB = path.join(tmpDir, 'project-b')
+    await fs.mkdir(projectB, { recursive: true })
+    process.env.NODE_ENV = 'development'
+    clearConfigPathCaches()
+
+    try {
+      const create = makeRequest('POST', '/api/mcp', {
+        cwd: projectB,
+        name: 'private-context7',
+        scope: 'local',
+        config: {
+          type: 'stdio',
+          command: 'npx',
+          args: ['@upstash/context7-mcp'],
+          env: {},
+        },
+      })
+      const createRes = await handleMcpApi(create.req, create.url, create.segments)
+      expect(createRes.status).toBe(201)
+
+      const projectPaths = makeRequest('GET', '/api/mcp/project-paths')
+      const projectPathsRes = await handleMcpApi(projectPaths.req, projectPaths.url, projectPaths.segments)
+      expect(projectPathsRes.status).toBe(200)
+      const body = await projectPathsRes.json()
+
+      expect(body.projectPaths).toEqual([projectB])
+    } finally {
+      if (previousNodeEnv === undefined) {
+        delete process.env.NODE_ENV
+      } else {
+        process.env.NODE_ENV = previousNodeEnv
+      }
+      clearConfigPathCaches()
+    }
+  })
+
+  it('updates project MCP servers from their previous cwd into the selected target cwd', async () => {
+    const projectA = path.join(tmpDir, 'project-a')
+    const projectB = path.join(tmpDir, 'project-b')
+    await fs.mkdir(projectA, { recursive: true })
+    await fs.mkdir(projectB, { recursive: true })
+
+    const create = makeRequest('POST', '/api/mcp', {
+      cwd: projectA,
+      name: 'shared-tools',
+      scope: 'project',
+      config: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['old-tools'],
+        env: {},
+      },
+    })
+    const createRes = await handleMcpApi(create.req, create.url, create.segments)
+    expect(createRes.status).toBe(201)
+
+    const update = makeRequest('PUT', '/api/mcp/shared-tools', {
+      cwd: projectB,
+      previousCwd: projectA,
+      scope: 'project',
+      config: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['new-tools'],
+        env: {},
+      },
+    })
+    const updateRes = await handleMcpApi(update.req, update.url, update.segments)
+    expect(updateRes.status).toBe(200)
+
+    const projectAConfig = JSON.parse(await fs.readFile(path.join(projectA, '.mcp.json'), 'utf8'))
+    const projectBConfig = JSON.parse(await fs.readFile(path.join(projectB, '.mcp.json'), 'utf8'))
+
+    expect(projectAConfig.mcpServers?.['shared-tools']).toBeUndefined()
+    expect(projectBConfig.mcpServers?.['shared-tools']).toMatchObject({
+      type: 'stdio',
+      command: 'npx',
+      args: ['new-tools'],
+    })
+  })
+
   it('checks a single server status on demand', async () => {
     const create = makeRequest('POST', '/api/mcp', {
       cwd: projectRoot,
@@ -139,6 +342,37 @@ describe('MCP API', () => {
     expect(body.server.name).toBe('deepwiki')
     expect(body.server.status).toBe('connected')
     expect(connectSpy).toHaveBeenCalled()
+  })
+
+  it('lists runtime-visible claude.ai MCP connectors as read-only settings entries', async () => {
+    getAllMcpConfigsSpy = spyOn(mcpConfig, 'getAllMcpConfigs').mockResolvedValue({
+      servers: {
+        'claude.ai Docs': {
+          type: 'claudeai-proxy',
+          url: 'https://mcp.example.com/docs',
+          id: 'srv_docs',
+          scope: 'claudeai',
+        },
+      },
+      errors: [],
+    })
+
+    const list = makeRequest('GET', `/api/mcp?cwd=${encodeURIComponent(projectRoot)}`)
+    const listRes = await handleMcpApi(list.req, list.url, list.segments)
+
+    expect(listRes.status).toBe(200)
+    const listBody = await listRes.json()
+
+    expect(listBody.servers).toContainEqual(
+      expect.objectContaining({
+        name: 'claude.ai Docs',
+        scope: 'claudeai',
+        transport: 'claudeai-proxy',
+        canEdit: false,
+        canRemove: false,
+      }),
+    )
+    expect(connectSpy).not.toHaveBeenCalled()
   })
 
   it('rejects stdio MCP creation when the host command is unavailable', async () => {
@@ -252,6 +486,38 @@ describe('MCP API', () => {
     const listRes = await handleMcpApi(list.req, list.url, list.segments)
     const listBody = await listRes.json()
     expect(listBody.servers.some((server: { name: string }) => server.name === 'context7')).toBe(false)
+  })
+
+  it('syncs MCP toggles into the active CLI session control channel', async () => {
+    const create = makeRequest('POST', '/api/mcp', {
+      cwd: projectRoot,
+      name: 'session-sync',
+      scope: 'local',
+      config: {
+        type: 'stdio',
+        command: 'npx',
+        args: ['session-sync-mcp'],
+        env: {},
+      },
+    })
+    await handleMcpApi(create.req, create.url, create.segments)
+
+    const requestControl = mock(async () => ({}))
+    conversationService.hasSession = ((sessionId: string) => sessionId === 'session-1') as typeof conversationService.hasSession
+    conversationService.requestControl = requestControl as typeof conversationService.requestControl
+
+    const disable = makeRequest('POST', '/api/mcp/session-sync/toggle', {
+      cwd: projectRoot,
+      sessionId: 'session-1',
+    })
+    const disableRes = await handleMcpApi(disable.req, disable.url, disable.segments)
+
+    expect(disableRes.status).toBe(200)
+    expect(requestControl).toHaveBeenCalledWith(
+      'session-1',
+      { subtype: 'mcp_toggle', serverName: 'session-sync', enabled: false },
+      120_000,
+    )
   })
 
   it('reconnects plugin-scoped MCP servers exposed via the merged server list', async () => {

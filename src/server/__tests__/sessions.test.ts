@@ -14,7 +14,13 @@ import {
 } from '../services/repositoryLaunchService.js'
 import { conversationService } from '../services/conversationService.js'
 import { clearCommandsCache } from '../../commands.js'
+import { parseJSONL } from '../../utils/json.js'
+import { createSessionBranch } from '../../utils/sessionBranching.js'
 import { sanitizePath } from '../../utils/sessionStoragePortable.js'
+import { clearInstalledPluginsCache } from '../../utils/plugins/installedPluginsManager.js'
+import { clearPluginCache } from '../../utils/plugins/pluginLoader.js'
+import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
+import { updateSessionSlashCommands } from '../ws/handler.js'
 
 // ============================================================================
 // Test helpers
@@ -107,6 +113,19 @@ async function writeSkill(
   await fs.writeFile(
     path.join(skillDir, 'SKILL.md'),
     ['---', `description: ${description}`, '---', '', `# ${skillName}`].join('\n'),
+    'utf-8',
+  )
+}
+
+async function writeLegacySlashCommand(
+  commandsDir: string,
+  commandName: string,
+  description: string,
+): Promise<void> {
+  await fs.mkdir(commandsDir, { recursive: true })
+  await fs.writeFile(
+    path.join(commandsDir, `${commandName}.md`),
+    ['---', `description: ${description}`, 'argument-hint: <topic>', '---', '', `Run ${commandName}.`].join('\n'),
     'utf-8',
   )
 }
@@ -206,7 +225,16 @@ function makeUserEntry(content: string, uuid?: string): Record<string, unknown> 
   }
 }
 
-function makeAssistantEntry(content: string, parentUuid?: string): Record<string, unknown> {
+function makeAssistantEntry(
+  content: string,
+  parentUuid?: string,
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_input_tokens?: number
+    cache_creation_input_tokens?: number
+  },
+): Record<string, unknown> {
   return {
     parentUuid: parentUuid || null,
     isSidechain: false,
@@ -217,6 +245,7 @@ function makeAssistantEntry(content: string, parentUuid?: string): Record<string
       type: 'message',
       role: 'assistant',
       content: [{ type: 'text', text: content }],
+      ...(usage ? { usage } : {}),
     },
     uuid: crypto.randomUUID(),
     timestamp: '2026-01-01T00:02:00.000Z',
@@ -245,6 +274,33 @@ function makeAssistantToolUseEntry(
     },
     uuid: crypto.randomUUID(),
     timestamp: '2026-01-01T00:02:00.000Z',
+  }
+}
+
+function makeToolResultUserEntry(
+  toolUseId: string,
+  content: string,
+  uuid?: string,
+  parentUuid?: string,
+  sessionId = 'test-session',
+): Record<string, unknown> {
+  return {
+    parentUuid: parentUuid || null,
+    isSidechain: false,
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content,
+      }],
+    },
+    uuid: uuid || crypto.randomUUID(),
+    timestamp: '2026-01-01T00:02:30.000Z',
+    userType: 'external',
+    cwd: '/tmp/test',
+    sessionId,
   }
 }
 
@@ -286,6 +342,17 @@ function makeWorktreeStateEntry(
       sessionId,
       ...overrides,
     },
+  }
+}
+
+function makeContentReplacementEntry(
+  sessionId: string,
+  replacements: Array<{ kind: 'tool-result'; toolUseId: string; replacement: string }>,
+): Record<string, unknown> {
+  return {
+    type: 'content-replacement',
+    sessionId,
+    replacements,
   }
 }
 
@@ -397,10 +464,16 @@ describe('SessionService', () => {
   beforeEach(async () => {
     await setupTmpConfigDir()
     service = new SessionService()
+    clearInstalledPluginsCache()
+    clearPluginCache('sessions-api-test-setup')
+    resetSettingsCache()
   })
 
   afterEach(async () => {
     clearCommandsCache()
+    clearInstalledPluginsCache()
+    clearPluginCache('session-service-test-teardown')
+    resetSettingsCache()
     await cleanupTmpDir()
   })
 
@@ -431,6 +504,32 @@ describe('SessionService', () => {
     expect(session.title).toBe('Hello Claude')
     expect(session.messageCount).toBe(2) // 1 user + 1 assistant
     expect(session.projectPath).toBe('-tmp-testproject')
+    expect(session.projectRoot).toBe('/tmp/test')
+  })
+
+  it('should expose the source project root for persisted worktree sessions', async () => {
+    const sourceWorkDir = path.join(tmpDir, 'source-repo')
+    const worktreePath = path.join(sourceWorkDir, '.claude', 'worktrees', 'desktop-main-12345678')
+    await fs.mkdir(worktreePath, { recursive: true })
+    const sessionId = 'bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile(sanitizePath(worktreePath), sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry(worktreePath),
+      makeWorktreeStateEntry(sessionId, worktreePath, {
+        originalCwd: sourceWorkDir,
+      }),
+      makeUserEntry('Hello from worktree'),
+    ])
+
+    const result = await service.listSessions()
+
+    expect(result.sessions).toHaveLength(1)
+    expect(result.sessions[0]).toMatchObject({
+      id: sessionId,
+      projectPath: sanitizePath(worktreePath),
+      projectRoot: await fs.realpath(sourceWorkDir),
+      workDir: worktreePath,
+    })
   })
 
   it('should paginate results with limit and offset', async () => {
@@ -452,7 +551,7 @@ describe('SessionService', () => {
     expect(page2.sessions).toHaveLength(1)
   })
 
-  it('should only parse the requested page when listing many sessions', async () => {
+  it('should scan summaries before pagination so metadata-only writes cannot skew order', async () => {
     for (let i = 0; i < 12; i++) {
       const id = `1000000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
       const filePath = await writeSessionFile('-tmp-many-sessions', id, [
@@ -464,20 +563,157 @@ describe('SessionService', () => {
     }
 
     const serviceWithSpy = service as unknown as {
-      readJsonlFile: (...args: unknown[]) => Promise<unknown>
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
     }
-    const originalReadJsonlFile = serviceWithSpy.readJsonlFile.bind(service)
-    let readCount = 0
-    serviceWithSpy.readJsonlFile = async (...args) => {
-      readCount += 1
-      return originalReadJsonlFile(...args)
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      return originalScanSessionListSummary(...args)
     }
 
     const result = await service.listSessions({ limit: 3, offset: 0 })
 
     expect(result.total).toBe(12)
     expect(result.sessions).toHaveLength(3)
-    expect(readCount).toBe(3)
+    expect(scanCount).toBe(12)
+  })
+
+  it('should ignore metadata-only writes when sorting and dating the session list', async () => {
+    const activeSessionId = '10000000-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const viewedHistorySessionId = '10000001-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const activeFilePath = await writeSessionFile('-tmp-viewed-history-sessions', activeSessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeUserEntry('Recent real work'),
+        timestamp: '2026-07-02T02:00:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('Recent reply'),
+        timestamp: '2026-07-02T02:05:00.000Z',
+      },
+    ])
+    const historyFilePath = await writeSessionFile('-tmp-viewed-history-sessions', viewedHistorySessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeUserEntry('Older work'),
+        timestamp: '2026-07-01T02:00:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('Older reply'),
+        timestamp: '2026-07-01T02:05:00.000Z',
+      },
+      {
+        ...makeSessionMetaEntry('/tmp/viewed-history'),
+        timestamp: '2026-07-02T03:00:00.000Z',
+      },
+    ])
+    await fs.utimes(activeFilePath, new Date('2026-07-02T02:05:00.000Z'), new Date('2026-07-02T02:05:00.000Z'))
+    await fs.utimes(historyFilePath, new Date('2026-07-02T03:00:00.000Z'), new Date('2026-07-02T03:00:00.000Z'))
+
+    const result = await service.listSessions({ project: '/tmp/viewed-history-sessions', limit: 2 })
+
+    expect(result.sessions.map((session) => session.id)).toEqual([
+      activeSessionId,
+      viewedHistorySessionId,
+    ])
+    expect(result.sessions.find((session) => session.id === viewedHistorySessionId)?.modifiedAt)
+      .toBe('2026-07-01T02:05:00.000Z')
+  })
+
+  it('should reuse cached list metadata for repeated requests', async () => {
+    for (let i = 0; i < 5; i++) {
+      const id = `2000000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
+      const filePath = await writeSessionFile('-tmp-cached-sessions', id, [
+        makeSnapshotEntry(),
+        makeUserEntry(`Cached message ${i}`),
+      ])
+      const mtime = new Date(Date.now() - i * 1000)
+      await fs.utimes(filePath, mtime, mtime)
+    }
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      return originalScanSessionListSummary(...args)
+    }
+
+    const first = await service.listSessions({ limit: 3, offset: 0 })
+    const second = await service.listSessions({ limit: 3, offset: 0 })
+
+    expect(first.sessions.map((session) => session.id)).toEqual(second.sessions.map((session) => session.id))
+    expect(scanCount).toBe(5)
+  })
+
+  it('should reuse unchanged file summaries after the list response cache is cleared', async () => {
+    const sessionFiles: Array<{ id: string; filePath: string }> = []
+    for (let i = 0; i < 3; i++) {
+      const id = `2500000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
+      const filePath = await writeSessionFile('-tmp-file-summary-cache', id, [
+        makeSnapshotEntry(),
+        makeUserEntry(`Cached file summary ${i}`),
+      ])
+      const mtime = new Date(Date.now() - i * 1000)
+      await fs.utimes(filePath, mtime, mtime)
+      sessionFiles.push({ id, filePath })
+    }
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const serviceInternals = service as unknown as {
+      sessionListCache: Map<string, unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      return originalScanSessionListSummary(...args)
+    }
+
+    await service.listSessions({ limit: 3, offset: 0 })
+    expect(scanCount).toBe(3)
+
+    serviceInternals.sessionListCache.clear()
+    const second = await service.listSessions({ limit: 3, offset: 0 })
+    expect(second.sessions).toHaveLength(3)
+    expect(scanCount).toBe(3)
+
+    await fs.appendFile(
+      sessionFiles[1]!.filePath,
+      `${JSON.stringify({
+        type: 'custom-title',
+        customTitle: 'Changed cached file summary',
+        timestamp: new Date().toISOString(),
+      })}\n`,
+      'utf-8',
+    )
+    serviceInternals.sessionListCache.clear()
+
+    const third = await service.listSessions({ limit: 3, offset: 0 })
+    expect(third.sessions.find((session) => session.id === sessionFiles[1]!.id)?.title)
+      .toBe('Changed cached file summary')
+    expect(scanCount).toBe(4)
+  })
+
+  it('should invalidate cached list metadata after writes', async () => {
+    const sessionId = '30000000-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-cache-invalidation', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry('Original title'),
+    ])
+
+    const first = await service.listSessions({ limit: 10, offset: 0 })
+    expect(first.sessions[0]!.title).toBe('Original title')
+
+    await service.renameSession(sessionId, 'Renamed title')
+    const second = await service.listSessions({ limit: 10, offset: 0 })
+
+    expect(second.sessions[0]!.title).toBe('Renamed title')
   })
 
   it('should filter sessions by project', async () => {
@@ -519,6 +755,35 @@ describe('SessionService', () => {
     expect(detail!.messages[1]!.type).toBe('assistant')
   })
 
+  it('should derive session detail modifiedAt from transcript messages', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const filePath = await writeSessionFile('-tmp-project', sessionId, [
+      {
+        ...makeSessionMetaEntry('/tmp/project'),
+        timestamp: '2026-01-03T00:00:00.000Z',
+      },
+      {
+        ...makeUserEntry('Earlier user work'),
+        timestamp: '2026-01-01T00:01:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('Earlier assistant reply'),
+        timestamp: '2026-01-01T00:02:00.000Z',
+      },
+      {
+        type: 'custom-title',
+        customTitle: 'Later title metadata',
+        timestamp: '2026-01-04T00:00:00.000Z',
+      },
+    ])
+    const mtime = new Date('2026-01-05T00:00:00.000Z')
+    await fs.utimes(filePath, mtime, mtime)
+
+    const detail = await service.getSession(sessionId)
+
+    expect(detail?.modifiedAt).toBe('2026-01-01T00:02:00.000Z')
+  })
+
   it('should skip meta entries in messages', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-project', sessionId, [
@@ -552,6 +817,42 @@ describe('SessionService', () => {
 
     const messages = await service.getSessionMessages(sessionId)
     expect(messages).toHaveLength(2)
+  })
+
+  it('preserves structured toolUseResult metadata for AskUserQuestion answers', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'ask-1',
+              content: 'User has answered your questions: "Pick one?"="A". You can now continue with the user\'s answers in mind.',
+            },
+          ],
+        },
+        toolUseResult: {
+          questions: [{ question: 'Pick one?', options: [{ label: 'A' }] }],
+          answers: { 'Pick one?': 'A' },
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:01.000Z',
+      },
+    ])
+
+    const messages = await service.getSessionMessages(sessionId)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      type: 'tool_result',
+      toolUseResult: {
+        answers: { 'Pick one?': 'A' },
+      },
+    })
   })
 
   it('should append subagent tool calls under their parent agent tool result', async () => {
@@ -658,7 +959,93 @@ describe('SessionService', () => {
     ])
   })
 
-  it('should hide synthetic interruption, no-response, and command breadcrumb transcript entries', async () => {
+  it('should include linked subagent transcript changes in the message signature', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-tmp-project'
+    const agentId = 'abc123'
+
+    await writeSessionFile(projectDir, sessionId, [
+      makeSnapshotEntry(),
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'Agent:0',
+              name: 'Agent',
+              input: { description: 'Inspect alpha' },
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:02.000Z',
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'Agent:0',
+              content: [
+                {
+                  type: 'text',
+                  text: `alpha summary\nagentId: ${agentId}`,
+                },
+              ],
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:03.000Z',
+      },
+    ])
+    const subagentFile = await writeSubagentTranscriptFile(projectDir, sessionId, agentId, [
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'Read:0',
+              name: 'Read',
+              input: { file_path: '/tmp/alpha.txt' },
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:04.000Z',
+      },
+    ])
+
+    const before = await service.getSessionMessagesSignature(sessionId)
+
+    await fs.appendFile(subagentFile, `${JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'Read:0',
+            content: 'updated alpha body',
+          },
+        ],
+      },
+      uuid: crypto.randomUUID(),
+      timestamp: '2026-01-01T00:00:05.000Z',
+    })}\n`)
+
+    const after = await service.getSessionMessagesSignature(sessionId)
+
+    expect(before).not.toBe(after)
+  })
+
+  it('should hide synthetic interruption, no-response, and malformed command breadcrumb transcript entries', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-project', sessionId, [
       makeSnapshotEntry(),
@@ -691,17 +1078,137 @@ describe('SessionService', () => {
         uuid: crypto.randomUUID(),
         timestamp: '2026-01-01T00:00:04.000Z',
       },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '<command-name>/agent</command-name>\n<command-message>agent</command-message>\n<command-args>Plan 222</command-args>',
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:05.000Z',
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: '<command-name>/agent</command-name> malformed breadcrumb',
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:06.000Z',
+      },
       makeAssistantEntry('正常助手消息', crypto.randomUUID()),
     ])
 
     const messages = await service.getSessionMessages(sessionId)
 
-    expect(messages).toHaveLength(2)
+    expect(messages).toHaveLength(4)
     expect(messages[0]).toMatchObject({ type: 'user', content: '正常用户消息' })
     expect(messages[1]).toMatchObject({
+      type: 'user',
+      content: '<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>',
+    })
+    expect(messages[2]).toMatchObject({
+      type: 'user',
+      content: [{
+        type: 'text',
+        text: '<command-name>/agent</command-name>\n<command-message>agent</command-message>\n<command-args>Plan 222</command-args>',
+      }],
+    })
+    expect(messages[3]).toMatchObject({
       type: 'assistant',
       content: [{ type: 'text', text: '正常助手消息' }],
     })
+  })
+
+  it('should keep user-invoked skill command metadata for desktop history restore', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry([
+        '<command-message>frontend-design</command-message>',
+        '<command-name>/frontend-design</command-name>',
+        '<command-args>redesign the settings page</command-args>',
+      ].join('\n'), 'skill-command-user'),
+      makeAssistantEntry('正常助手消息', 'skill-command-user'),
+    ])
+
+    const messages = await service.getSessionMessages(sessionId)
+
+    expect(messages).toHaveLength(2)
+    const skillCommandContent = String(messages[0]!.content)
+    expect(messages[0]).toMatchObject({
+      id: 'skill-command-user',
+      type: 'user',
+      content: expect.stringContaining('<command-name>/frontend-design</command-name>'),
+    })
+    expect(skillCommandContent).toContain('<command-args>redesign the settings page</command-args>')
+    expect(messages[1]).toMatchObject({ type: 'assistant' })
+  })
+
+  it('should keep /goal local command transcript entries for desktop history restore', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      {
+        parentUuid: null,
+        isSidechain: false,
+        type: 'system',
+        subtype: 'local_command',
+        content: '<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>ship persisted goal</command-args>',
+        level: 'info',
+        timestamp: '2026-01-01T00:00:01.000Z',
+        uuid: 'goal-command',
+      },
+      {
+        parentUuid: 'goal-command',
+        isSidechain: false,
+        type: 'system',
+        subtype: 'local_command',
+        content: '<local-command-stdout>Goal set: ship persisted goal</local-command-stdout>',
+        level: 'info',
+        timestamp: '2026-01-01T00:00:02.000Z',
+        uuid: 'goal-output',
+      },
+      {
+        parentUuid: 'goal-output',
+        isSidechain: false,
+        type: 'system',
+        subtype: 'local_command',
+        content: '<local-command-stdout>Goal continuing: verify persisted follow-up</local-command-stdout>',
+        level: 'info',
+        timestamp: '2026-01-01T00:00:03.000Z',
+        uuid: 'goal-continuing',
+      },
+      makeAssistantEntry('正常助手消息', crypto.randomUUID()),
+    ])
+
+    const messages = await service.getSessionMessages(sessionId)
+
+    expect(messages).toMatchObject([
+      {
+        id: 'goal-command',
+        type: 'system',
+        content: expect.stringContaining('<command-name>/goal</command-name>'),
+      },
+      {
+        id: 'goal-output',
+        type: 'system',
+        content: expect.stringContaining('Goal set: ship persisted goal'),
+      },
+      {
+        id: 'goal-continuing',
+        type: 'system',
+        content: expect.stringContaining('Goal continuing: verify persisted follow-up'),
+      },
+      {
+        type: 'assistant',
+      },
+    ])
   })
 
   it('should hide task-notification turns and their automatic responses from history', async () => {
@@ -792,6 +1299,7 @@ describe('SessionService', () => {
         toolUseId: 'toolu_bg',
         status: 'completed',
         summary: 'Background command completed',
+        timestamp: '2026-01-01T00:01:00.000Z',
       },
     ])
   })
@@ -911,6 +1419,26 @@ describe('SessionService', () => {
     expect(workDir).toBe('/tmp/latest-worktree')
   })
 
+  it('should prefer the newest duplicate session file when worktree metadata moves', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const sourceFile = await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry('/tmp/project'),
+    ])
+    const worktreeFile = await writeSessionFile('-tmp-project--claude-worktrees-desktop-main-12345678', sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry('/tmp/project/.claude/worktrees/desktop-main-12345678'),
+    ])
+
+    const oldTime = new Date('2026-01-01T00:00:00.000Z')
+    const newTime = new Date('2026-01-01T00:00:01.000Z')
+    await fs.utimes(sourceFile, oldTime, oldTime)
+    await fs.utimes(worktreeFile, newTime, newTime)
+
+    const workDir = await service.getSessionWorkDir(sessionId)
+    expect(workDir).toBe('/tmp/project/.claude/worktrees/desktop-main-12345678')
+  })
+
   it('should recover CLI worktree state from transcript metadata', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-project--claude-worktrees-desktop-main-12345678', sessionId, [
@@ -948,6 +1476,82 @@ describe('SessionService', () => {
       worktree: true,
       worktreePath: expect.stringContaining(path.join('.claude', 'worktrees', 'desktop-feature-rail-')),
     })
+  })
+
+  it('should preserve permission metadata when clearing placeholder transcripts', async () => {
+    const workDir = path.join(tmpDir, 'clear-permission-workdir')
+    await fs.mkdir(workDir, { recursive: true })
+    const { sessionId } = await (service.createSession as unknown as (
+      workDir?: string,
+      repositoryOptions?: unknown,
+      permissionMode?: string,
+    ) => Promise<{ sessionId: string; workDir: string }>)(workDir, undefined, 'acceptEdits')
+
+    await service.clearSessionTranscript(sessionId, workDir)
+    const launchInfo = await service.getSessionLaunchInfo(sessionId)
+
+    expect(launchInfo?.workDir).toBe(await fs.realpath(workDir))
+    expect(launchInfo?.permissionMode).toBe('acceptEdits')
+  })
+
+  it('should persist session permission mode in launch metadata', async () => {
+    const workDir = path.join(tmpDir, 'permission-workdir')
+    await fs.mkdir(workDir, { recursive: true })
+    const { sessionId } = await (service.createSession as unknown as (
+      workDir?: string,
+      repositoryOptions?: unknown,
+      permissionMode?: string,
+    ) => Promise<{ sessionId: string; workDir: string }>)(workDir, undefined, 'acceptEdits')
+
+    let launchInfo = await service.getSessionLaunchInfo(sessionId)
+    expect(launchInfo?.permissionMode).toBe('acceptEdits')
+
+    await (service.appendSessionMetadata as unknown as (
+      sessionId: string,
+      metadata: { workDir: string; permissionMode?: string },
+    ) => Promise<void>)(sessionId, {
+      workDir,
+      permissionMode: 'plan',
+    })
+
+    launchInfo = await service.getSessionLaunchInfo(sessionId)
+    expect(launchInfo?.permissionMode).toBe('plan')
+  })
+
+  it('should not append duplicate runtime metadata when it already matches', async () => {
+    const workDir = '/tmp/runtime-idempotent'
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const filePath = await writeSessionFile(sanitizePath(workDir), sessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeSessionMetaEntry(workDir),
+        runtimeProviderId: 'provider-a',
+        runtimeModelId: 'model-a',
+        effortLevel: 'max',
+      },
+      makeUserEntry('Runtime metadata should stay stable'),
+    ])
+    const before = await fs.readFile(filePath, 'utf-8')
+
+    await service.appendSessionMetadata(sessionId, {
+      workDir,
+      runtimeProviderId: 'provider-a',
+      runtimeModelId: 'model-a',
+      effortLevel: 'max',
+    })
+
+    expect(await fs.readFile(filePath, 'utf-8')).toBe(before)
+
+    await service.appendSessionMetadata(sessionId, {
+      workDir,
+      runtimeProviderId: 'provider-a',
+      runtimeModelId: 'model-b',
+      effortLevel: 'max',
+    })
+
+    const afterChange = await fs.readFile(filePath, 'utf-8')
+    expect(afterChange).not.toBe(before)
+    expect(afterChange).toContain('"runtimeModelId":"model-b"')
   })
 
   it('should remove stale placeholder files after native CLI worktree startup', async () => {
@@ -1122,6 +1726,21 @@ describe('SessionService', () => {
     expect(context.currentBranch).toBe('worktree-desktop-hidden')
     expect(context.branches.some((branch) => branch.name === context.currentBranch)).toBe(false)
     expect(context.branches.some((branch) => branch.name.startsWith('worktree-desktop-'))).toBe(false)
+  })
+
+  it('should keep stale worktree records when their paths cannot be resolved', async () => {
+    const workDir = await createCleanGitRepo(tmpDir)
+    const staleWorktreeName = `stale-worktree-${Date.now()}`
+    const staleWorktree = path.join(tmpDir, staleWorktreeName)
+    git(workDir, 'worktree', 'add', '-b', 'stale-worktree', staleWorktree, 'feature/rail')
+    await fs.rm(staleWorktree, { recursive: true, force: true })
+
+    const context = await getRepositoryContext(workDir)
+    const expectedPath = path.join(await fs.realpath(tmpDir), staleWorktreeName).normalize('NFC')
+    expect(context.state).toBe('ok')
+    expect(context.worktrees.some((worktree) => (
+      worktree.path === expectedPath && worktree.branch === 'stale-worktree' && !worktree.current
+    ))).toBe(true)
   })
 
   it('should let git carry compatible dirty changes during direct branch launch', async () => {
@@ -1304,6 +1923,66 @@ describe('SessionService', () => {
     expect(detail!.title).toBe('This is my first real question')
   })
 
+  it('should derive a clean title from slash command breadcrumb metadata', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry([
+        '<command-message>frontend-design</command-message>',
+        '<command-name>/frontend-design</command-name>',
+        '<command-args>@website 重新设计首页</command-args>',
+      ].join('\n')),
+    ])
+
+    const detail = await service.getSession(sessionId)
+    expect(detail!.title).toBe('/frontend-design @website 重新设计首页')
+  })
+
+  it('should keep a goal creation title instead of later goal status titles', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      {
+        parentUuid: null,
+        isSidechain: false,
+        type: 'system',
+        subtype: 'local_command',
+        content: '<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>ship the actual objective</command-args>',
+        level: 'info',
+        timestamp: '2026-01-01T00:00:01.000Z',
+        uuid: 'goal-command',
+      },
+      {
+        type: 'ai-title',
+        aiTitle: '/goal status',
+        timestamp: '2026-01-01T00:02:00.000Z',
+      },
+    ])
+
+    const detail = await service.getSession(sessionId)
+    expect(detail!.title).toBe('/goal ship the actual objective')
+  })
+
+  it('should display stored AI titles without internal XML tags', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry('fallback message'),
+      {
+        type: 'ai-title',
+        aiTitle: [
+          '<command-message>frontend-design</command-message>',
+          '<command-name>/frontend-design</command-name>',
+          '<command-args>@website</command-args>',
+        ].join(' '),
+        timestamp: '2026-01-01T00:02:00.000Z',
+      },
+    ])
+
+    const detail = await service.getSession(sessionId)
+    expect(detail!.title).toBe('/frontend-design @website')
+  })
+
   it('should truncate long titles to 80 chars', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     const longMessage = 'A'.repeat(120)
@@ -1353,6 +2032,174 @@ describe('SessionService', () => {
     expect(launchInfo!.transcriptMessageCount).toBe(2)
     expect(launchInfo!.customTitle).toBe('Saved chat')
   })
+
+  it('should recover Windows drive paths from sanitized project dirs for old transcripts without metadata', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff'
+    const userUuid = crypto.randomUUID()
+    const userEntry = makeUserEntry('Resume this Windows session', userUuid)
+    delete userEntry.cwd
+    await writeSessionFile('g--AI-NTos-NT-deepseek-nano-core', sessionId, [
+      makeSnapshotEntry(),
+      userEntry,
+      makeAssistantEntry('Welcome back', userUuid),
+    ])
+
+    const expectedWorkDir = 'g:\\AI\\NTos\\NT\\deepseek\\nano\\core'
+    expect(await service.getSessionWorkDir(sessionId)).toBe(expectedWorkDir)
+
+    const launchInfo = await service.getSessionLaunchInfo(sessionId)
+    expect(launchInfo).not.toBeNull()
+    expect(launchInfo!.workDir).toBe(expectedWorkDir)
+    expect(launchInfo!.transcriptMessageCount).toBe(2)
+  })
+
+  it('createSessionBranch should preserve branch metadata, copied snapshots, and filtered replacements', async () => {
+    const sessionId = 'branch-source-session'
+    const workDir = path.join(tmpDir, 'branch-source')
+    const worktreePath = path.join(workDir, '.claude', 'worktrees', 'desktop-main-12345678')
+    const firstUserId = crypto.randomUUID()
+    const firstAssistantId = crypto.randomUUID()
+    const firstToolResultId = crypto.randomUUID()
+    const laterUserId = crypto.randomUUID()
+    const laterAssistantId = crypto.randomUUID()
+    const repository = {
+      branch: 'feature/rail',
+      worktree: true,
+      baseRef: 'feature/rail',
+      repoRoot: workDir,
+    }
+    const sourceProjectDir = sanitizePath(workDir)
+    const sourcePath = await writeSessionFile(sourceProjectDir, sessionId, [
+      makeSessionMetaEntry(workDir),
+      {
+        type: 'session-meta',
+        isMeta: true,
+        workDir,
+        repository,
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+      makeWorktreeStateEntry(sessionId, worktreePath, {
+        originalCwd: workDir,
+      }),
+      makeFileHistorySnapshotEntry(firstUserId, {
+        'src/step.js': {
+          backupFileName: 'branch-source-step@v1',
+          version: 1,
+          backupTime: '2026-01-01T00:00:00.000Z',
+        },
+      }),
+      {
+        ...makeUserEntry('branch this conversation', firstUserId),
+        cwd: workDir,
+        sessionId,
+      },
+      {
+        ...makeAssistantToolUseEntry([
+          { id: 'tool-1', name: 'Read', input: { path: 'src/step.js' } },
+        ], firstUserId),
+        uuid: firstAssistantId,
+        cwd: workDir,
+        sessionId,
+      },
+      {
+        ...makeToolResultUserEntry('tool-1', 'first tool result', firstToolResultId, firstAssistantId, sessionId),
+        cwd: workDir,
+      },
+      makeContentReplacementEntry(sessionId, [
+        { kind: 'tool-result', toolUseId: 'tool-1', replacement: 'preview-1' },
+        { kind: 'tool-result', toolUseId: 'tool-2', replacement: 'preview-2' },
+      ]),
+      makeFileHistorySnapshotEntry(laterUserId, {
+        'src/step.js': {
+          backupFileName: 'branch-source-step@v2',
+          version: 2,
+          backupTime: '2026-01-01T00:00:00.000Z',
+        },
+      }),
+      {
+        ...makeUserEntry('later prompt', laterUserId),
+        parentUuid: firstToolResultId,
+        cwd: workDir,
+        sessionId,
+      },
+      {
+        ...makeAssistantEntry('later reply', laterUserId),
+        uuid: laterAssistantId,
+        cwd: workDir,
+        sessionId,
+      },
+    ])
+
+    const sourceBefore = await fs.readFile(sourcePath, 'utf-8')
+
+    const branch = await createSessionBranch({
+      sourceSessionId: sessionId,
+      sourceTranscriptPath: sourcePath,
+      targetMessageId: firstToolResultId,
+      title: 'Desktop branch',
+      sourceWorkDir: workDir,
+      sourceRepository: repository,
+      sourceWorktreeSession: {
+        originalCwd: workDir,
+        worktreePath,
+        worktreeName: 'desktop-main-12345678',
+        worktreeBranch: 'worktree-desktop-main-12345678',
+        originalBranch: 'main',
+        sessionId,
+      },
+    })
+
+    const branchMessages = await service.getSessionMessages(branch.sessionId)
+    expect(branchMessages.map((message) => message.id)).toEqual([
+      firstUserId,
+      firstAssistantId,
+      firstToolResultId,
+    ])
+    expect(branch.title).toBe('Desktop branch (Branch)')
+
+    const launchInfo = await service.getSessionLaunchInfo(branch.sessionId)
+    expect(launchInfo).toMatchObject({
+      workDir,
+      repository,
+      worktreeSession: {
+        originalCwd: workDir,
+        worktreePath,
+      },
+    })
+
+    const branchEntries = parseJSONL<Record<string, unknown>>(await fs.readFile(branch.forkPath))
+    expect(branchEntries.some((entry) => (
+      entry.type === 'content-replacement' &&
+      entry.sessionId === branch.sessionId &&
+      Array.isArray(entry.replacements) &&
+      entry.replacements.length === 1 &&
+      (entry.replacements[0] as { toolUseId?: string }).toolUseId === 'tool-1'
+    ))).toBe(true)
+    expect(branchEntries.some((entry) => (
+      entry.type === 'file-history-snapshot' &&
+      typeof (entry.snapshot as { messageId?: string } | undefined)?.messageId === 'string' &&
+      (entry.snapshot as { messageId?: string }).messageId === firstUserId
+    ))).toBe(true)
+    expect(branchEntries.some((entry) => (
+      entry.type === 'file-history-snapshot' &&
+      typeof (entry.snapshot as { messageId?: string } | undefined)?.messageId === 'string' &&
+      (entry.snapshot as { messageId?: string }).messageId === laterUserId
+    ))).toBe(false)
+    expect(branchEntries.some((entry) => (
+      entry.type === 'custom-title' &&
+      entry.customTitle === 'Desktop branch (Branch)'
+    ))).toBe(true)
+    expect(branchEntries.filter((entry) => (
+      entry.type === 'user' ||
+      entry.type === 'assistant'
+    )).every((entry) => (
+      entry.sessionId === branch.sessionId &&
+      typeof (entry.forkedFrom as { sessionId?: string } | undefined)?.sessionId === 'string'
+    ))).toBe(true)
+
+    const sourceAfter = await fs.readFile(sourcePath, 'utf-8')
+    expect(sourceAfter).toBe(sourceBefore)
+  })
 })
 
 // ============================================================================
@@ -1371,11 +2218,8 @@ describe('Sessions API', () => {
     const { handleSessionsApi } = await import('../api/sessions.js')
     const { handleConversationsApi } = await import('../api/conversations.js')
 
-    const port = 30000 + Math.floor(Math.random() * 10000)
-    baseUrl = `http://127.0.0.1:${port}`
-
     server = Bun.serve({
-      port,
+      port: 0,
       hostname: '127.0.0.1',
 
       async fetch(req) {
@@ -1393,6 +2237,7 @@ describe('Sessions API', () => {
         return new Response('Not Found', { status: 404 })
       },
     })
+    baseUrl = `http://127.0.0.1:${server.port}`
   })
 
   afterEach(async () => {
@@ -1400,6 +2245,9 @@ describe('Sessions API', () => {
       server.stop(true)
       server = null
     }
+    clearInstalledPluginsCache()
+    clearPluginCache('sessions-api-test-teardown')
+    resetSettingsCache()
     await cleanupTmpDir()
   })
 
@@ -1439,6 +2287,27 @@ describe('Sessions API', () => {
     expect(body.sessionId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
     )
+  })
+
+  it('GET /api/sessions/:id/inspection should report persisted permission mode for inactive sessions', async () => {
+    const workDir = await fs.mkdtemp(path.join(tmpDir, 'api-session-permission-'))
+    const createRes = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workDir, permissionMode: 'bypassPermissions' }),
+    })
+    expect(createRes.status).toBe(201)
+
+    const { sessionId } = (await createRes.json()) as { sessionId: string }
+    const inspectionRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/inspection?includeContext=0`)
+    expect(inspectionRes.status).toBe(200)
+
+    const inspection = (await inspectionRes.json()) as {
+      active: boolean
+      status: { permissionMode?: string }
+    }
+    expect(inspection.active).toBe(false)
+    expect(inspection.status.permissionMode).toBe('bypassPermissions')
   })
 
   it('GET /api/sessions/repository-context should return branch launch metadata', async () => {
@@ -1518,9 +2387,9 @@ describe('Sessions API', () => {
     await writeSessionFile('-tmp-api-test', sessionId, [
       makeSnapshotEntry(),
       makeUserEntry('Hello'),
-      makeAssistantEntry('World'),
+      makeAssistantEntry('World', undefined, { input_tokens: 1234, output_tokens: 56 }),
       makeUserEntry(
-        '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>failed</status>\n<summary>Background command failed &amp; stopped</summary>\n<output-file>C:\\Temp\\bg.output</output-file>\n</task-notification>',
+        '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>failed</status>\n<summary>Background command failed &amp; stopped</summary>\n<result>Stack trace &amp; failed assertion</result>\n<output-file>C:\\Temp\\bg.output</output-file>\n</task-notification>',
         crypto.randomUUID(),
       ),
       makeAssistantEntry('internal task response'),
@@ -1534,6 +2403,10 @@ describe('Sessions API', () => {
       taskNotifications: unknown[]
     }
     expect(body.messages).toHaveLength(2)
+    expect(body.messages[1]).toMatchObject({
+      type: 'assistant',
+      usage: { input_tokens: 1234, output_tokens: 56 },
+    })
     expect(JSON.stringify(body.messages)).not.toContain('<task-notification>')
     expect(body.taskNotifications).toEqual([
       {
@@ -1541,7 +2414,9 @@ describe('Sessions API', () => {
         toolUseId: 'toolu_bg',
         status: 'failed',
         summary: 'Background command failed & stopped',
+        result: 'Stack trace & failed assertion',
         outputFile: 'C:\\Temp\\bg.output',
+        timestamp: expect.any(String),
       },
     ])
   })
@@ -1588,11 +2463,11 @@ describe('Sessions API', () => {
     }
   })
 
-  it('GET /api/sessions/:id/git-info should include isolated worktree identity', async () => {
+  it('GET /api/sessions/:id/git-info should keep the visible launch branch while including isolated worktree identity', async () => {
     const workDir = await createCleanGitRepo(tmpDir)
     const { sessionId } = await sessionService.createSession(
       workDir,
-      { branch: 'main', worktree: true },
+      { branch: 'feature/rail', worktree: true },
     )
     const launchInfo = await sessionService.getSessionLaunchInfo(sessionId)
     const repository = launchInfo?.repository
@@ -1600,7 +2475,7 @@ describe('Sessions API', () => {
     expect(repository?.worktreeBranch).toBeTruthy()
 
     const activeWorktree = repository!.worktreePath!
-    git(workDir, 'worktree', 'add', '-b', repository!.worktreeBranch!, activeWorktree, 'main')
+    git(workDir, 'worktree', 'add', '-b', repository!.worktreeBranch!, activeWorktree, 'feature/rail')
     const sessionsMap = (conversationService as any).sessions as Map<string, { workDir: string }>
 
     sessionsMap.set(sessionId, { workDir: activeWorktree })
@@ -1620,7 +2495,7 @@ describe('Sessions API', () => {
           branch: string | null
         } | null
       }
-      expect(body.branch).toBe('main')
+      expect(body.branch).toBe('feature/rail')
       expect(body.workDir).toBe(activeWorktree)
       expect(body.worktree).toEqual({
         enabled: true,
@@ -1729,6 +2604,56 @@ describe('Sessions API', () => {
     })
   })
 
+  it('GET /api/sessions/:id/git-info should not hang when git blocks in a UTF-8 workDir', async () => {
+    if (process.platform === 'win32') return
+
+    const parentDir = path.join(tmpDir, '数据包看板')
+    const workDir = path.join(parentDir, 'datavizprocessingplatform')
+    await fs.mkdir(workDir, { recursive: true })
+    git(workDir, 'init', '--initial-branch', 'main')
+    git(workDir, 'config', 'user.email', 'sessions-api@example.com')
+    git(workDir, 'config', 'user.name', 'Sessions API')
+    await fs.writeFile(path.join(workDir, 'README.md'), 'main\n')
+    git(workDir, 'add', 'README.md')
+    git(workDir, 'commit', '-m', 'initial')
+
+    const fsmonitorPath = path.join(tmpDir, 'slow-fsmonitor.sh')
+    await fs.writeFile(fsmonitorPath, '#!/bin/sh\nsleep 2\nexit 0\n', 'utf-8')
+    await fs.chmod(fsmonitorPath, 0o755)
+    git(workDir, 'config', 'core.fsmonitor', fsmonitorPath)
+
+    const { sessionId } = await sessionService.createSession(workDir)
+    const oldTimeout = process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS
+    process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS = '80'
+
+    try {
+      const startedAt = Date.now()
+      const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/git-info`, {
+        signal: AbortSignal.timeout(1_000),
+      })
+      expect(Date.now() - startedAt).toBeLessThan(1_000)
+      expect(res.status).toBe(200)
+
+      const body = (await res.json()) as {
+        branch: string | null
+        repoName: string | null
+        workDir: string
+        changedFiles: number
+      }
+      expect(body.workDir).toBe(await fs.realpath(workDir))
+      expect(body.workDir).toContain('数据包看板')
+      expect(body.branch).toBe('main')
+      expect(body.repoName).toBe('datavizprocessingplatform')
+      expect(body.changedFiles).toBe(0)
+    } finally {
+      if (oldTimeout === undefined) {
+        delete process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS
+      } else {
+        process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS = oldTimeout
+      }
+    }
+  })
+
   it('DELETE /api/sessions/:id should delete the session', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-api-test', sessionId, [makeSnapshotEntry()])
@@ -1739,6 +2664,35 @@ describe('Sessions API', () => {
     // Verify it's gone
     const res2 = await fetch(`${baseUrl}/api/sessions/${sessionId}`)
     expect(res2.status).toBe(404)
+  })
+
+  it('DELETE /api/sessions/:id should invalidate recent projects cache', async () => {
+    const workDir = await fs.mkdtemp(path.join(tmpDir, 'recent-cache-delete-'))
+    const createRes = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workDir }),
+    })
+    expect(createRes.status).toBe(201)
+    const { sessionId } = await createRes.json() as { sessionId: string }
+    const realWorkDir = await fs.realpath(workDir)
+
+    const firstRecentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(firstRecentRes.status).toBe(200)
+    const firstRecent = await firstRecentRes.json() as {
+      projects: Array<{ realPath: string }>
+    }
+    expect(firstRecent.projects.some((project) => project.realPath === realWorkDir)).toBe(true)
+
+    const deleteRes = await fetch(`${baseUrl}/api/sessions/${sessionId}`, { method: 'DELETE' })
+    expect(deleteRes.status).toBe(200)
+
+    const secondRecentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(secondRecentRes.status).toBe(200)
+    const secondRecent = await secondRecentRes.json() as {
+      projects: Array<{ realPath: string }>
+    }
+    expect(secondRecent.projects.some((project) => project.realPath === realWorkDir)).toBe(false)
   })
 
   it('DELETE /api/sessions/:id should remove matching IM adapter session mappings', async () => {
@@ -1803,6 +2757,97 @@ describe('Sessions API', () => {
     }
   })
 
+  it('POST /api/sessions/batch-delete should delete sessions and clean adapter mappings', async () => {
+    const sessionIdA = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const sessionIdB = 'ffffffff-1111-2222-3333-ffffffffffff'
+    const otherSessionId = '99999999-1111-2222-3333-999999999999'
+    await writeSessionFile('-tmp-api-test', sessionIdA, [makeSnapshotEntry()])
+    await writeSessionFile('-tmp-api-test', sessionIdB, [makeSnapshotEntry()])
+    await fs.writeFile(
+      path.join(tmpDir, 'adapter-sessions.json'),
+      JSON.stringify({
+        'wechat-chat-a': {
+          sessionId: sessionIdA,
+          workDir: '/tmp/project-a',
+          updatedAt: 1,
+        },
+        'wechat-chat-b': {
+          sessionId: sessionIdB,
+          workDir: '/tmp/project-b',
+          updatedAt: 2,
+        },
+        'other-chat': {
+          sessionId: otherSessionId,
+          workDir: '/tmp/project-c',
+          updatedAt: 3,
+        },
+      }, null, 2),
+      'utf-8',
+    )
+
+    const res = await fetch(`${baseUrl}/api/sessions/batch-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionIds: [sessionIdA, sessionIdB] }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({
+      ok: true,
+      successes: [sessionIdA, sessionIdB],
+      failures: [],
+    })
+
+    expect((await fetch(`${baseUrl}/api/sessions/${sessionIdA}`)).status).toBe(404)
+    expect((await fetch(`${baseUrl}/api/sessions/${sessionIdB}`)).status).toBe(404)
+    const persisted = JSON.parse(
+      await fs.readFile(path.join(tmpDir, 'adapter-sessions.json'), 'utf-8'),
+    )
+    expect(persisted['wechat-chat-a']).toBeUndefined()
+    expect(persisted['wechat-chat-b']).toBeUndefined()
+    expect(persisted['other-chat'].sessionId).toBe(otherSessionId)
+  })
+
+  it('POST /api/sessions/batch-delete should report partial failures and roll back failed delete markers', async () => {
+    const successSessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const failedSessionId = 'ffffffff-1111-2222-3333-ffffffffffff'
+    await writeSessionFile('-tmp-api-test', successSessionId, [makeSnapshotEntry()])
+    await writeSessionFile('-tmp-api-test', failedSessionId, [makeSnapshotEntry()])
+
+    const originalDeleteSession = sessionService.deleteSession.bind(sessionService)
+    sessionService.deleteSession = (async (targetSessionId: string) => {
+      if (targetSessionId === failedSessionId) {
+        throw new Error('simulated batch unlink failure')
+      }
+      return originalDeleteSession(targetSessionId)
+    }) as typeof sessionService.deleteSession
+
+    try {
+      const res = await fetch(`${baseUrl}/api/sessions/batch-delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionIds: [successSessionId, failedSessionId] }),
+      })
+
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({
+        ok: false,
+        successes: [successSessionId],
+        failures: [{
+          sessionId: failedSessionId,
+          message: 'simulated batch unlink failure',
+        }],
+      })
+      expect((conversationService as any).deletedSessions.has(failedSessionId)).toBe(false)
+      expect((await fetch(`${baseUrl}/api/sessions/${successSessionId}`)).status).toBe(404)
+      expect((await fetch(`${baseUrl}/api/sessions/${failedSessionId}`)).status).toBe(200)
+    } finally {
+      sessionService.deleteSession = originalDeleteSession as typeof sessionService.deleteSession
+      conversationService.unmarkSessionDeleted(successSessionId)
+      conversationService.unmarkSessionDeleted(failedSessionId)
+    }
+  })
+
   it('PATCH /api/sessions/:id should rename the session', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-api-test', sessionId, [
@@ -1851,6 +2896,182 @@ describe('Sessions API', () => {
     )
     expect(body.commands).toContainEqual(
       expect.objectContaining({ name: 'project-skill', description: 'Project skill description' }),
+    )
+  })
+
+  it('GET /api/sessions/:id/slash-commands should include legacy custom commands before CLI init', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef'
+    const workDir = path.join(tmpDir, 'workspace', 'app')
+
+    await writeLegacySlashCommand(
+      path.join(tmpDir, 'commands'),
+      'user-probe',
+      'User custom slash command',
+    )
+    await writeLegacySlashCommand(
+      path.join(workDir, '.claude', 'commands'),
+      'project-probe',
+      'Project custom slash command',
+    )
+
+    await writeSessionFile('-tmp-api-test', sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry(workDir),
+    ])
+
+    clearCommandsCache()
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/slash-commands`)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      commands: Array<{ name: string; description: string; argumentHint?: string }>
+    }
+
+    expect(body.commands).toContainEqual(
+      expect.objectContaining({
+        name: 'user-probe',
+        description: 'User custom slash command',
+        argumentHint: '<topic>',
+      }),
+    )
+    expect(body.commands).toContainEqual(
+      expect.objectContaining({
+        name: 'project-probe',
+        description: 'Project custom slash command',
+        argumentHint: '<topic>',
+      }),
+    )
+  })
+
+  it('GET /api/sessions/:id/slash-commands should preserve cached command argument hints when merging custom commands', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeef001'
+    const workDir = path.join(tmpDir, 'workspace', 'app')
+
+    await writeLegacySlashCommand(
+      path.join(workDir, '.claude', 'commands'),
+      'project-probe',
+      'Project custom slash command',
+    )
+
+    await writeSessionFile('-tmp-api-test', sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry(workDir),
+    ])
+
+    updateSessionSlashCommands(
+      sessionId,
+      [{ name: 'builtin-probe', description: 'Cached CLI command', argumentHint: '<value>' }],
+      { notifyClient: false },
+    )
+    clearCommandsCache()
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/slash-commands`)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      commands: Array<{ name: string; description: string; argumentHint?: string }>
+    }
+
+    expect(body.commands).toContainEqual({
+      name: 'builtin-probe',
+      description: 'Cached CLI command',
+      argumentHint: '<value>',
+    })
+    expect(body.commands).toContainEqual(
+      expect.objectContaining({
+        name: 'project-probe',
+        description: 'Project custom slash command',
+      }),
+    )
+  })
+
+  it('GET /api/sessions/:id/slash-commands should include enabled plugin skills before CLI init', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff'
+    const workDir = path.join(tmpDir, 'workspace', 'app')
+    const marketplaceRoot = path.join(tmpDir, 'marketplace-root')
+    const pluginRoot = path.join(marketplaceRoot, 'plugins', 'superpowers')
+    const pluginsDir = path.join(tmpDir, 'plugins')
+    const marketplaceFile = path.join(
+      marketplaceRoot,
+      '.claude-plugin',
+      'marketplace.json',
+    )
+
+    await fs.mkdir(path.join(pluginRoot, '.claude-plugin'), { recursive: true })
+    await fs.mkdir(path.dirname(marketplaceFile), { recursive: true })
+    await fs.mkdir(pluginsDir, { recursive: true })
+    await fs.mkdir(workDir, { recursive: true })
+    await writeSkill(
+      path.join(pluginRoot, 'skills'),
+      'brainstorming',
+      'Superpowers brainstorming skill',
+    )
+    await fs.writeFile(
+      path.join(pluginRoot, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({
+        name: 'superpowers',
+        version: '5.0.7',
+        description: 'Core skills library',
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      marketplaceFile,
+      JSON.stringify({
+        name: 'claude-plugins-official',
+        owner: { name: 'Test' },
+        plugins: [
+          {
+            name: 'superpowers',
+            source: './plugins/superpowers',
+            version: '5.0.7',
+          },
+        ],
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        'claude-plugins-official': {
+          source: { source: 'directory', path: marketplaceRoot },
+          installLocation: marketplaceRoot,
+          lastUpdated: new Date(0).toISOString(),
+        },
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({
+        enabledPlugins: {
+          'superpowers@claude-plugins-official': true,
+        },
+      }),
+      'utf-8',
+    )
+
+    resetSettingsCache()
+    clearPluginCache('sessions-api-plugin-skills')
+    clearCommandsCache()
+    await writeSessionFile('-tmp-api-test', sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry(workDir),
+    ])
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/slash-commands`)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      commands: Array<{ name: string; description: string }>
+    }
+
+    expect(body.commands).toContainEqual(
+      expect.objectContaining({
+        name: 'superpowers:brainstorming',
+        description: 'Superpowers brainstorming skill',
+      }),
     )
   })
 
@@ -2248,6 +3469,147 @@ describe('Sessions API', () => {
     expect(await res.json()).toMatchObject({
       error: 'METHOD_NOT_ALLOWED',
     })
+  })
+
+  it('POST /api/sessions/:id/branch should create a branched session up to the target message', async () => {
+    const sessionId = '11111111-1111-4111-8111-111111111111'
+    const workDir = path.join(tmpDir, 'branch-api-workdir')
+    const firstUserId = crypto.randomUUID()
+    const firstAssistantId = crypto.randomUUID()
+    const secondUserId = crypto.randomUUID()
+    const secondAssistantId = crypto.randomUUID()
+
+    await writeSessionFile(sanitizePath(workDir), sessionId, [
+      {
+        type: 'session-meta',
+        isMeta: true,
+        workDir,
+        timestamp: '2026-01-01T00:00:00.000Z',
+      },
+      {
+        ...makeUserEntry('first prompt', firstUserId),
+        cwd: workDir,
+        sessionId,
+      },
+      {
+        ...makeAssistantEntry('first reply', firstUserId),
+        uuid: firstAssistantId,
+        cwd: workDir,
+        sessionId,
+      },
+      {
+        ...makeUserEntry('second prompt', secondUserId),
+        parentUuid: firstAssistantId,
+        cwd: workDir,
+        sessionId,
+      },
+      {
+        ...makeAssistantEntry('second reply', secondUserId),
+        uuid: secondAssistantId,
+        cwd: workDir,
+        sessionId,
+      },
+    ])
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetMessageId: firstAssistantId,
+        title: 'API branch',
+      }),
+    })
+    expect(res.status).toBe(201)
+
+    const body = await res.json() as {
+      sessionId: string
+      title: string
+      workDir: string
+      sourceSessionId: string
+      targetMessageId: string
+    }
+    expect(body).toMatchObject({
+      title: 'API branch (Branch)',
+      workDir,
+      sourceSessionId: sessionId,
+      targetMessageId: firstAssistantId,
+    })
+
+    const branchMessages = await service.getSessionMessages(body.sessionId)
+    expect(branchMessages.map((message) => message.id)).toEqual([
+      firstUserId,
+      firstAssistantId,
+    ])
+  })
+
+  it('POST /api/sessions/:id/branch should reject sidechain targets', async () => {
+    const sessionId = '22222222-2222-4222-8222-222222222222'
+    const rootUserId = crypto.randomUUID()
+    const rootAssistantId = crypto.randomUUID()
+    const sidechainId = crypto.randomUUID()
+
+    await writeSessionFile('-tmp-api-branch-sidechain', sessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeUserEntry('root prompt', rootUserId),
+        sessionId,
+      },
+      {
+        ...makeAssistantEntry('root reply', rootUserId),
+        uuid: rootAssistantId,
+        sessionId,
+      },
+      {
+        ...makeUserEntry('side question', sidechainId),
+        parentUuid: rootAssistantId,
+        isSidechain: true,
+        sessionId,
+      },
+    ])
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetMessageId: sidechainId }),
+    })
+
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({
+      error: 'BAD_REQUEST',
+    })
+  })
+
+  it('POST /api/sessions/:id/branch should validate request bodies and missing sessions', async () => {
+    const methodNotAllowedRes = await fetch(`${baseUrl}/api/sessions/33333333-3333-4333-8333-333333333333/branch`)
+    expect(methodNotAllowedRes.status).toBe(405)
+
+    const missingTargetRes = await fetch(`${baseUrl}/api/sessions/branch-missing-target/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    expect(missingTargetRes.status).toBe(400)
+
+    const invalidJsonRes = await fetch(`${baseUrl}/api/sessions/branch-invalid-json/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{',
+    })
+    expect(invalidJsonRes.status).toBe(400)
+
+    const invalidTitleRes = await fetch(`${baseUrl}/api/sessions/44444444-4444-4444-8444-444444444444/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetMessageId: 'message-1', title: 123 }),
+    })
+    expect(invalidTitleRes.status).toBe(400)
+
+    const missingSessionRes = await fetch(`${baseUrl}/api/sessions/00000000-0000-0000-0000-000000000000/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetMessageId: 'missing-target' }),
+    })
+    expect(missingSessionRes.status).toBe(404)
   })
 
   it('POST /api/sessions/:id/rewind should preview and trim the active conversation chain', async () => {

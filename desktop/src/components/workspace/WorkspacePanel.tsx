@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { MessageCircle } from 'lucide-react'
 import { Highlight } from 'prism-react-renderer'
 import type {
   WorkspaceChangedFile,
@@ -16,6 +17,9 @@ import {
 } from '../../stores/workspacePanelStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
+import { useUIStore } from '../../stores/uiStore'
+import { copyTextToClipboard } from '../chat/clipboard'
+import { clearWindowSelection, getSelectionPopoverPosition, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
 import { MarkdownRenderer } from '../markdown/MarkdownRenderer'
 import {
   getFileExtension,
@@ -24,9 +28,21 @@ import {
   WorkspaceDiffSurface,
   workspacePrismTheme,
 } from './WorkspaceCodeSurface'
+import { WorkspaceFileOpenWith } from './WorkspaceFileOpenWith'
 
 type WorkspacePanelProps = {
   sessionId: string
+  /**
+   * When hosted inside the unified WorkbenchPanel, the close action lives in the
+   * shared workbench mode strip. Set this to drop WorkspacePanel's own close
+   * button so the panel header doesn't render a duplicate close control.
+   */
+  embedded?: boolean
+  /**
+   * Main-content workbench tabs reuse the same workspace preview UI without
+   * depending on the right-side panel's open bit.
+   */
+  forceVisible?: boolean
 }
 
 type TreeNodeProps = {
@@ -40,8 +56,15 @@ type TreeNodeProps = {
   filterQuery: string
   onToggle: (path: string) => void
   onOpenFile: (path: string) => void
-  onFileContextMenu: (event: MouseEvent, path: string) => void
+  onFileContextMenu: (event: MouseEvent, path: string, isDirectory: boolean) => void
   activePath: string | null
+}
+
+type FileContextMenuState = {
+  path: string
+  isDirectory: boolean
+  x: number
+  y: number
 }
 
 const FILE_STATUS_META: Record<WorkspaceFileStatus, { label: string; className: string }> = {
@@ -82,6 +105,9 @@ const FILE_STATUS_META: Record<WorkspaceFileStatus, { label: string; className: 
 const EMPTY_TREE_BY_PATH: Record<string, WorkspaceTreeResult | undefined> = {}
 const EMPTY_PREVIEW_TABS: WorkspacePreviewTab[] = []
 const EMPTY_EXPANDED_PATHS: string[] = []
+const SELECTION_MENU_OFFSET = 10
+const SELECTION_MENU_WIDTH = 158
+const SELECTION_MENU_HEIGHT = 44
 const FILE_BADGE_META: Record<string, { label: string; className: string }> = {
   ts: { label: 'TS', className: 'bg-[var(--color-secondary)]/14 text-[var(--color-secondary)]' },
   tsx: { label: 'TSX', className: 'bg-[var(--color-secondary)]/14 text-[var(--color-secondary)]' },
@@ -134,6 +160,11 @@ function getFileBadgeMeta(name: string) {
 function resolveWorkspaceAttachmentPath(workDir: string | undefined, filePath: string) {
   if (!workDir || filePath.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(filePath)) return filePath
   return `${workDir.replace(/[\\/]+$/, '')}/${filePath.replace(/^[/\\]+/, '')}`
+}
+
+function getWorkspaceReferenceName(path: string, isDirectory = false) {
+  const name = path.split('/').filter(Boolean).pop() || path
+  return isDirectory && !name.endsWith('/') ? `${name}/` : name
 }
 
 function isMarkdownPreview(tab: WorkspacePreviewTab) {
@@ -205,6 +236,117 @@ function treeEntryMatchesFilter(
   const childTree = treeByPath[entry.path]
   if (childTree?.state !== 'ok') return false
   return childTree.entries.some((child) => treeEntryMatchesFilter(child, query, treeByPath))
+}
+
+type WorkspaceTextSelection = {
+  text: string
+  startLine?: number
+  endLine?: number
+}
+
+type FloatingSelectionMenuState = WorkspaceTextSelection & {
+  x: number
+  y: number
+}
+
+type SelectionPointer = {
+  clientX: number
+  clientY: number
+}
+
+function getElementForNode(node: Node | null): Element | null {
+  if (!node) return null
+  return node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement
+}
+
+function getLineNumberFromNode(node: Node | null, root: HTMLElement) {
+  const element = getElementForNode(node)
+  const row = element?.closest('[data-workspace-line-number]')
+  if (!row || !root.contains(row)) return undefined
+  const line = Number(row.getAttribute('data-workspace-line-number'))
+  return Number.isFinite(line) ? line : undefined
+}
+
+function getSelectionPosition(range: Range, root: HTMLElement, pointer?: SelectionPointer) {
+  return getSelectionPopoverPosition(range, root, {
+    menuWidth: SELECTION_MENU_WIDTH,
+    menuHeight: SELECTION_MENU_HEIGHT,
+    offset: SELECTION_MENU_OFFSET,
+    fallbackPointer: pointer,
+  })
+}
+
+function getTextSelectionFromContainer(
+  root: HTMLElement | null,
+  resolveLines?: (text: string, range: Range) => { startLine?: number; endLine?: number },
+  pointer?: SelectionPointer,
+): FloatingSelectionMenuState | null {
+  if (!root) return null
+
+  const selection = window.getSelection()
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null
+
+  const range = selection.getRangeAt(0)
+  const startElement = getElementForNode(range.startContainer)
+  const endElement = getElementForNode(range.endContainer)
+  if (!startElement || !endElement || !root.contains(startElement) || !root.contains(endElement)) {
+    return null
+  }
+
+  const text = selection.toString().trim()
+  if (!text) return null
+
+  const nodeLines = {
+    startLine: getLineNumberFromNode(range.startContainer, root),
+    endLine: getLineNumberFromNode(range.endContainer, root),
+  }
+  const resolvedLines = resolveLines?.(text, range) ?? nodeLines
+  const startLine = resolvedLines.startLine ?? nodeLines.startLine
+  const endLine = resolvedLines.endLine ?? nodeLines.endLine ?? startLine
+  const orderedStart = startLine && endLine ? Math.min(startLine, endLine) : startLine
+  const orderedEnd = startLine && endLine ? Math.max(startLine, endLine) : endLine
+
+  return {
+    ...getSelectionPosition(range, root, pointer),
+    text,
+    ...(orderedStart ? { startLine: orderedStart } : {}),
+    ...(orderedEnd ? { endLine: orderedEnd } : {}),
+  }
+}
+
+function getLineRangeForText(value: string, text: string) {
+  const index = value.indexOf(text)
+  if (index < 0) return {}
+  const startLine = value.slice(0, index).split('\n').length
+  const endLine = startLine + text.split('\n').length - 1
+  return { startLine, endLine }
+}
+
+function FloatingSelectionMenu({
+  selection,
+  onAdd,
+  popoverRef,
+}: {
+  selection: FloatingSelectionMenuState | null
+  onAdd: () => void
+  popoverRef: { current: HTMLButtonElement | null }
+}) {
+  const t = useTranslation()
+  if (!selection) return null
+
+  return (
+    <button
+      ref={popoverRef}
+      type="button"
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={onAdd}
+      className="fixed z-50 inline-flex h-11 items-center gap-2 rounded-full border border-[var(--color-border)]/70 bg-[var(--color-surface-container-lowest)] px-5 text-[15px] font-semibold text-[var(--color-text-primary)] shadow-[0_10px_28px_rgba(15,23,42,0.14),0_2px_8px_rgba(15,23,42,0.08)] transition-colors hover:bg-[var(--color-surface)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
+      style={{ left: selection.x, top: selection.y }}
+    >
+      <MessageCircle size={21} strokeWidth={2.15} className="shrink-0 text-[var(--color-text-primary)]" aria-hidden="true" />
+      <span>{t('workspace.addSelectionToChat')}</span>
+    </button>
+  )
 }
 
 function PanelMessage({
@@ -308,15 +450,20 @@ function CodeSurface({
   value,
   language,
   onAddLineComment,
+  onAddSelection,
 }: {
   value: string
   language: string
   onAddLineComment: (line: number, note: string, quote: string) => void
+  onAddSelection: (selection: WorkspaceTextSelection) => void
 }) {
   const t = useTranslation()
+  const surfaceRef = useRef<HTMLDivElement>(null)
+  const selectionMenuRef = useRef<HTMLButtonElement>(null)
   const [commentLine, setCommentLine] = useState<number | null>(null)
   const [commentDraft, setCommentDraft] = useState('')
   const [showAllLines, setShowAllLines] = useState(false)
+  const [selectionMenu, setSelectionMenu] = useState<FloatingSelectionMenuState | null>(null)
   const lines = value.split('\n')
   const visibleLines = showAllLines ? lines : lines.slice(0, WORKSPACE_PREVIEW_LINE_LIMIT)
   const activeQuote = commentLine ? visibleLines[commentLine - 1] ?? '' : ''
@@ -327,13 +474,48 @@ function CodeSurface({
     setShowAllLines(false)
     setCommentLine(null)
     setCommentDraft('')
+    setSelectionMenu(null)
   }, [language, value])
+
+  const dismissSelectionMenu = useCallback(() => {
+    setSelectionMenu(null)
+  }, [])
+
+  useSelectionPopoverDismiss({
+    active: Boolean(selectionMenu),
+    popoverRef: selectionMenuRef,
+    onDismiss: dismissSelectionMenu,
+  })
 
   const submitLineComment = () => {
     if (!commentLine || !commentDraft.trim()) return
     onAddLineComment(commentLine, commentDraft.trim(), activeQuote)
     setCommentLine(null)
     setCommentDraft('')
+  }
+
+  const handleSelectionMouseUp = (event: MouseEvent<HTMLDivElement>) => {
+    const selection = getTextSelectionFromContainer(surfaceRef.current, undefined, event)
+    if (!selection?.startLine || !selection.endLine || selection.startLine === selection.endLine) {
+      setSelectionMenu(selection)
+      return
+    }
+
+    setSelectionMenu({
+      ...selection,
+      text: visibleLines.slice(selection.startLine - 1, selection.endLine).join('\n').trim(),
+    })
+  }
+
+  const addCurrentSelectionToChat = () => {
+    if (!selectionMenu) return
+    onAddSelection({
+      text: selectionMenu.text,
+      startLine: selectionMenu.startLine,
+      endLine: selectionMenu.endLine,
+    })
+    setSelectionMenu(null)
+    clearWindowSelection()
   }
 
   const renderLineCommentEditor = (lineNumber: number) => {
@@ -398,7 +580,14 @@ function CodeSurface({
   )
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto bg-[var(--color-code-bg)]">
+    <div
+      ref={surfaceRef}
+      className="min-h-0 flex-1 overflow-auto bg-[var(--color-code-bg)]"
+      onMouseUp={handleSelectionMouseUp}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') setSelectionMenu(null)
+      }}
+    >
       <div className="relative min-w-max py-2">
         {usePlainLargePreview ? (
           <pre
@@ -411,7 +600,10 @@ function CodeSurface({
               const lineNumber = index + 1
               return (
                 <div key={lineNumber}>
-                  <div className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]">
+                  <div
+                    className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]"
+                    data-workspace-line-number={lineNumber}
+                  >
                     {renderLineNumberButton(lineNumber)}
                     <span className="whitespace-pre pr-6">{line || ' '}</span>
                   </div>
@@ -440,6 +632,7 @@ function CodeSurface({
                     <div key={String(lineKey)}>
                       <div
                         {...lineProps}
+                        data-workspace-line-number={lineNumber}
                         className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]"
                       >
                         {renderLineNumberButton(lineNumber)}
@@ -475,13 +668,64 @@ function CodeSurface({
           </div>
         )}
       </div>
+      <FloatingSelectionMenu selection={selectionMenu} onAdd={addCurrentSelectionToChat} popoverRef={selectionMenuRef} />
     </div>
   )
 }
 
-function MarkdownSurface({ value }: { value: string }) {
+function MarkdownSurface({
+  value,
+  onAddSelection,
+}: {
+  value: string
+  onAddSelection: (selection: WorkspaceTextSelection) => void
+}) {
+  const surfaceRef = useRef<HTMLDivElement>(null)
+  const selectionMenuRef = useRef<HTMLButtonElement>(null)
+  const [selectionMenu, setSelectionMenu] = useState<FloatingSelectionMenuState | null>(null)
+
+  useEffect(() => {
+    setSelectionMenu(null)
+  }, [value])
+
+  const dismissSelectionMenu = useCallback(() => {
+    setSelectionMenu(null)
+  }, [])
+
+  useSelectionPopoverDismiss({
+    active: Boolean(selectionMenu),
+    popoverRef: selectionMenuRef,
+    onDismiss: dismissSelectionMenu,
+  })
+
+  const handleSelectionMouseUp = (event: MouseEvent<HTMLDivElement>) => {
+    setSelectionMenu(getTextSelectionFromContainer(
+      surfaceRef.current,
+      (text) => getLineRangeForText(value, text),
+      event,
+    ))
+  }
+
+  const addCurrentSelectionToChat = () => {
+    if (!selectionMenu) return
+    onAddSelection({
+      text: selectionMenu.text,
+      startLine: selectionMenu.startLine,
+      endLine: selectionMenu.endLine,
+    })
+    setSelectionMenu(null)
+    clearWindowSelection()
+  }
+
   return (
-    <div className="min-h-0 flex-1 overflow-auto bg-[var(--color-surface)]">
+    <div
+      ref={surfaceRef}
+      className="min-h-0 flex-1 overflow-auto bg-[var(--color-surface)]"
+      onMouseUp={handleSelectionMouseUp}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') setSelectionMenu(null)
+      }}
+    >
       <div className="mx-auto w-full max-w-[860px] px-6 py-5">
         <MarkdownRenderer
           content={value}
@@ -489,6 +733,7 @@ function MarkdownSurface({ value }: { value: string }) {
           className="workspace-markdown-preview prose-p:text-[14px] prose-p:leading-7 prose-h1:text-[24px] prose-h2:text-[18px] prose-h3:text-[15px] prose-code:text-[12px] prose-pre:my-4"
         />
       </div>
+      <FloatingSelectionMenu selection={selectionMenu} onAdd={addCurrentSelectionToChat} popoverRef={selectionMenuRef} />
     </div>
   )
 }
@@ -579,7 +824,7 @@ function TreeNode({
       <button
         type="button"
         onClick={() => onOpenFile(entry.path)}
-        onContextMenu={(event) => onFileContextMenu(event, entry.path)}
+        onContextMenu={(event) => onFileContextMenu(event, entry.path, false)}
         className={`group mx-2 flex h-8 w-[calc(100%-16px)] items-center gap-2 rounded-[7px] pr-2 text-left transition-colors ${
           isActive
             ? 'bg-[var(--color-surface-selected)] shadow-[inset_0_0_0_1.5px_var(--color-border-focus)]'
@@ -598,6 +843,7 @@ function TreeNode({
       <button
         type="button"
         onClick={() => onToggle(entry.path)}
+        onContextMenu={(event) => onFileContextMenu(event, entry.path, true)}
         aria-expanded={isVisuallyExpanded}
         className="group mx-2 flex h-8 w-[calc(100%-16px)] items-center gap-2 rounded-[7px] pr-2 text-left transition-colors hover:bg-[var(--color-surface-hover)]"
         style={{ paddingLeft: indent }}
@@ -671,12 +917,14 @@ function TreeNode({
   )
 }
 
-export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
+export function WorkspacePanel({ sessionId, embedded = false, forceVisible = false }: WorkspacePanelProps) {
   const t = useTranslation()
+  const addToast = useUIStore((state) => state.addToast)
   const [filterQuery, setFilterQuery] = useState('')
   const [isViewMenuOpen, setIsViewMenuOpen] = useState(false)
+  const [isNavigatorOpen, setIsNavigatorOpen] = useState(false)
   const [previewTabContextMenu, setPreviewTabContextMenu] = useState<{ tabId: string; x: number; y: number } | null>(null)
-  const [fileContextMenu, setFileContextMenu] = useState<{ path: string; x: number; y: number } | null>(null)
+  const [fileContextMenu, setFileContextMenu] = useState<FileContextMenuState | null>(null)
   const width = useWorkspacePanelStore((state) => state.width)
   const isOpen = useWorkspacePanelStore((state) => state.isPanelOpen(sessionId))
   const activeView = useWorkspacePanelStore((state) => state.getActiveView(sessionId))
@@ -703,6 +951,7 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
   const closePanel = useWorkspacePanelStore((state) => state.closePanel)
   const addWorkspaceReference = useWorkspaceChatContextStore((state) => state.addReference)
   const chatState = useChatStore((state) => state.sessions[sessionId]?.chatState ?? 'idle')
+  const shouldRender = forceVisible || isOpen
   const refreshLifecycleRef = useRef({
     sessionId,
     isOpen: false,
@@ -717,6 +966,8 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
   const expandedPathSet = new Set(expandedPaths)
   const activePreviewTab =
     previewTabs.find((tab) => tab.id === activePreviewTabId) ?? previewTabs[previewTabs.length - 1] ?? null
+  const hasPreviewTabs = previewTabs.length > 0
+  const isNavigatorVisible = !hasPreviewTabs || isNavigatorOpen
   const activeTreePath = activePreviewTab?.kind === 'file' ? activePreviewTab.path : null
   const filteredChangedFiles = useMemo(
     () => (status?.changedFiles ?? []).filter((file) => changedFileMatchesFilter(file, normalizedFilterQuery)),
@@ -741,25 +992,25 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
   useEffect(() => {
     const previous = refreshLifecycleRef.current
     const sessionChanged = previous.sessionId !== sessionId
-    const opened = isOpen && (sessionChanged || !previous.isOpen)
+    const opened = shouldRender && (sessionChanged || !previous.isOpen)
     const completedTurn =
-      isOpen &&
+      shouldRender &&
       !sessionChanged &&
       previous.chatState !== 'idle' &&
       chatState === 'idle'
 
-    refreshLifecycleRef.current = { sessionId, isOpen, chatState }
+    refreshLifecycleRef.current = { sessionId, isOpen: shouldRender, chatState }
 
     const shouldRefreshOnOpen = opened
     const shouldRefreshAfterCompletedTurn = completedTurn && chatState === 'idle'
     if ((!shouldRefreshOnOpen && !shouldRefreshAfterCompletedTurn) || statusLoading) return
     void loadStatus(sessionId)
-  }, [chatState, isOpen, loadStatus, sessionId, statusLoading])
+  }, [chatState, loadStatus, sessionId, shouldRender, statusLoading])
 
   useEffect(() => {
-    if (!isOpen || activeView !== 'all' || rootTree || rootTreeLoading || rootTreeError) return
+    if (!shouldRender || !isNavigatorVisible || activeView !== 'all' || rootTree || rootTreeLoading || rootTreeError) return
     void loadTree(sessionId, '')
-  }, [activeView, isOpen, loadTree, rootTree, rootTreeError, rootTreeLoading, sessionId])
+  }, [activeView, isNavigatorVisible, loadTree, rootTree, rootTreeError, rootTreeLoading, sessionId, shouldRender])
 
   useEffect(() => {
     if (!previewTabContextMenu && !fileContextMenu) return
@@ -771,9 +1022,20 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
     return () => document.removeEventListener('click', close)
   }, [fileContextMenu, previewTabContextMenu])
 
-  if (!isOpen) return null
+  useEffect(() => {
+    if (!hasPreviewTabs && isNavigatorOpen) {
+      setIsNavigatorOpen(false)
+    }
+  }, [hasPreviewTabs, isNavigatorOpen])
 
-  const hasPreviewTabs = previewTabs.length > 0
+  useEffect(() => {
+    if (!isNavigatorVisible) {
+      setIsViewMenuOpen(false)
+    }
+  }, [isNavigatorVisible])
+
+  if (!shouldRender) return null
+
   const panelWidth = hasPreviewTabs ? width : Math.min(width, 520)
   const panelMaxWidth = hasPreviewTabs ? 'min(62%, calc(100% - 328px))' : '36%'
   const panelMinWidth = hasPreviewTabs ? 'min(420px, 54%)' : 'min(340px, 40%)'
@@ -793,12 +1055,13 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
     void openPreview(sessionId, path, 'file')
   }
 
-  const addFileToChat = (path: string) => {
+  const addWorkspacePathToChat = (path: string, isDirectory = false) => {
     addWorkspaceReference(sessionId, {
       kind: 'file',
       path,
       absolutePath: resolveWorkspaceAttachmentPath(status?.workDir, path),
-      name: path.split('/').pop() || path,
+      name: getWorkspaceReferenceName(path, isDirectory),
+      isDirectory,
     })
   }
 
@@ -815,6 +1078,18 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
     })
   }
 
+  const addSelectionToChat = (path: string, selection: WorkspaceTextSelection) => {
+    addWorkspaceReference(sessionId, {
+      kind: 'code-selection',
+      path,
+      absolutePath: resolveWorkspaceAttachmentPath(status?.workDir, path),
+      name: path.split('/').pop() || path,
+      lineStart: selection.startLine,
+      lineEnd: selection.endLine,
+      quote: selection.text,
+    })
+  }
+
   const handleSetActiveView = (view: 'changed' | 'all') => {
     setActiveView(sessionId, view)
     setIsViewMenuOpen(false)
@@ -827,11 +1102,11 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
     setPreviewTabContextMenu({ tabId, x: event.clientX, y: event.clientY })
   }
 
-  const handleFileContextMenu = (event: MouseEvent, path: string) => {
+  const handleFileContextMenu = (event: MouseEvent, path: string, isDirectory = false) => {
     event.preventDefault()
     event.stopPropagation()
     setPreviewTabContextMenu(null)
-    setFileContextMenu({ path, x: event.clientX, y: event.clientY })
+    setFileContextMenu({ path, isDirectory, x: event.clientX, y: event.clientY })
   }
 
   const handleClosePreviewTabs = (scope: WorkspacePreviewCloseScope) => {
@@ -840,10 +1115,14 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
     setPreviewTabContextMenu(null)
   }
 
-  const copyWorkspacePath = (path: string) => {
-    const resolvedPath = resolveWorkspaceAttachmentPath(status?.workDir, path)
-    void navigator.clipboard?.writeText(resolvedPath)
+  const copyWorkspacePath = async (path: string, mode: 'relative' | 'absolute' = 'relative') => {
+    const pathToCopy = mode === 'absolute' ? resolveWorkspaceAttachmentPath(status?.workDir, path) : path
+    const copied = await copyTextToClipboard(pathToCopy)
     setFileContextMenu(null)
+    addToast({
+      type: copied ? 'success' : 'error',
+      message: copied ? t('workspace.pathCopied') : t('common.copyFailed'),
+    })
   }
 
   const renderChangedView = () => {
@@ -975,7 +1254,7 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
           ))}
           <button
             type="button"
-            onClick={() => addFileToChat(activePreviewTab.path)}
+            onClick={() => addWorkspacePathToChat(activePreviewTab.path)}
             className="ml-auto inline-flex h-6 shrink-0 items-center gap-1 rounded-[6px] px-1.5 text-[11px] text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]"
           >
             <span aria-hidden="true" className="material-symbols-outlined text-[14px]">person_add</span>
@@ -996,12 +1275,16 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
             path={activePreviewTab.path}
           />
         ) : state === 'ok' && isMarkdownPreview(activePreviewTab) ? (
-          <MarkdownSurface value={activePreviewTab.content ?? ''} />
+          <MarkdownSurface
+            value={activePreviewTab.content ?? ''}
+            onAddSelection={(selection) => addSelectionToChat(activePreviewTab.path, selection)}
+          />
         ) : state === 'ok' ? (
           <CodeSurface
             value={activePreviewTab.content ?? ''}
             language={activePreviewTab.language ?? 'text'}
             onAddLineComment={(line, note, quote) => addLineCommentToChat(activePreviewTab.path, line, note, quote)}
+            onAddSelection={(selection) => addSelectionToChat(activePreviewTab.path, selection)}
           />
         ) : (
           <PanelMessage
@@ -1017,60 +1300,69 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
   const renderPreviewTabs = () => (
     <>
       <div
-        role="tablist"
-        aria-label={t('workspace.previewTabs')}
-        className="flex h-11 shrink-0 items-center gap-1 overflow-x-auto border-b border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3"
+        className="flex h-11 shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3"
       >
-        {previewTabs.length === 0 ? (
-          <div className="flex items-center gap-2 px-1.5 text-[12px] text-[var(--color-text-tertiary)]">
-            <span className="material-symbols-outlined text-[15px]">docs</span>
-            <span>{t('workspace.preview')}</span>
-          </div>
-        ) : (
-          previewTabs.map((tab) => {
-            const kindLabel = getPreviewKindLabel(t, tab.kind)
-            const isActive = tab.id === activePreviewTab?.id
+        <div
+          role="tablist"
+          aria-label={t('workspace.previewTabs')}
+          className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto bg-[var(--color-surface-container-lowest)]"
+        >
+          {previewTabs.length === 0 ? (
+            <div className="flex items-center gap-2 px-1.5 text-[12px] text-[var(--color-text-tertiary)]">
+              <span className="material-symbols-outlined text-[15px]">docs</span>
+              <span>{t('workspace.preview')}</span>
+            </div>
+          ) : (
+            previewTabs.map((tab) => {
+              const kindLabel = getPreviewKindLabel(t, tab.kind)
+              const isActive = tab.id === activePreviewTab?.id
 
-            return (
-              <div
-                key={tab.id}
-                onContextMenu={(event) => handlePreviewTabContextMenu(event, tab.id)}
-                className={`group flex h-8 min-w-[118px] max-w-[210px] shrink-0 items-center gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors ${
-                  isActive
-                    ? 'bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
-                    : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]'
-                }`}
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={isActive}
-                  onClick={() => {
-                    void openPreview(sessionId, tab.path, tab.kind)
-                  }}
-                  className="min-w-0 flex flex-1 items-center gap-2 text-left"
+              return (
+                <div
+                  key={tab.id}
+                  onContextMenu={(event) => handlePreviewTabContextMenu(event, tab.id)}
+                  className={`group flex h-8 min-w-[118px] max-w-[210px] shrink-0 items-center gap-2 rounded-[8px] px-2 text-left text-[13px] transition-colors ${
+                    isActive
+                      ? 'bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
+                      : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]'
+                  }`}
                 >
-                  {tab.kind === 'diff' ? (
-                    <span className="material-symbols-outlined shrink-0 text-[15px] text-[var(--color-text-tertiary)]">difference</span>
-                  ) : (
-                    <FileTypeBadge name={tab.title} subtle={!isActive} />
-                  )}
-                  <span className="min-w-0 flex-1 truncate">{tab.title}</span>
-                </button>
-                <button
-                  type="button"
-                  aria-label={`${t('workspace.closeTab')} ${tab.title} ${kindLabel}`}
-                  onClick={() => {
-                    closePreview(sessionId, tab.id)
-                  }}
-                  className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] text-[var(--color-text-tertiary)] opacity-0 transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] group-hover:opacity-100 focus-visible:opacity-100"
-                >
-                  <span className="material-symbols-outlined text-[13px] leading-none">close</span>
-                </button>
-              </div>
-            )
-          })
-        )}
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={isActive}
+                    onClick={() => {
+                      void openPreview(sessionId, tab.path, tab.kind)
+                    }}
+                    className="min-w-0 flex flex-1 items-center gap-2 text-left"
+                  >
+                    {tab.kind === 'diff' ? (
+                      <span className="material-symbols-outlined shrink-0 text-[15px] text-[var(--color-text-tertiary)]">difference</span>
+                    ) : (
+                      <FileTypeBadge name={tab.title} subtle={!isActive} />
+                    )}
+                    <span className="min-w-0 flex-1 truncate">{tab.title}</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`${t('workspace.closeTab')} ${tab.title} ${kindLabel}`}
+                    onClick={() => {
+                      closePreview(sessionId, tab.id)
+                    }}
+                    className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] text-[var(--color-text-tertiary)] opacity-0 transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] group-hover:opacity-100 focus-visible:opacity-100"
+                  >
+                    <span className="material-symbols-outlined text-[13px] leading-none">close</span>
+                  </button>
+                </div>
+              )
+            })
+          )}
+        </div>
+        <ToolbarIconButton
+          icon={isNavigatorVisible ? 'right_panel_close' : 'account_tree'}
+          label={isNavigatorVisible ? t('workspace.hideNavigator') : t('workspace.showNavigator')}
+          onClick={() => setIsNavigatorOpen((open) => !open)}
+        />
       </div>
 
       {previewTabContextMenu && (
@@ -1129,84 +1421,92 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
   return (
     <aside
       data-testid="workspace-panel"
-      className="flex h-full shrink-0 border-l border-[var(--color-border)] bg-[var(--color-surface)]"
-      style={{ width: panelWidth, maxWidth: panelMaxWidth, minWidth: panelMinWidth }}
+      className={
+        embedded
+          ? 'flex h-full min-h-0 w-full min-w-0 bg-[var(--color-surface)]'
+          : 'flex h-full shrink-0 border-l border-[var(--color-border)] bg-[var(--color-surface)]'
+      }
+      style={embedded ? undefined : { width: panelWidth, maxWidth: panelMaxWidth, minWidth: panelMinWidth }}
     >
       {hasPreviewTabs && (
-        <div className="flex min-w-0 flex-1 flex-col border-r border-[var(--color-border)] bg-[var(--color-surface)]">
+        <div className={`flex min-w-0 flex-1 flex-col bg-[var(--color-surface)] ${isNavigatorVisible ? 'border-r border-[var(--color-border)]' : ''}`}>
           {renderPreviewTabs()}
           {renderPreviewContent()}
         </div>
       )}
 
-      <div
-        className={`${hasPreviewTabs ? 'basis-[32%] min-w-[220px] max-w-[320px]' : 'w-full'} flex h-full shrink-0 flex-col bg-[var(--color-surface)]`}
-      >
-        <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-[var(--color-border)] px-2.5">
-          <div className="relative min-w-0">
-            <button
-              type="button"
-              aria-label={activeView === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
-              aria-haspopup="menu"
-              aria-expanded={isViewMenuOpen}
-              onClick={() => setIsViewMenuOpen((open) => !open)}
-              className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-[7px] px-2 py-1 text-[14px] font-semibold leading-5 text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
-            >
-              <span className="truncate">
-                {activeView === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
-              </span>
-              <span className="material-symbols-outlined shrink-0 text-[15px] font-normal text-[var(--color-text-tertiary)]">expand_more</span>
-            </button>
-            {isViewMenuOpen && (
-              <div
-                role="menu"
-                className="absolute left-0 top-[calc(100%+4px)] z-30 min-w-[124px] overflow-hidden rounded-[9px] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-1 shadow-[var(--shadow-dropdown)]"
+      {isNavigatorVisible && (
+        <div
+          className={`${hasPreviewTabs ? 'basis-[32%] min-w-[220px] max-w-[320px]' : 'w-full'} flex h-full shrink-0 flex-col bg-[var(--color-surface)]`}
+        >
+          <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-[var(--color-border)] px-2.5">
+            <div className="relative min-w-0">
+              <button
+                type="button"
+                aria-label={activeView === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
+                aria-haspopup="menu"
+                aria-expanded={isViewMenuOpen}
+                onClick={() => setIsViewMenuOpen((open) => !open)}
+                className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-[7px] px-2 py-1 text-[14px] font-semibold leading-5 text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
               >
-                {(['changed', 'all'] as const).map((view) => {
-                  const selected = activeView === view
-                  return (
-                    <button
-                      key={view}
-                      type="button"
-                      role="menuitem"
-                      onClick={() => handleSetActiveView(view)}
-                      className={`flex h-7 w-full items-center gap-2 px-2.5 text-left text-[12px] transition-colors ${
-                        selected ? 'bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
-                      }`}
-                    >
-                      <span className="min-w-0 flex-1 truncate">
-                        {view === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
-                      </span>
-                      {selected && (
-                        <span className="material-symbols-outlined text-[14px] text-[var(--color-brand)]">check</span>
-                      )}
-                    </button>
-                  )
-                })}
-              </div>
-            )}
+                <span className="truncate">
+                  {activeView === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
+                </span>
+                <span className="material-symbols-outlined shrink-0 text-[15px] font-normal text-[var(--color-text-tertiary)]">expand_more</span>
+              </button>
+              {isViewMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute left-0 top-[calc(100%+4px)] z-30 min-w-[124px] overflow-hidden rounded-[9px] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-1 shadow-[var(--shadow-dropdown)]"
+                >
+                  {(['changed', 'all'] as const).map((view) => {
+                    const selected = activeView === view
+                    return (
+                      <button
+                        key={view}
+                        type="button"
+                        role="menuitem"
+                        onClick={() => handleSetActiveView(view)}
+                        className={`flex h-7 w-full items-center gap-2 px-2.5 text-left text-[12px] transition-colors ${
+                          selected ? 'bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]' : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
+                        }`}
+                      >
+                        <span className="min-w-0 flex-1 truncate">
+                          {view === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
+                        </span>
+                        {selected && (
+                          <span className="material-symbols-outlined text-[14px] text-[var(--color-brand)]">check</span>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              <ToolbarIconButton
+                icon="refresh"
+                label={t('workspace.refresh')}
+                onClick={handleRefresh}
+              />
+              {!embedded && (
+                <ToolbarIconButton
+                  icon="close"
+                  label={t('workspace.closePanel')}
+                  onClick={() => closePanel(sessionId)}
+                />
+              )}
+            </div>
           </div>
 
-          <div className="ml-auto flex shrink-0 items-center gap-1">
-            <ToolbarIconButton
-              icon="refresh"
-              label={t('workspace.refresh')}
-              onClick={handleRefresh}
-            />
-            <ToolbarIconButton
-              icon="close"
-              label={t('workspace.closePanel')}
-              onClick={() => closePanel(sessionId)}
-            />
+          <WorkspaceFilterInput value={filterQuery} onChange={setFilterQuery} />
+
+          <div className="min-h-0 flex-1 overflow-auto py-2">
+            {activeView === 'changed' ? renderChangedView() : renderAllFilesView()}
           </div>
         </div>
-
-        <WorkspaceFilterInput value={filterQuery} onChange={setFilterQuery} />
-
-        <div className="min-h-0 flex-1 overflow-auto py-2">
-          {activeView === 'changed' ? renderChangedView() : renderAllFilesView()}
-        </div>
-      </div>
+      )}
 
       {fileContextMenu && (
         <div
@@ -1219,7 +1519,7 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
             type="button"
             role="menuitem"
             onClick={() => {
-              addFileToChat(fileContextMenu.path)
+              addWorkspacePathToChat(fileContextMenu.path, fileContextMenu.isDirectory)
               setFileContextMenu(null)
             }}
             className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
@@ -1230,12 +1530,27 @@ export function WorkspacePanel({ sessionId }: WorkspacePanelProps) {
           <button
             type="button"
             role="menuitem"
-            onClick={() => copyWorkspacePath(fileContextMenu.path)}
+            onClick={() => void copyWorkspacePath(fileContextMenu.path)}
             className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
           >
             <span aria-hidden="true" className="material-symbols-outlined text-[14px] text-[var(--color-text-tertiary)]">content_copy</span>
             <span>{t('workspace.copyPath')}</span>
           </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void copyWorkspacePath(fileContextMenu.path, 'absolute')}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
+          >
+            <span aria-hidden="true" className="material-symbols-outlined text-[14px] text-[var(--color-text-tertiary)]">file_copy</span>
+            <span>{t('workspace.copyAbsolutePath')}</span>
+          </button>
+          <WorkspaceFileOpenWith
+            absolutePath={resolveWorkspaceAttachmentPath(status?.workDir, fileContextMenu.path)}
+            sessionId={sessionId}
+            workspacePath={fileContextMenu.isDirectory ? undefined : fileContextMenu.path}
+            onAfterSelect={() => setFileContextMenu(null)}
+          />
         </div>
       )}
     </aside>

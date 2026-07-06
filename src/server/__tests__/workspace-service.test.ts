@@ -4,6 +4,10 @@ import { execFileSync } from 'node:child_process'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { WorkspaceService } from '../services/workspaceService.js'
+import {
+  clearFilesystemAccessRootsForTests,
+  registerFilesystemAccessRoot,
+} from '../services/filesystemAccessRoots.js'
 
 const cleanupDirs = new Set<string>()
 const ONE_MIB = 1024 * 1024
@@ -76,6 +80,56 @@ afterEach(async () => {
   cleanupDirs.clear()
 })
 
+describe('WorkspaceService outside-workspace preview', () => {
+  afterEach(() => {
+    clearFilesystemAccessRootsForTests()
+  })
+
+  it('rejects a file outside the workdir until its dir is a registered access root, then reads it', async () => {
+    const workDir = await makeTempDir('workspace-service-work-')
+    const outsideDir = await makeTempDir('workspace-service-outside-')
+    const outsideFile = path.join(outsideDir, 'todo.html')
+    await fs.writeFile(outsideFile, '<h1>hi</h1>\n')
+
+    const service = new WorkspaceService(async (sessionId) => sessionId === 'session-1' ? workDir : null)
+
+    // Not registered yet → treated as a sandbox escape.
+    await expect(service.readFile('session-1', outsideFile)).rejects.toThrow(/outside workspace/)
+
+    // Registered (as the turn-checkpoint flow does for changed files) → readable.
+    registerFilesystemAccessRoot(outsideDir)
+    const allowed = await service.readFile('session-1', outsideFile)
+    expect(allowed.state).toBe('ok')
+    expect(allowed.content).toContain('<h1>hi</h1>')
+  })
+
+  it('still rejects an unrelated path even when another outside dir is registered', async () => {
+    const workDir = await makeTempDir('workspace-service-work-')
+    const registeredDir = await makeTempDir('workspace-service-reg-')
+    const unrelatedDir = await makeTempDir('workspace-service-unrelated-')
+    const unrelatedFile = path.join(unrelatedDir, 'secret.txt')
+    await fs.writeFile(unrelatedFile, 'nope\n')
+    registerFilesystemAccessRoot(registeredDir)
+
+    const service = new WorkspaceService(async (sessionId) => sessionId === 'session-1' ? workDir : null)
+
+    await expect(service.readFile('session-1', unrelatedFile)).rejects.toThrow(/outside workspace/)
+  })
+
+  it('does not allow relative traversal through a registered outside dir', async () => {
+    const baseDir = await makeTempDir('workspace-service-base-')
+    const workDir = path.join(baseDir, 'work')
+    const outsideFile = path.join(baseDir, 'outside.txt')
+    await fs.mkdir(workDir)
+    await fs.writeFile(outsideFile, 'secret\n')
+    registerFilesystemAccessRoot(baseDir)
+
+    const service = new WorkspaceService(async (sessionId) => sessionId === 'session-1' ? workDir : null)
+
+    await expect(service.readFile('session-1', '../outside.txt')).rejects.toThrow(/outside workspace/)
+  })
+})
+
 describe('WorkspaceService', () => {
   it('returns git status for modified, added, deleted, and untracked files', async () => {
     const repoDir = await createGitWorkspace()
@@ -131,6 +185,34 @@ describe('WorkspaceService', () => {
     expect(diff.state).toBe('ok')
     expect(diff.diff).toContain('subdir/sub.txt')
     expect(diff.diff?.length).toBeGreaterThan(0)
+  })
+
+  it('prefers the live git diff over stale transcript edits for a currently changed file', async () => {
+    const repoDir = await createGitWorkspace()
+    const service = new WorkspaceService(
+      async (sessionId) => sessionId === 'session-1' ? repoDir : null,
+      async () => [{
+        id: 'assistant-1',
+        type: 'tool_use',
+        timestamp: new Date().toISOString(),
+        content: [{
+          type: 'tool_use',
+          name: 'Edit',
+          input: {
+            file_path: 'tracked.txt',
+            old_string: 'before\n',
+            new_string: 'model snapshot\n',
+          },
+        }],
+      }],
+    )
+
+    const diff = await service.getDiff('session-1', 'tracked.txt')
+
+    expect(diff.state).toBe('ok')
+    expect(diff.diff).toContain('diff --git a/tracked.txt b/tracked.txt')
+    expect(diff.diff).toContain('+after')
+    expect(diff.diff).not.toContain('+model snapshot')
   })
 
   it('returns explicit non-git and missing-workdir states', async () => {
@@ -394,10 +476,12 @@ describe('WorkspaceService', () => {
     })
   })
 
-  it('lists a single directory level with dotfiles excluded and directories first', async () => {
+  it('lists a single directory level with dotfiles included and directories first', async () => {
     const workDir = await makeTempDir('workspace-service-tree-')
     const service = new WorkspaceService(async () => workDir)
 
+    await fs.mkdir(path.join(workDir, '.hidden-dir'))
+    await fs.mkdir(path.join(workDir, '.git'))
     await fs.mkdir(path.join(workDir, 'b-dir'))
     await fs.mkdir(path.join(workDir, 'a-dir'))
     await fs.mkdir(path.join(workDir, 'a-dir', 'inner'))
@@ -409,8 +493,10 @@ describe('WorkspaceService', () => {
       state: 'ok',
       path: '',
       entries: [
+        { name: '.hidden-dir', path: '.hidden-dir', isDirectory: true },
         { name: 'a-dir', path: 'a-dir', isDirectory: true },
         { name: 'b-dir', path: 'b-dir', isDirectory: true },
+        { name: '.hidden.txt', path: '.hidden.txt', isDirectory: false },
         { name: 'z-file.txt', path: 'z-file.txt', isDirectory: false },
       ],
     })

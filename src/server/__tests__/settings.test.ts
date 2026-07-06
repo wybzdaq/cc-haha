@@ -2,11 +2,12 @@
  * Unit tests for Settings, Models, and Status APIs
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeAll, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { SettingsService } from '../services/settingsService.js'
+import { conversationService } from '../services/conversationService.js'
 import { handleSettingsApi } from '../api/settings.js'
 import { handleModelsApi } from '../api/models.js'
 import { handleStatusApi, resetUsage, addUsage } from '../api/status.js'
@@ -21,6 +22,13 @@ import {
 } from '../../utils/secureStorage/macOsKeychainHelpers.js'
 import type { OpenAIOAuthTokens } from '../../services/openaiAuth/types.js'
 import { getModelOptions } from '../../utils/model/modelOptions.js'
+import {
+  getSettingsForSource,
+  updateSettingsForSource,
+} from '../../utils/settings/settings.js'
+import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
+import { clearAllOutputStylesCache } from '../../constants/outputStyles.js'
+import { clearOutputStyleCaches } from '../../outputStyles/loadOutputStylesDir.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -40,6 +48,9 @@ let originalAnthropicDefaultOpusModel: string | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-test-'))
+  resetSettingsCache()
+  clearAllOutputStylesCache()
+  clearOutputStyleCaches()
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   originalHome = process.env.HOME
   originalUserProfile = process.env.USERPROFILE
@@ -72,6 +83,9 @@ async function teardown() {
   plainTextStorage.delete()
   clearKeychainCache()
   clearOpenAIOAuthTokenCache()
+  resetSettingsCache()
+  clearAllOutputStylesCache()
+  clearOutputStyleCaches()
 
   if (originalConfigDir !== undefined) {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
@@ -204,6 +218,14 @@ describe('SettingsService', () => {
     expect(settings.model).toBe('claude-opus-4-7')
   })
 
+  it('should write and read the pure white theme setting', async () => {
+    const svc = new SettingsService()
+    await svc.updateUserSettings({ theme: 'white' })
+
+    const settings = await svc.getUserSettings()
+    expect(settings.theme).toBe('white')
+  })
+
   it('should merge settings on update (shallow merge)', async () => {
     const svc = new SettingsService()
     await svc.updateUserSettings({ theme: 'dark' })
@@ -212,6 +234,37 @@ describe('SettingsService', () => {
     const settings = await svc.getUserSettings()
     expect(settings.theme).toBe('dark')
     expect(settings.model).toBe('claude-haiku-4-5')
+  })
+
+  it('should not let cached CLI settings overwrite desktop settings updates', async () => {
+    const svc = new SettingsService()
+    await svc.updateUserSettings({
+      enabledPlugins: {
+        'demo@test-market': false,
+      },
+    })
+
+    expect(getSettingsForSource('userSettings')?.enabledPlugins?.['demo@test-market']).toBe(false)
+
+    await svc.updateUserSettings({
+      language: 'chinese',
+      desktopNotificationsEnabled: true,
+      alwaysThinkingEnabled: false,
+    })
+
+    const { error } = updateSettingsForSource('userSettings', {
+      enabledPlugins: {
+        ...getSettingsForSource('userSettings')?.enabledPlugins,
+        'demo@test-market': true,
+      },
+    })
+    expect(error).toBeNull()
+
+    const settings = await svc.getUserSettings()
+    expect(settings.language).toBe('chinese')
+    expect(settings.desktopNotificationsEnabled).toBe(true)
+    expect(settings.alwaysThinkingEnabled).toBe(false)
+    expect((settings.enabledPlugins as Record<string, unknown>)['demo@test-market']).toBe(true)
   })
 
   it('should read and write project settings', async () => {
@@ -223,6 +276,24 @@ describe('SettingsService', () => {
 
     const settings = await svc.getProjectSettings()
     expect(settings.outputStyle).toBe('verbose')
+  })
+
+  it('should read and write project-local settings', async () => {
+    const projectRoot = path.join(tmpDir, 'myproject')
+    const svc = new SettingsService(projectRoot)
+
+    await svc.updateLocalSettings({
+      outputStyle: 'Learning',
+      preserved: true,
+    })
+    await svc.updateLocalSettings({
+      theme: 'dark',
+    })
+
+    const settings = await svc.getLocalSettings()
+    expect(settings.outputStyle).toBe('Learning')
+    expect(settings.preserved).toBe(true)
+    expect(settings.theme).toBe('dark')
   })
 
   it('should merge user and project settings', async () => {
@@ -346,6 +417,128 @@ describe('Settings API', () => {
     const res2 = await handleSettingsApi(r2, u2, s2)
     const body2 = await res2.json()
     expect(body2.model).toBe('claude-opus-4-7')
+  })
+
+  it('PUT /api/settings/user should sync thinking changes to active CLI sessions', async () => {
+    const syncSpy = spyOn(conversationService, 'setMaxThinkingTokensForActiveSessions')
+      .mockImplementation(() => 0)
+
+    try {
+      const disabled = makeRequest('PUT', '/api/settings/user', {
+        alwaysThinkingEnabled: false,
+      })
+      expect((await handleSettingsApi(disabled.req, disabled.url, disabled.segments)).status).toBe(200)
+
+      const enabled = makeRequest('PUT', '/api/settings/user', {
+        alwaysThinkingEnabled: true,
+      })
+      expect((await handleSettingsApi(enabled.req, enabled.url, enabled.segments)).status).toBe(200)
+
+      expect(syncSpy).toHaveBeenNthCalledWith(1, 0)
+      expect(syncSpy).toHaveBeenNthCalledWith(2, null)
+    } finally {
+      syncSpy.mockRestore()
+    }
+  })
+
+  it('GET /api/settings/output-styles should include built-in, user, and project styles', async () => {
+    const projectRoot = path.join(tmpDir, 'myproject')
+    await fs.mkdir(path.join(tmpDir, 'output-styles'), { recursive: true })
+    await fs.mkdir(path.join(projectRoot, '.claude', 'output-styles'), { recursive: true })
+    await fs.writeFile(
+      path.join(tmpDir, 'output-styles', 'user-style.md'),
+      [
+        '---',
+        'name: User Style',
+        'description: User custom voice',
+        'keep-coding-instructions: true',
+        '---',
+        'User prompt',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(projectRoot, '.claude', 'output-styles', 'project-style.md'),
+      [
+        '---',
+        'name: Project Style',
+        'description: Project custom voice',
+        '---',
+        'Project prompt',
+      ].join('\n'),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(projectRoot, '.claude', 'settings.local.json'),
+      JSON.stringify({ outputStyle: 'Project Style' }),
+      'utf-8',
+    )
+
+    clearAllOutputStylesCache()
+    clearOutputStyleCaches()
+
+    const { req, url, segments } = makeRequest(
+      'GET',
+      `/api/settings/output-styles?workDir=${encodeURIComponent(projectRoot)}`,
+    )
+    const res = await handleSettingsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.outputStyle).toBe('Project Style')
+    expect(body.scope).toBe('localSettings')
+    expect(body.workDir).toBe(projectRoot)
+    expect(body.styles).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ value: 'default', source: 'built-in' }),
+        expect.objectContaining({ value: 'Explanatory', source: 'built-in' }),
+        expect.objectContaining({ value: 'Learning', source: 'built-in' }),
+        expect.objectContaining({ value: 'User Style', source: 'userSettings' }),
+        expect.objectContaining({ value: 'Project Style', source: 'projectSettings' }),
+      ]),
+    )
+  })
+
+  it('PUT /api/settings/output-style should save to project-local settings and preserve fields', async () => {
+    const projectRoot = path.join(tmpDir, 'myproject')
+    await fs.mkdir(path.join(projectRoot, '.claude'), { recursive: true })
+    await fs.writeFile(
+      path.join(projectRoot, '.claude', 'settings.local.json'),
+      JSON.stringify({ preserved: 'yes' }),
+      'utf-8',
+    )
+
+    const { req, url, segments } = makeRequest('PUT', '/api/settings/output-style', {
+      outputStyle: 'Learning',
+      workDir: projectRoot,
+    })
+    const res = await handleSettingsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      ok: true,
+      outputStyle: 'Learning',
+      scope: 'localSettings',
+      workDir: projectRoot,
+    })
+
+    const raw = await fs.readFile(
+      path.join(projectRoot, '.claude', 'settings.local.json'),
+      'utf-8',
+    )
+    const settings = JSON.parse(raw)
+    expect(settings.outputStyle).toBe('Learning')
+    expect(settings.preserved).toBe('yes')
+  })
+
+  it('PUT /api/settings/output-style should reject unavailable styles', async () => {
+    const { req, url, segments } = makeRequest('PUT', '/api/settings/output-style', {
+      outputStyle: 'Missing Style',
+    })
+    const res = await handleSettingsApi(req, url, segments)
+
+    expect(res.status).toBe(400)
   })
 
   it('GET /api/settings/cli-launcher should expose bundled launcher status', async () => {
@@ -551,9 +744,69 @@ describe('Models API', () => {
 
     const managedSettings = await providerSvc.getManagedSettings()
     expect(managedSettings.model).toBe('glm-5-turbo')
+    expect((managedSettings.env as Record<string, string>).CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
 
     const globalSettings = await settingsSvc.getUserSettings()
     expect(globalSettings.model).toBeUndefined()
+  })
+
+  it('GET /api/models should return the OpenAI model catalog when ChatGPT Official is active', async () => {
+    const providerSvc = new ProviderService()
+    await providerSvc.activateProvider('openai-official')
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      models: Array<{ id: string; name: string }>
+      provider: { id: string; name: string } | null
+    }
+    expect(body.provider).toEqual({
+      id: 'openai-official',
+      name: 'ChatGPT Official',
+    })
+    expect(body.models.map((model) => model.id)).toEqual([
+      'gpt-5.3-codex',
+      'gpt-5.4',
+      'gpt-5.5',
+      'gpt-5.4-mini',
+    ])
+  })
+
+  it('PUT /api/models/current should persist GPT model to managed settings when ChatGPT Official is active', async () => {
+    const settingsSvc = new SettingsService()
+    const providerSvc = new ProviderService()
+    await settingsSvc.updateUserSettings({ model: 'claude-haiku-4-5' })
+    await providerSvc.activateProvider('openai-official')
+
+    const { req, url, segments } = makeRequest('PUT', '/api/models/current', {
+      modelId: 'gpt-5.5',
+    })
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const managedSettings = await providerSvc.getManagedSettings()
+    expect(managedSettings.model).toBe('gpt-5.5')
+
+    const globalSettings = await settingsSvc.getUserSettings()
+    expect(globalSettings.model).toBe('claude-haiku-4-5')
+  })
+
+  it('GET /api/models/current should read current GPT model from managed settings when ChatGPT Official is active', async () => {
+    const providerSvc = new ProviderService()
+    await providerSvc.activateProvider('openai-official')
+    await providerSvc.updateManagedSettings({ model: 'gpt-5.5' })
+
+    const { req, url, segments } = makeRequest('GET', '/api/models/current')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.model).toMatchObject({
+      id: 'gpt-5.5',
+      name: 'GPT-5.5',
+    })
   })
 
   it('GET /api/effort should return default effort level', async () => {
@@ -562,7 +815,7 @@ describe('Models API', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.level).toBe('medium')
+    expect(body.level).toBe('max')
     expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
   })
 
@@ -575,7 +828,7 @@ describe('Models API', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.level).toBe('medium')
+    expect(body.level).toBe('max')
     expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
   })
 
@@ -700,5 +953,63 @@ describe('Status API', () => {
     const { req, url, segments } = makeRequest('GET', '/api/status/nonexistent')
     const res = await handleStatusApi(req, url, segments)
     expect(res.status).toBe(404)
+  })
+})
+
+// =============================================================================
+// Activity Stats API
+// =============================================================================
+
+describe('Activity Stats API', () => {
+  let handleApiRequest: typeof import('../router.js').handleApiRequest
+
+  beforeAll(async () => {
+    ;({ handleApiRequest } = await import('../router.js'))
+  })
+
+  beforeEach(async () => {
+    await setup()
+  })
+
+  afterEach(teardown)
+
+  it('GET /api/activity-stats should default to the all range', async () => {
+    const { req, url } = makeRequest('GET', '/api/activity-stats')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(200)
+
+    const body = await res.json()
+    expect(body.range).toBe('all')
+    expect(body.stats.totalSessions).toBe(0)
+    expect(body.stats.toolUsage).toEqual({})
+    expect(body.stats.skillUsage).toEqual({})
+    expect(new Date(body.generatedAt).toString()).not.toBe('Invalid Date')
+  })
+
+  it('GET /api/activity-stats/:range should return stats for supported ranges', async () => {
+    for (const range of ['7d', '30d', 'all'] as const) {
+      const { req, url } = makeRequest('GET', `/api/activity-stats/${range}`)
+      const res = await handleApiRequest(req, url)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.range).toBe(range)
+      expect(body.stats).toBeDefined()
+    }
+  })
+
+  it('should reject non-GET methods', async () => {
+    const { req, url } = makeRequest('POST', '/api/activity-stats')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(405)
+  })
+
+  it('should reject unknown activity stats ranges', async () => {
+    const { req, url } = makeRequest('GET', '/api/activity-stats/90d')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(400)
   })
 })

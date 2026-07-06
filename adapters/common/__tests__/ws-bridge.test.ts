@@ -17,6 +17,8 @@ describe('WsBridge', () => {
     const result = bridge.connectSession('chat-1', 'my-uuid-session-id')
     expect(result).toBe(true)
     expect(bridge.hasSession('chat-1')).toBe(true)
+    expect(bridge.getSessionId('chat-1')).toBe('my-uuid-session-id')
+    expect(bridge.isSessionOpen('chat-1', 'my-uuid-session-id')).toBe(false)
   })
 
   it('connectSession for different chatIds creates separate sessions', () => {
@@ -97,6 +99,22 @@ describe('WsBridge: handler serialization', () => {
     })
   })
 
+  async function waitForServerConnection(): Promise<WsServerSocket> {
+    if (connections[0]) return connections[0]
+    await new Promise<void>((resolve, reject) => {
+      const onConnection = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      const timer = setTimeout(() => {
+        server.off('connection', onConnection)
+        reject(new Error('Timed out waiting for test WebSocket connection'))
+      }, 500)
+      server.once('connection', onConnection)
+    })
+    return connections[0]!
+  }
+
   it('processes handler calls in strict FIFO order per chatId', async () => {
     const bridge = new WsBridge(serverUrl, 'test')
     const events: string[] = []
@@ -115,8 +133,7 @@ describe('WsBridge: handler serialization', () => {
     bridge.connectSession('chat-1', 'sess-1')
     const ok = await bridge.waitForOpen('chat-1')
     expect(ok).toBe(true)
-    expect(connections.length).toBe(1)
-    const serverWs = connections[0]!
+    const serverWs = await waitForServerConnection()
 
     // Blast three messages back-to-back. msg1 is slow, msg2/msg3 are fast.
     // With serialization: start:1, end:1, start:2, end:2, start:3, end:3
@@ -151,7 +168,7 @@ describe('WsBridge: handler serialization', () => {
 
     bridge.connectSession('chat-err', 'sess-err')
     await bridge.waitForOpen('chat-err')
-    const serverWs = connections[0]!
+    const serverWs = await waitForServerConnection()
 
     serverWs.send(JSON.stringify({ throw: true }))
     serverWs.send(JSON.stringify({ tag: 'after' }))
@@ -169,7 +186,7 @@ describe('WsBridge: handler serialization', () => {
     bridge.connectSession('chat-deleted', 'sess-deleted')
     await bridge.waitForOpen('chat-deleted')
 
-    const serverWs = connections[0]!
+    const serverWs = await waitForServerConnection()
     serverWs.close(1000, 'session deleted')
 
     await new Promise((resolve) => setTimeout(resolve, 50))
@@ -186,9 +203,43 @@ describe('WsBridge: handler serialization', () => {
     bridge.onServerMessage('chat-reset', () => {})
     bridge.connectSession('chat-reset', 'sess-reset')
     await bridge.waitForOpen('chat-reset')
+    const staleSession = (bridge as any).sessions.get('chat-reset')
+    expect(staleSession.ws.listenerCount('message')).toBeGreaterThan(0)
 
     bridge.resetSession('chat-reset')
     expect(bridge.hasSession('chat-reset')).toBe(false)
+    expect(staleSession.ws.listenerCount('message')).toBe(0)
+    expect(staleSession.ws.listenerCount('close')).toBe(0)
+    expect(staleSession.ws.listenerCount('error')).toBe(0)
+
+    bridge.destroy()
+  })
+
+  it('does not dispatch stale messages from a socket reset before reconnect', async () => {
+    const bridge = new WsBridge(serverUrl, 'test')
+    const events: string[] = []
+
+    bridge.onServerMessage('chat-resume', (msg: any) => {
+      events.push(String(msg.tag))
+    })
+    bridge.connectSession('chat-resume', 'sess-old')
+    expect(await bridge.waitForOpen('chat-resume')).toBe(true)
+    const oldServerWs = await waitForServerConnection()
+
+    bridge.resetSession('chat-resume')
+    bridge.onServerMessage('chat-resume', (msg: any) => {
+      events.push(String(msg.tag))
+    })
+    bridge.connectSession('chat-resume', 'sess-new')
+    expect(await bridge.waitForOpen('chat-resume')).toBe(true)
+    const newServerWs = connections[1]!
+
+    oldServerWs.send(JSON.stringify({ tag: 'stale-old' }))
+    newServerWs.send(JSON.stringify({ tag: 'fresh-new' }))
+
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    expect(events).toEqual(['fresh-new'])
 
     bridge.destroy()
   })

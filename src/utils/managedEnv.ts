@@ -1,6 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { isRemoteManagedSettingsEligible } from '../services/remoteManagedSettings/syncCache.js'
+import {
+  activeProviderNeedsProxy,
+  mergeActiveProviderManagedEnv,
+} from '../server/services/providerRuntimeEnv.js'
+import { ensureStandaloneProviderProxy } from '../server/proxy/standaloneProviderProxy.js'
 import { clearCACertsCache } from './caCerts.js'
 import { getGlobalConfig } from './config.js'
 import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
@@ -8,6 +13,7 @@ import {
   isProviderManagedEnvVar,
   SAFE_ENV_VARS,
 } from './managedEnvConstants.js'
+import { normalizeLegacyDeepSeekManagedEnv } from './providerManagedEnvCompat.js'
 import { clearMTLSCache } from './mtls.js'
 import { clearProxyCache, configureGlobalAgents } from './proxy.js'
 import { isSettingSourceEnabled } from './settings/constants.js'
@@ -99,13 +105,20 @@ function filterSettingsEnv(
  * Returns an empty object if the file doesn't exist or is invalid.
  */
 function getCcHahaSettingsEnv(): Record<string, string> {
+  const configDir = getClaudeConfigHomeDir()
+  const serverPort =
+    !isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+    activeProviderNeedsProxy(configDir)
+      ? ensureStandaloneProviderProxy()
+      : undefined
   try {
-    const ccHahaSettings = join(getClaudeConfigHomeDir(), 'cc-haha', 'settings.json')
+    const ccHahaSettings = join(configDir, 'cc-haha', 'settings.json')
     const raw = readFileSync(ccHahaSettings, 'utf-8')
     const parsed = JSON.parse(raw) as { env?: Record<string, string> }
-    return parsed.env ?? {}
+    const settingsEnv = normalizeLegacyDeepSeekManagedEnv(parsed.env ?? {}).env
+    return mergeActiveProviderManagedEnv(settingsEnv, configDir, { serverPort })
   } catch {
-    return {}
+    return mergeActiveProviderManagedEnv({}, configDir, { serverPort })
   }
 }
 

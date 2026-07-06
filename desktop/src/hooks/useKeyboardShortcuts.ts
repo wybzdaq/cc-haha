@@ -3,16 +3,23 @@ import { useSessionStore } from '../stores/sessionStore'
 import { useChatStore } from '../stores/chatStore'
 import { useTabStore } from '../stores/tabStore'
 import { useUIStore } from '../stores/uiStore'
+import {
+  getAppZoomKeyboardAction,
+  nextAppZoomLevel,
+} from '../lib/appZoom'
+import { useSettingsStore } from '../stores/settingsStore'
 
 export function useKeyboardShortcuts() {
   const setActiveSession = useSessionStore((s) => s.setActiveSession)
   const setActiveView = useUIStore((s) => s.setActiveView)
-  const setSidebarOpen = useUIStore((s) => s.setSidebarOpen)
+  const openModal = useUIStore((s) => s.openModal)
   const closeModal = useUIStore((s) => s.closeModal)
   const activeModal = useUIStore((s) => s.activeModal)
   const stopGeneration = useChatStore((s) => s.stopGeneration)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const chatState = useChatStore((s) => activeTabId ? s.sessions[activeTabId]?.chatState ?? 'idle' : 'idle')
+  const uiZoom = useSettingsStore((s) => s.uiZoom)
+  const setUiZoom = useSettingsStore((s) => s.setUiZoom)
 
   const activeModalRef = useRef(activeModal)
   activeModalRef.current = activeModal
@@ -20,9 +27,20 @@ export function useKeyboardShortcuts() {
   chatStateRef.current = chatState
   const activeTabIdRef = useRef(activeTabId)
   activeTabIdRef.current = activeTabId
+  const appZoomLevelRef = useRef(uiZoom)
+  appZoomLevelRef.current = uiZoom
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const zoomAction = getAppZoomKeyboardAction(e)
+      if (zoomAction) {
+        e.preventDefault()
+        const nextZoom = nextAppZoomLevel(appZoomLevelRef.current, zoomAction)
+        appZoomLevelRef.current = nextZoom
+        setUiZoom(nextZoom)
+        return
+      }
+
       const meta = e.metaKey || e.ctrlKey
 
       // Cmd+N — New session
@@ -32,15 +50,10 @@ export function useKeyboardShortcuts() {
         setActiveView('code')
       }
 
-      // Cmd+K — Focus search (sidebar search input)
+      // Cmd+K — Open global session search
       if (meta && e.key === 'k') {
         e.preventDefault()
-        setSidebarOpen(true)
-        requestAnimationFrame(() => {
-          const searchInput = document.querySelector('#sidebar-search') as HTMLInputElement | null
-          searchInput?.focus()
-          searchInput?.select()
-        })
+        openModal('globalSearch')
       }
 
       // Escape — Close modal or clear state
@@ -61,5 +74,5 @@ export function useKeyboardShortcuts() {
 
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [closeModal, setActiveSession, setActiveView, setSidebarOpen, stopGeneration])
+  }, [closeModal, openModal, setActiveSession, setActiveView, setUiZoom, stopGeneration])
 }

@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '../components/shared/Button'
+import { DirectoryPicker } from '../components/shared/DirectoryPicker'
 import { Input } from '../components/shared/Input'
-import { Modal } from '../components/shared/Modal'
+import { ConfirmDialog } from '../components/shared/ConfirmDialog'
 import { useTranslation } from '../i18n'
 import { useUIStore } from '../stores/uiStore'
 import { useMcpStore } from '../stores/mcpStore'
 import { useSessionStore } from '../stores/sessionStore'
-import type { McpServerRecord, McpUpsertPayload } from '../types/mcp'
+import { sessionsApi } from '../api/sessions'
+import { mcpApi } from '../api/mcp'
+import type { McpServerRecord, McpUpsertPayload, McpWritableScope } from '../types/mcp'
 
 type EditorMode =
   | { type: 'list' }
@@ -29,6 +32,8 @@ type KeyValueRow = {
 
 type McpDraft = {
   name: string
+  scope: McpWritableScope
+  projectPath: string
   transport: TransportKind
   command: string
   args: StringRow[]
@@ -61,12 +66,64 @@ const MCP_GROUP_ORDER: McpGroupKey[] = [
   'dynamic',
 ]
 
+const WRITABLE_SCOPES: McpWritableScope[] = ['local', 'project', 'user']
+
 const STATUS_TONE: Record<McpServerRecord['status'], string> = {
-  connected: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20',
-  checking: 'bg-slate-500/10 text-slate-600 border-slate-500/20',
-  'needs-auth': 'bg-amber-500/10 text-amber-600 border-amber-500/20',
-  failed: 'bg-rose-500/10 text-rose-600 border-rose-500/20',
+  connected: 'bg-[var(--color-inspector-success-bg)] text-[var(--color-inspector-success)] border-[var(--color-border)]',
+  checking: 'bg-[var(--color-surface-hover)] text-[var(--color-text-secondary)] border-[var(--color-border)]',
+  'needs-auth': 'bg-[var(--color-surface-container-low)] text-[var(--color-warning)] border-[var(--color-border)]',
+  failed: 'bg-[var(--color-inspector-danger-bg)] text-[var(--color-inspector-danger)] border-[var(--color-border)]',
   disabled: 'bg-[var(--color-surface-hover)] text-[var(--color-text-secondary)] border-[var(--color-border)]',
+}
+
+const SENSITIVE_MCP_FIELD = /(?:api[_-]?key|auth[_-]?token|authorization|bearer|token|secret|password|credential)/i
+const SENSITIVE_CLI_FLAG = /^--(?:api-key|api_key|auth-token|auth_token|authorization|bearer|token|secret|password|credential)$/i
+const REDACTED_INPUT_VALUE = '[redacted]'
+
+function isMcpServerNameValid(name: string): boolean {
+  const trimmed = name.trim()
+  return trimmed.length > 0 && !/[^\p{L}\p{N}_-]/u.test(trimmed)
+}
+
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(/(bearer\s+)(?:"[^"]+"|'[^']+'|[^\s"',}]+)/gi, '$1[redacted]')
+    .replace(/(--(?:api-key|api_key|auth-token|auth_token|authorization|bearer|token|secret|password|credential)(?:=|\s+))(?:"[^"]+"|'[^']+'|[^\s"',}]+)/gi, '$1[redacted]')
+    .replace(/((?:api[_-]?key|auth[_-]?token|authorization|bearer|token|secret|password|credential)(?:["']?\s*[:=]\s*["']?))([^"',\s}]+)/gi, '$1[redacted]')
+    .replace(/\bsk-[A-Za-z0-9][A-Za-z0-9_-]{5,}\b/g, '[redacted]')
+}
+
+function redactMcpDisplayValue(value: unknown): unknown {
+  if (typeof value === 'string') return redactSensitiveText(value)
+  if (Array.isArray(value)) {
+    return value.map((item, index) => {
+      const previous = value[index - 1]
+      if (typeof previous === 'string' && SENSITIVE_CLI_FLAG.test(previous)) return '[redacted]'
+      return redactMcpDisplayValue(item)
+    })
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [
+        key,
+        SENSITIVE_MCP_FIELD.test(key) ? '[redacted]' : redactMcpDisplayValue(nested),
+      ]),
+    )
+  }
+  return value
+}
+
+function displayMcpArgumentValue(rows: StringRow[], index: number): string {
+  const row = rows[index]
+  if (!row) return ''
+  const previous = rows[index - 1]?.value
+  if (row.value && previous && SENSITIVE_CLI_FLAG.test(previous.trim())) return REDACTED_INPUT_VALUE
+  return redactSensitiveText(row.value)
+}
+
+function displayMcpKeyValueRowValue(row: KeyValueRow): string {
+  if (row.value && SENSITIVE_MCP_FIELD.test(row.key)) return REDACTED_INPUT_VALUE
+  return redactSensitiveText(row.value)
 }
 
 function createId() {
@@ -85,6 +142,8 @@ function createKeyValueRow(key = '', value = ''): KeyValueRow {
 function createEmptyDraft(): McpDraft {
   return {
     name: '',
+    scope: 'local',
+    projectPath: '',
     transport: 'stdio',
     command: '',
     args: [createStringRow('')],
@@ -95,6 +154,18 @@ function createEmptyDraft(): McpDraft {
     oauthClientId: '',
     oauthCallbackPort: '',
   }
+}
+
+function asWritableScope(scope: string): McpWritableScope {
+  return scope === 'project' || scope === 'user' ? scope : 'local'
+}
+
+function scopeRequiresProject(scope: McpWritableScope) {
+  return scope === 'local' || scope === 'project'
+}
+
+function serverHasProjectContext(server: Pick<McpServerRecord, 'scope' | 'projectPath'>) {
+  return (server.scope === 'local' || server.scope === 'project') && !!server.projectPath
 }
 
 function isStdioConfig(config: McpServerRecord['config']): config is Extract<McpServerRecord['config'], { type: 'stdio' }> {
@@ -108,6 +179,8 @@ function isRemoteConfig(config: McpServerRecord['config']): config is Extract<Mc
 function draftFromServer(server: McpServerRecord): McpDraft {
   const base = createEmptyDraft()
   base.name = server.name
+  base.scope = asWritableScope(server.scope)
+  base.projectPath = scopeRequiresProject(base.scope) ? server.projectPath ?? '' : ''
 
   if (isStdioConfig(server.config)) {
     return {
@@ -155,7 +228,7 @@ function rowsToList(rows: StringRow[]) {
 function buildPayload(draft: McpDraft): McpUpsertPayload {
   if (draft.transport === 'stdio') {
     return {
-      scope: 'user',
+      scope: draft.scope,
       config: {
         type: 'stdio',
         command: draft.command.trim(),
@@ -170,7 +243,7 @@ function buildPayload(draft: McpDraft): McpUpsertPayload {
   const oauthClientId = draft.oauthClientId.trim()
 
   return {
-    scope: 'user',
+    scope: draft.scope,
     config: {
       type: draft.transport,
       url: draft.url.trim(),
@@ -189,7 +262,8 @@ function buildPayload(draft: McpDraft): McpUpsertPayload {
 }
 
 function isDraftValid(draft: McpDraft) {
-  if (!draft.name.trim()) return false
+  if (!isMcpServerNameValid(draft.name)) return false
+  if (scopeRequiresProject(draft.scope) && !draft.projectPath.trim()) return false
   if (draft.transport === 'stdio') return draft.command.trim().length > 0
   return draft.url.trim().length > 0
 }
@@ -284,6 +358,7 @@ function ArraySection({
   valuePlaceholder,
   singleValue = false,
   addLabel,
+  displayValue,
 }: {
   title: string
   rows: KeyValueRow[] | StringRow[]
@@ -294,12 +369,13 @@ function ArraySection({
   valuePlaceholder: string
   singleValue?: boolean
   addLabel: string
+  displayValue?: (row: KeyValueRow | StringRow, index: number) => string
 }) {
   return (
     <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] p-5">
       <div className="text-sm font-semibold text-[var(--color-text-primary)] mb-4">{title}</div>
       <div className="space-y-3">
-        {rows.map((row) => (
+        {rows.map((row, index) => (
           <div key={row.id} className={`grid gap-3 ${singleValue ? 'grid-cols-[minmax(0,1fr)_32px]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_32px]'}`}>
             {!singleValue && 'key' in row && (
               <Input
@@ -309,7 +385,7 @@ function ArraySection({
               />
             )}
             <Input
-              value={row.value}
+              value={displayValue ? displayValue(row, index) : row.value}
               onChange={(event) => onChange(row.id, 'value', event.target.value)}
               placeholder={valuePlaceholder}
             />
@@ -348,6 +424,19 @@ function StatCard({ label, value, icon }: { label: string; value: number; icon: 
   )
 }
 
+function LoadingState({ label }: { label: string }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex min-h-[220px] flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-center"
+    >
+      <div className="h-7 w-7 animate-spin rounded-full border-2 border-[var(--color-brand)] border-t-transparent" />
+      <div className="text-sm font-medium text-[var(--color-text-secondary)]">{label}</div>
+    </div>
+  )
+}
+
 function ServerRow({
   server,
   isBusy,
@@ -375,7 +464,15 @@ function ServerRow({
           <span className="rounded-full bg-[var(--color-surface-hover)] px-2 py-1 font-medium text-[var(--color-text-secondary)]">
             {scopeLabel(server, t)}
           </span>
-          <span className="truncate">{server.summary}</span>
+          {serverHasProjectContext(server) && (
+            <span
+              className="max-w-full truncate rounded-full bg-[var(--color-surface-hover)] px-2 py-1 font-[var(--font-mono)] text-[11px] text-[var(--color-text-tertiary)]"
+              title={server.projectPath}
+            >
+              {server.projectPath}
+            </span>
+          )}
+          <span className="truncate">{redactSensitiveText(server.summary)}</span>
         </div>
         {server.statusDetail && (
           <div className="mt-2 text-xs text-[var(--color-text-tertiary)] truncate">{server.statusDetail}</div>
@@ -406,8 +503,10 @@ export function McpSettings() {
   const [draft, setDraft] = useState<McpDraft>(createEmptyDraft)
   const [isSaving, setIsSaving] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
-  const [busyServerName, setBusyServerName] = useState<string | null>(null)
+  const [busyServerKey, setBusyServerKey] = useState<string | null>(null)
   const [pendingDeleteServer, setPendingDeleteServer] = useState<McpServerRecord | null>(null)
+  const [isInitialLoading, setIsInitialLoading] = useState(true)
+  const projectPathsForFetchRef = useRef<string[] | undefined>(undefined)
   const refreshInFlightRef = useRef(new Set<string>())
 
   const activeSession = sessions.find((session) => session.id === activeSessionId)
@@ -415,7 +514,38 @@ export function McpSettings() {
   const resolveOperationCwd = (server?: McpServerRecord) => server?.projectPath ?? currentWorkDir
 
   useEffect(() => {
-    void fetchServers(undefined, currentWorkDir)
+    let cancelled = false
+    setIsInitialLoading(useMcpStore.getState().servers.length === 0)
+
+    const loadServers = async () => {
+      try {
+        const [recentProjectPaths, privateMcpProjectPaths] = await Promise.all([
+          sessionsApi.getRecentProjects(8)
+            .then(({ projects }) => projects.map((project) => project.realPath))
+            .catch(() => []),
+          mcpApi.projectPaths()
+            .then(({ projectPaths }) => projectPaths)
+            .catch(() => []),
+        ])
+        if (cancelled) return
+        const paths = [
+          currentWorkDir,
+          ...recentProjectPaths,
+          ...privateMcpProjectPaths,
+        ].filter((path): path is string => !!path)
+        const projectPathsForFetch = Array.from(new Set(paths))
+        projectPathsForFetchRef.current = projectPathsForFetch.length ? projectPathsForFetch : undefined
+        await fetchServers(projectPathsForFetchRef.current, currentWorkDir)
+      } finally {
+        if (!cancelled) setIsInitialLoading(false)
+      }
+    }
+
+    void loadServers()
+
+    return () => {
+      cancelled = true
+    }
   }, [fetchServers, currentWorkDir])
 
   const groupedServers = useMemo(() => {
@@ -432,6 +562,7 @@ export function McpSettings() {
     connected: servers.filter((server) => server.status === 'connected').length,
     attention: servers.filter((server) => server.status === 'failed' || server.status === 'needs-auth').length,
   }), [servers])
+  const showListLoading = (isInitialLoading || isLoading) && servers.length === 0
 
   const beginCreate = () => {
     setDraft(createEmptyDraft())
@@ -504,9 +635,9 @@ export function McpSettings() {
   }, [servers, refreshServerStatus, currentWorkDir])
 
   const handleToggle = async (server: McpServerRecord) => {
-    setBusyServerName(server.name)
+    setBusyServerKey(getServerIdentityKey(server))
     try {
-      const updated = await toggleServer(server, resolveOperationCwd(server))
+      const updated = await toggleServer(server, resolveOperationCwd(server), activeSessionId ?? undefined)
       addToast({
         type: 'success',
         message: updated.enabled ? t('settings.mcp.toast.enabled', { name: server.name }) : t('settings.mcp.toast.disabled', { name: server.name }),
@@ -517,7 +648,7 @@ export function McpSettings() {
         message: error instanceof Error ? error.message : t('settings.mcp.toast.toggleFailed'),
       })
     } finally {
-      setBusyServerName(null)
+      setBusyServerKey(null)
     }
   }
 
@@ -529,7 +660,7 @@ export function McpSettings() {
       statusDetail: undefined,
     }
 
-    setBusyServerName(server.name)
+    setBusyServerKey(getServerIdentityKey(server))
     setView((current) => {
       if (current.type !== 'details' && current.type !== 'edit') return current
       if (getServerIdentityKey(current.server) !== getServerIdentityKey(server)) return current
@@ -556,7 +687,7 @@ export function McpSettings() {
         message: error instanceof Error ? error.message : t('settings.mcp.toast.reconnectFailed'),
       })
     } finally {
-      setBusyServerName(null)
+      setBusyServerKey(null)
     }
   }
 
@@ -588,28 +719,20 @@ export function McpSettings() {
   }
 
   const deleteModal = (
-    <Modal
+    <ConfirmDialog
       open={pendingDeleteServer !== null}
       onClose={() => {
         if (isDeleting) return
         setPendingDeleteServer(null)
       }}
       title={t('settings.mcp.form.deleteTitle')}
-      footer={(
-        <>
-          <Button variant="ghost" onClick={() => setPendingDeleteServer(null)} disabled={isDeleting}>
-            {t('settings.mcp.form.cancel')}
-          </Button>
-          <Button variant="danger" onClick={confirmDelete} loading={isDeleting}>
-            {t('settings.mcp.form.confirmDelete')}
-          </Button>
-        </>
-      )}
-    >
-      <p className="text-sm leading-6 text-[var(--color-text-secondary)]">
-        {pendingDeleteServer ? t('settings.mcp.form.deleteConfirmBody', { name: pendingDeleteServer.name }) : ''}
-      </p>
-    </Modal>
+      body={pendingDeleteServer ? t('settings.mcp.form.deleteConfirmBody', { name: pendingDeleteServer.name }) : ''}
+      confirmLabel={t('settings.mcp.form.confirmDelete')}
+      cancelLabel={t('settings.mcp.form.cancel')}
+      confirmVariant="danger"
+      loading={isDeleting}
+      onConfirm={confirmDelete}
+    />
   )
 
   const handleSave = async () => {
@@ -617,9 +740,10 @@ export function McpSettings() {
     setIsSaving(true)
     try {
       const payload = buildPayload(draft)
+      const operationCwd = scopeRequiresProject(draft.scope) ? draft.projectPath.trim() : undefined
       const saved = view.type === 'edit'
-        ? await updateServer(view.server, payload, resolveOperationCwd(view.server))
-        : await createServer(draft.name.trim(), payload, currentWorkDir)
+        ? await updateServer(view.server, payload, operationCwd)
+        : await createServer(draft.name.trim(), payload, operationCwd)
 
       addToast({
         type: 'success',
@@ -681,7 +805,10 @@ export function McpSettings() {
         <div className="max-w-5xl min-w-0">
           <button
             type="button"
-            onClick={() => setView({ type: 'list' })}
+            onClick={() => {
+              setView({ type: 'list' })
+              selectServer(null)
+            }}
             className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
           >
             <span className="material-symbols-outlined text-[18px]">arrow_back</span>
@@ -691,7 +818,7 @@ export function McpSettings() {
           <div className="flex items-start justify-between gap-4 mb-8">
             <div>
               <h2 className="text-[2.2rem] font-semibold tracking-[-0.03em] text-[var(--color-text-primary)]">{server.name}</h2>
-              <p className="mt-3 text-base text-[var(--color-text-secondary)]">{server.summary}</p>
+              <p className="mt-3 text-base text-[var(--color-text-secondary)]">{redactSensitiveText(server.summary)}</p>
               <div className="mt-4 flex flex-wrap items-center gap-3">
                 <StatusBadge server={server} />
                 {server.statusDetail && (
@@ -700,7 +827,7 @@ export function McpSettings() {
               </div>
             </div>
             {server.canReconnect && (
-              <Button variant="secondary" onClick={() => handleReconnect(server)} loading={busyServerName === server.name}>
+              <Button variant="secondary" onClick={() => handleReconnect(server)} loading={busyServerKey === getServerIdentityKey(server)}>
                 <span className="material-symbols-outlined text-[16px]">sync</span>
                 {t('settings.mcp.form.reconnect')}
               </Button>
@@ -717,7 +844,7 @@ export function McpSettings() {
             <div className="mt-5">
               <div className="text-sm font-semibold text-[var(--color-text-primary)] mb-2">{t('settings.mcp.form.rawConfig')}</div>
               <pre className="overflow-x-auto rounded-[var(--radius-lg)] bg-[var(--color-surface-hover)] p-4 text-xs text-[var(--color-text-secondary)]">
-                {JSON.stringify(server.config, null, 2)}
+                {JSON.stringify(redactMcpDisplayValue(server.config), null, 2)}
               </pre>
             </div>
           </section>
@@ -732,13 +859,31 @@ export function McpSettings() {
     const targetServer = editing ? view.server : null
     const transportLocked = editing
     const isBusy = isSaving || isDeleting
+    const targetProjectPath = draft.projectPath.trim()
+    const needsProjectTarget = scopeRequiresProject(draft.scope)
+    const targetProjectHint = draft.scope === 'local'
+      ? (targetProjectPath
+          ? t('settings.mcp.targetProject.localSelected', { path: targetProjectPath })
+          : currentWorkDir
+            ? t('settings.mcp.targetProject.emptyWithCurrent', { path: currentWorkDir })
+            : t('settings.mcp.targetProject.localEmpty'))
+      : draft.scope === 'project'
+        ? (targetProjectPath
+            ? t('settings.mcp.targetProject.projectSelected', { path: targetProjectPath })
+            : currentWorkDir
+              ? t('settings.mcp.targetProject.emptyWithCurrent', { path: currentWorkDir })
+              : t('settings.mcp.targetProject.projectEmpty'))
+        : t('settings.mcp.targetProject.globalHint')
 
     return (
       <>
         <div className="max-w-5xl min-w-0">
           <button
             type="button"
-            onClick={() => setView({ type: 'list' })}
+            onClick={() => {
+              setView({ type: 'list' })
+              selectServer(null)
+            }}
             className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
           >
             <span className="material-symbols-outlined text-[18px]">arrow_back</span>
@@ -765,7 +910,7 @@ export function McpSettings() {
 
             <div className="flex items-center gap-3">
               {editing && targetServer?.canReconnect && (
-                <Button variant="secondary" onClick={() => handleReconnect(targetServer)} loading={busyServerName === targetServer.name}>
+                <Button variant="secondary" onClick={() => handleReconnect(targetServer)} loading={busyServerKey === getServerIdentityKey(targetServer)}>
                   <span className="material-symbols-outlined text-[16px]">sync</span>
                   {t('settings.mcp.form.reconnect')}
                 </Button>
@@ -800,9 +945,47 @@ export function McpSettings() {
             <div className="text-sm font-semibold text-[var(--color-text-primary)] mb-2">
               {t('settings.mcp.form.scope')}
             </div>
-            <p className="text-xs leading-5 text-[var(--color-text-tertiary)]">
-              {t('settings.mcp.globalOnlyHint')}
-            </p>
+            <div className="grid gap-2 md:grid-cols-3">
+              {WRITABLE_SCOPES.map((scope) => {
+                const active = draft.scope === scope
+                return (
+                  <button
+                    key={scope}
+                    type="button"
+                    onClick={() => setDraftField('scope', scope)}
+                    className={`rounded-[var(--radius-md)] border p-3 text-left transition-colors ${
+                      active
+                        ? 'border-[var(--color-border-focus)] bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
+                        : 'border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
+                    }`}
+                  >
+                    <span className="block text-sm font-semibold">{t(`settings.mcp.scope.${scope}`)}</span>
+                    <span className="mt-1 block text-xs leading-5 text-[var(--color-text-tertiary)]">
+                      {t(`settings.mcp.scopeDesc.${scope}`)}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          </section>
+
+          <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] p-5">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-[var(--color-text-primary)]">
+                  {needsProjectTarget ? t('settings.mcp.targetProject.title') : t('settings.mcp.targetProject.globalTitle')}
+                </div>
+                <p className="mt-1 text-xs leading-5 text-[var(--color-text-tertiary)]">
+                  {targetProjectHint}
+                </p>
+              </div>
+              {needsProjectTarget && (
+                <DirectoryPicker
+                  value={draft.projectPath}
+                  onChange={(path) => setDraftField('projectPath', path)}
+                />
+              )}
+            </div>
           </section>
 
           <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
@@ -856,6 +1039,7 @@ export function McpSettings() {
                 onAdd={() => addRow('args')}
                 onRemove={(id) => removeRow('args', id)}
                 singleValue
+                displayValue={(_row, index) => displayMcpArgumentValue(draft.args, index)}
                 valuePlaceholder={t('settings.mcp.form.argumentPlaceholder')}
                 addLabel={t('settings.mcp.form.addArgument')}
               />
@@ -866,6 +1050,7 @@ export function McpSettings() {
                 onChange={(id, field, value) => updateKeyValueRows('env', id, field, value)}
                 onAdd={() => addRow('env')}
                 onRemove={(id) => removeRow('env', id)}
+                displayValue={(row) => ('key' in row ? displayMcpKeyValueRowValue(row) : row.value)}
                 keyPlaceholder={t('settings.mcp.form.keyPlaceholder')}
                 valuePlaceholder={t('settings.mcp.form.valuePlaceholder')}
                 addLabel={t('settings.mcp.form.addEnv')}
@@ -889,6 +1074,7 @@ export function McpSettings() {
                 onChange={(id, field, value) => updateKeyValueRows('headers', id, field, value)}
                 onAdd={() => addRow('headers')}
                 onRemove={(id) => removeRow('headers', id)}
+                displayValue={(row) => ('key' in row ? displayMcpKeyValueRowValue(row) : row.value)}
                 keyPlaceholder={t('settings.mcp.form.keyPlaceholder')}
                 valuePlaceholder={t('settings.mcp.form.valuePlaceholder')}
                 addLabel={t('settings.mcp.form.addHeader')}
@@ -950,64 +1136,66 @@ export function McpSettings() {
         </Button>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3 mb-8">
-        <StatCard label={t('settings.mcp.stats.total')} value={stats.total} icon="dns" />
-        <StatCard label={t('settings.mcp.stats.connected')} value={stats.connected} icon="check_circle" />
-        <StatCard label={t('settings.mcp.stats.attention')} value={stats.attention} icon="error" />
-      </div>
-
-      {isLoading && servers.length === 0 ? (
-        <div className="flex justify-center py-16">
-          <div className="animate-spin h-6 w-6 rounded-full border-2 border-[var(--color-brand)] border-t-transparent" />
-        </div>
-      ) : error ? (
-        <div className="text-center py-16 rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
-          <span className="material-symbols-outlined text-[40px] text-[var(--color-error)] mb-3 block">error</span>
-          <p className="text-sm text-[var(--color-error)] mb-3">{error}</p>
-          <button
-            type="button"
-            onClick={() => void fetchServers(undefined, currentWorkDir)}
-            className="text-sm text-[var(--color-text-accent)] hover:underline"
-          >
-            {t('common.retry')}
-          </button>
-        </div>
-      ) : servers.length === 0 ? (
-        <div className="text-center py-16 rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
-          <span className="material-symbols-outlined text-[40px] text-[var(--color-text-tertiary)] mb-3 block">dns</span>
-          <p className="text-sm text-[var(--color-text-secondary)] mb-1">{t('settings.mcp.empty')}</p>
-          <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.mcp.emptyHint')}</p>
-        </div>
+      {showListLoading ? (
+        <LoadingState label={t('common.loading')} />
       ) : (
-        <div className="flex flex-col gap-6">
-          {MCP_GROUP_ORDER.map((group) => {
-            const groupServers = groupedServers[group]
-            if (!groupServers?.length) return null
+        <>
+          <div className="grid gap-4 md:grid-cols-3 mb-8">
+            <StatCard label={t('settings.mcp.stats.total')} value={stats.total} icon="dns" />
+            <StatCard label={t('settings.mcp.stats.connected')} value={stats.connected} icon="check_circle" />
+            <StatCard label={t('settings.mcp.stats.attention')} value={stats.attention} icon="error" />
+          </div>
 
-            return (
-              <section key={group}>
-                <div className="flex items-center justify-between mb-3">
-                  <div className="text-[1.35rem] font-semibold text-[var(--color-text-primary)]">
-                    {group === 'plugin' ? t('settings.mcp.scope.plugin') : t(`settings.mcp.scope.${group}`)}
-                  </div>
-                  <div className="text-sm text-[var(--color-text-tertiary)]">{groupServers.length}</div>
-                </div>
-                <div className="rounded-[28px] border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
-                  {groupServers.map((server) => (
-                    <ServerRow
-                      key={`${server.scope}:${server.name}`}
-                      server={server}
-                      isBusy={busyServerName === server.name}
-                      onOpen={() => beginEdit(server)}
-                      onToggle={() => void handleToggle(server)}
-                      t={t}
-                    />
-                  ))}
-                </div>
-              </section>
-            )
-          })}
-        </div>
+          {error ? (
+            <div className="text-center py-16 rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
+              <span className="material-symbols-outlined text-[40px] text-[var(--color-error)] mb-3 block">error</span>
+              <p className="text-sm text-[var(--color-error)] mb-3">{error}</p>
+              <button
+                type="button"
+                onClick={() => void fetchServers(projectPathsForFetchRef.current, currentWorkDir)}
+                className="text-sm text-[var(--color-text-accent)] hover:underline"
+              >
+                {t('common.retry')}
+              </button>
+            </div>
+          ) : servers.length === 0 ? (
+            <div className="text-center py-16 rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
+              <span className="material-symbols-outlined text-[40px] text-[var(--color-text-tertiary)] mb-3 block">dns</span>
+              <p className="text-sm text-[var(--color-text-secondary)] mb-1">{t('settings.mcp.empty')}</p>
+              <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.mcp.emptyHint')}</p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-6">
+              {MCP_GROUP_ORDER.map((group) => {
+                const groupServers = groupedServers[group]
+                if (!groupServers?.length) return null
+
+                return (
+                  <section key={group}>
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-[1.35rem] font-semibold text-[var(--color-text-primary)]">
+                        {group === 'plugin' ? t('settings.mcp.scope.plugin') : t(`settings.mcp.scope.${group}`)}
+                      </div>
+                      <div className="text-sm text-[var(--color-text-tertiary)]">{groupServers.length}</div>
+                    </div>
+                    <div className="rounded-[28px] border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
+                      {groupServers.map((server) => (
+                        <ServerRow
+                          key={getServerIdentityKey(server)}
+                          server={server}
+                          isBusy={busyServerKey === getServerIdentityKey(server)}
+                          onOpen={() => beginEdit(server)}
+                          onToggle={() => void handleToggle(server)}
+                          t={t}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                )
+              })}
+            </div>
+          )}
+        </>
       )}
       {deleteModal}
     </div>

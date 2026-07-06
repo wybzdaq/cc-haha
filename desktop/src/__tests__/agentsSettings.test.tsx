@@ -148,7 +148,7 @@ describe('Settings > Agents tab', () => {
       activeTabId: 'session-1',
       tabs: [{ sessionId: 'session-1', title: 'Test', type: 'session', status: 'idle' }],
     })
-    useUIStore.setState({ pendingSettingsTab: null })
+    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null })
     useSessionStore.setState({
       sessions: [
         {
@@ -165,15 +165,12 @@ describe('Settings > Agents tab', () => {
       activeSessionId: 'session-1',
       isLoading: false,
       error: null,
-      selectedProjects: [],
-      availableProjects: [],
       fetchSessions: noopFetch,
       createSession: vi.fn(),
       deleteSession: vi.fn(),
       renameSession: vi.fn(),
       updateSessionTitle: vi.fn(),
       setActiveSession: vi.fn(),
-      setSelectedProjects: vi.fn(),
     })
     useAgentStore.setState({
       activeAgents: [],

@@ -29,6 +29,7 @@ import {
 } from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient, type RecentProject } from '../common/http-client.js'
+import { restoreStoredSessionBinding } from '../common/session-recovery.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
 import { optimizeMarkdownForFeishu } from './markdown-style.js'
 import { extractInboundPayload } from './extract-payload.js'
@@ -37,6 +38,7 @@ import { AttachmentStore } from '../common/attachment/attachment-store.js'
 import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
+import { isOutsideWorkDir } from './path-safety.js'
 
 // ---------- init ----------
 
@@ -217,17 +219,15 @@ function clearTransientChatState(chatId: string): void {
 }
 
 async function ensureExistingSession(chatId: string): Promise<{ sessionId: string; workDir: string } | null> {
-  const stored = sessionStore.get(chatId)
-  if (!stored) return null
-
-  if (!bridge.hasSession(chatId)) {
-    bridge.connectSession(chatId, stored.sessionId)
-    bridge.onServerMessage(chatId, (msg) => handleServerMessage(chatId, msg))
-    const opened = await bridge.waitForOpen(chatId)
-    if (!opened) return null
-  }
-
-  return stored
+  return await restoreStoredSessionBinding({
+    chatId,
+    bridge,
+    sessionStore,
+    httpClient,
+    onServerMessage: (msg) => handleServerMessage(chatId, msg),
+    logPrefix: '[Feishu]',
+    clearTransientState: () => clearTransientChatState(chatId),
+  })
 }
 
 async function buildStatusText(chatId: string): Promise<string> {
@@ -502,16 +502,6 @@ function summarizeToolCall(toolName: string, input: unknown): ToolCallSummary {
   }
 }
 
-/** True if `filePath` resolves to a location outside of `workDir`.
- *  Relative paths are resolved against workDir first. */
-function isOutsideWorkDir(filePath: string, workDir: string): boolean {
-  const abs = path.isAbsolute(filePath)
-    ? path.normalize(filePath)
-    : path.resolve(workDir, filePath)
-  const normWork = path.normalize(workDir).replace(/\/+$/, '')
-  return abs !== normWork && !abs.startsWith(normWork + path.sep)
-}
-
 /** Truncate a single-line target preview (e.g. shell command) to maxLen. */
 function truncateTarget(s: string, maxLen = 160): string {
   if (s.length <= maxLen) return s
@@ -655,14 +645,8 @@ function buildPermissionCard(
 // ---------- session management ----------
 
 async function ensureSession(chatId: string): Promise<boolean> {
-  if (bridge.hasSession(chatId)) return true
-
-  const stored = sessionStore.get(chatId)
-  if (stored) {
-    bridge.connectSession(chatId, stored.sessionId)
-    bridge.onServerMessage(chatId, (msg) => handleServerMessage(chatId, msg))
-    return await bridge.waitForOpen(chatId)
-  }
+  const stored = await ensureExistingSession(chatId)
+  if (stored) return true
 
   const workDir = defaultWorkDir
   if (workDir) {

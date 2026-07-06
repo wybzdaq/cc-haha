@@ -25,7 +25,8 @@ export type PythonRuntimeResolution = {
   path: string | null
   command: string | null
   prefixArgs: string[]
-  source: 'system' | 'venv' | null
+  source: 'custom' | 'system' | 'venv' | null
+  error: string | null
 }
 
 function getPythonCandidates(platform: NodeJS.Platform): PythonCandidate[] {
@@ -68,6 +69,19 @@ function extractPythonVersion(output: string): string | null {
   return match?.[1] ?? null
 }
 
+export function isPythonVersionAtLeast(
+  version: string | null,
+  major: number,
+  minor: number,
+): boolean {
+  if (!version) return false
+  const match = version.match(/^(\d+)\.(\d+)/)
+  if (!match) return false
+  const currentMajor = Number(match[1])
+  const currentMinor = Number(match[2])
+  return currentMajor > major || (currentMajor === major && currentMinor >= minor)
+}
+
 function firstOutputLine(output: string): string | null {
   const line = output
     .split(/\r?\n/)
@@ -90,7 +104,34 @@ export async function detectPythonRuntime(
   platform: NodeJS.Platform,
   runCommand: CommandRunner,
   venvPythonPath?: string,
+  customPythonPath?: string | null,
 ): Promise<PythonRuntimeResolution> {
+  const normalizedCustomPath = customPythonPath?.trim()
+  if (normalizedCustomPath) {
+    const customResult = await runCommand(normalizedCustomPath, ['--version'])
+    if (customResult.ok) {
+      return {
+        installed: true,
+        version: extractPythonVersion(`${customResult.stdout}\n${customResult.stderr}`),
+        path: normalizedCustomPath,
+        command: normalizedCustomPath,
+        prefixArgs: [],
+        source: 'custom',
+        error: null,
+      }
+    }
+
+    return {
+      installed: false,
+      version: null,
+      path: normalizedCustomPath,
+      command: normalizedCustomPath,
+      prefixArgs: [],
+      source: 'custom',
+      error: customResult.stderr || customResult.stdout || `Failed to run ${normalizedCustomPath}`,
+    }
+  }
+
   for (const candidate of getPythonCandidates(platform)) {
     const versionResult = await runCommand(candidate.command, [...candidate.prefixArgs, '--version'])
     if (!versionResult.ok) continue
@@ -102,6 +143,7 @@ export async function detectPythonRuntime(
       command: candidate.command,
       prefixArgs: candidate.prefixArgs,
       source: 'system',
+      error: null,
     }
   }
 
@@ -115,6 +157,7 @@ export async function detectPythonRuntime(
         command: venvPythonPath,
         prefixArgs: [],
         source: 'venv',
+        error: null,
       }
     }
   }
@@ -126,6 +169,6 @@ export async function detectPythonRuntime(
     command: null,
     prefixArgs: [],
     source: null,
+    error: null,
   }
 }
-

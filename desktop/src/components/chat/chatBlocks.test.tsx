@@ -18,14 +18,44 @@ describe('chat blocks', () => {
     const { container } = render(<ThinkingBlock content="this is a long internal reasoning trace" isActive />)
 
     expect(screen.getByText(/Thinking/)).toBeTruthy()
-    expect(container.textContent).toContain('this is a long internal reasoning trace')
+    expect(container.textContent).not.toContain('this is a long internal reasoning trace')
     expect(container.querySelector('.thinking-cursor')).toBeNull()
   })
 
   it('does not animate inactive historical thinking blocks', () => {
     const { container } = render(<ThinkingBlock content="old reasoning" isActive={false} />)
 
-    expect(container.querySelector('.thinking-inline-cursor')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
+
+    expect(container.textContent).toContain('old reasoning')
+    expect(container.querySelector('.thinking-cursor')).toBeNull()
+  })
+
+  it('renders thinking content as markdown only after expanding', () => {
+    const { container } = render(<ThinkingBlock content={'**important**\n\n- item one'} />)
+
+    expect(container.textContent).not.toContain('important')
+    expect(container.querySelector('strong')).toBeNull()
+    expect(container.querySelector('li')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
+
+    expect(container.querySelector('strong')?.textContent).toBe('important')
+    expect(container.querySelector('li')?.textContent).toBe('item one')
+  })
+
+  it('hides full thinking content until expanded', () => {
+    const content = Array.from({ length: 12 }, (_, index) => `line-${index + 1}`).join('\n')
+    const { container } = render(<ThinkingBlock content={content} />)
+
+    expect(container.textContent).not.toContain('line-1')
+    expect(container.textContent).not.toContain('line-11')
+
+    fireEvent.click(screen.getByRole('button', { name: /Thought/ }))
+
+    expect(container.textContent).toContain('line-1')
+    expect(container.textContent).toContain('line-11')
+    expect(container.textContent).toContain('line-12')
   })
 
   it('shows tool previews only after expanding the tool block', () => {
@@ -64,6 +94,133 @@ describe('chat blocks', () => {
     expect(container.textContent).not.toContain('file-a')
   })
 
+  it('shows pending Write tool calls while input is still streaming', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Write"
+        input={{ file_path: '/private/tmp/ai-code-novel.md' }}
+        isPending
+        partialInput={'{"file_path":"/private/tmp/ai-code-novel.md","content":"第一章'}
+      />,
+    )
+
+    expect(container.textContent).toContain('Write')
+    expect(container.textContent).toContain('ai-code-novel.md')
+    expect(container.textContent).toContain('Generating content')
+  })
+
+  it('shows pending Write line and character progress in the collapsed header', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Write"
+        input={{ file_path: '/private/tmp/ai-code-novel.md' }}
+        isPending
+        partialInput={'{"file_path":"/private/tmp/ai-code-novel.md","content":"alpha\\nbeta'}
+      />,
+    )
+
+    expect(container.textContent).toContain('Generating content')
+    expect(container.textContent).toContain('2 lines')
+    expect(container.textContent).toContain('10 chars')
+    expect(container.textContent).not.toContain('latest')
+  })
+
+  it('expands pending Write tool calls into a live writer preview instead of raw JSON', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Write"
+        input={{ file_path: '/private/tmp/ai-code-novel.md' }}
+        isPending
+        partialInput={'{"file_path":"/private/tmp/ai-code-novel.md","content":"# 第一章\\n\\n正文正在生成'}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Writer')
+    expect(container.textContent).toContain('# 第一章')
+    expect(container.textContent).toContain('正文正在生成')
+    expect(container.textContent).not.toContain('"content"')
+  })
+
+  it('formats and wraps pending Bash partial JSON input when expanded', () => {
+    const partialInput = [
+      '{"command":"cat << \'HTMLEOF\' > /tmp/index.html\\n<!DOCTYPE html>\\n<html lang=\\"zh-CN\\">",',
+      '"description":"Create HTML shell command"}',
+    ].join('')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'cat << \'HTMLEOF\' > /tmp/index.html', description: 'Create HTML shell command' }}
+        isPending
+        partialInput={partialInput}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Partial input')
+    expect(container.textContent).toContain('json')
+    expect(container.textContent).toContain('4 lines')
+    expect(container.textContent).not.toContain('1 line')
+
+    const contentWrapper = container.querySelector('[data-code-viewer-content]') as HTMLElement | null
+    expect(contentWrapper?.style.whiteSpace).toBe('pre-wrap')
+    expect(contentWrapper?.style.wordBreak).toBe('break-word')
+  })
+
+  it('shows non-windowed Writer preview stats before the 120-line limit', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Write"
+        input={{ file_path: '/private/tmp/generated.ts' }}
+        isPending
+        partialInput={'{"file_path":"/private/tmp/generated.ts","content":"alpha\\nbeta\\ngamma'}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Writer')
+    expect(container.textContent).toContain('3 lines')
+    expect(container.textContent).toContain('16 chars')
+    expect(container.textContent).not.toContain('latest')
+  })
+
+  it('shows pending Edit replacement character progress in the collapsed header', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Edit"
+        input={{ file_path: '/tmp/example.ts' }}
+        isPending
+        partialInput={'{"file_path":"/tmp/example.ts","old_string":"const ready = false","new_string":"const ready = true'}
+      />,
+    )
+
+    expect(container.textContent).toContain('Preparing edit')
+    expect(container.textContent).toContain('1 line')
+    expect(container.textContent).toContain('18 chars')
+  })
+
+  it('windows long pending Write previews to the latest content', () => {
+    const lines = Array.from({ length: 180 }, (_, index) => `line-${index + 1}`)
+    const escapedContent = lines.join('\\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Write"
+        input={{ file_path: '/private/tmp/generated.ts' }}
+        isPending
+        partialInput={`{"file_path":"/private/tmp/generated.ts","content":"${escapedContent}`}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('latest')
+    expect(container.textContent).toContain('line-180')
+    expect(container.textContent).not.toContain('line-30')
+  })
+
   it('shows a collapsed error summary for failed bash commands', () => {
     const { container } = render(
       <ToolCallBlock
@@ -75,6 +232,84 @@ describe('chat blocks', () => {
 
     expect(container.textContent).toContain('Bash')
     expect(container.textContent).toContain('fatal: unrecognized argument: --no-stat')
+  })
+
+  it('shows full bash error output when the tool block is expanded', () => {
+    const lines = Array.from({ length: 8 }, (_, index) => `detail line ${index + 1}`)
+    const fullError = [
+      '<tool_use_error>InputValidationError: Bash failed due to the following issues: The required parameter `description` is missing.',
+      ...lines,
+      'final remediation hint: provide a concise command description.',
+    ].join('\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Bash"
+        input={{ command: 'bun run check:server' }}
+        result={{ content: fullError, isError: true }}
+      />,
+    )
+
+    expect(container.textContent).toContain('InputValidationError')
+    expect(container.textContent).not.toContain('final remediation hint')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Error Output')
+    expect(container.textContent).toContain('detail line 8')
+    expect(container.textContent).toContain('final remediation hint')
+  })
+
+  it('shows read tool validation errors when the tool block is expanded', () => {
+    const fullError = [
+      '<tool_use_error>InputValidationError: Read failed due to the following issues:',
+      'The required parameter `file_path` is missing.',
+      'The provided limit must be greater than 0.',
+    ].join('\n')
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Read"
+        input={{}}
+        result={{ content: fullError, isError: true }}
+      />,
+    )
+
+    expect(container.textContent).toContain('Read')
+    expect(container.textContent).not.toContain('file_path')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('Error Output')
+    expect(container.textContent).toContain('file_path')
+    expect(container.textContent).toContain('limit must be greater than 0')
+  })
+
+  it('keeps edit previews while showing edit tool error output when expanded', () => {
+    const { container } = render(
+      <ToolCallBlock
+        toolName="Edit"
+        input={{
+          file_path: '/tmp/example.ts',
+          old_string: 'const enabled = false',
+          new_string: 'const enabled = true',
+        }}
+        result={{
+          content: [
+            'InputValidationError: Edit failed due to the following issues:',
+            'The provided old_string was not found in the file.',
+          ].join('\n'),
+          isError: true,
+        }}
+      />,
+    )
+
+    expect(container.textContent).toContain('Edit')
+    expect(container.textContent).not.toContain('old_string was not found')
+
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(container.textContent).toContain('example.ts')
+    expect(container.textContent).toContain('Error Output')
+    expect(container.textContent).toContain('old_string was not found')
   })
 
   it('expands tool errors so full Computer Use gate messages are readable', () => {
@@ -121,6 +356,7 @@ describe('chat blocks', () => {
           },
           pendingComputerUsePermission: null,
           tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
           elapsedSeconds: 0,
           statusVerb: '',
           slashCommands: [],

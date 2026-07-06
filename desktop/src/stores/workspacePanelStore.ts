@@ -8,10 +8,11 @@ import {
 } from '../api/sessions'
 
 export const WORKSPACE_PANEL_DEFAULT_WIDTH = 860
-export const WORKSPACE_PANEL_MIN_WIDTH = 640
+export const WORKSPACE_PANEL_MIN_WIDTH = 420
 export const WORKSPACE_PANEL_MAX_WIDTH = 1120
 
 export type WorkspacePanelView = 'changed' | 'all'
+export type WorkbenchMode = 'workspace' | 'browser'
 export type WorkspacePreviewKind = 'file' | 'diff'
 export type WorkspacePreviewCloseScope = 'current' | 'others' | 'left' | 'right' | 'all'
 export type WorkspacePreviewState =
@@ -55,6 +56,7 @@ type WorkspacePanelErrorState = {
 
 type WorkspacePanelStore = {
   panelBySession: Record<string, WorkspacePanelSessionState | undefined>
+  modeBySession: Record<string, WorkbenchMode | undefined>
   width: number
   statusBySession: Record<string, WorkspaceStatusResult | undefined>
   expandedPathsBySession: Record<string, string[] | undefined>
@@ -66,6 +68,8 @@ type WorkspacePanelStore = {
 
   isPanelOpen: (sessionId: string) => boolean
   getActiveView: (sessionId: string) => WorkspacePanelView
+  getMode: (sessionId: string) => WorkbenchMode
+  setMode: (sessionId: string, mode: WorkbenchMode) => void
   openPanel: (sessionId: string) => void
   closePanel: (sessionId: string) => void
   togglePanel: (sessionId: string) => void
@@ -85,6 +89,8 @@ const DEFAULT_PANEL_STATE: WorkspacePanelSessionState = {
   isOpen: false,
   activeView: 'changed',
 }
+
+const DEFAULT_WORKBENCH_MODE: WorkbenchMode = 'workspace'
 
 const statusRequestIds = new Map<string, number>()
 const treeRequestIds = new Map<string, number>()
@@ -182,6 +188,7 @@ function upsertPreviewTab(
 
 export const useWorkspacePanelStore = create<WorkspacePanelStore>((set, get) => ({
   panelBySession: {},
+  modeBySession: {},
   width: WORKSPACE_PANEL_DEFAULT_WIDTH,
   statusBySession: {},
   expandedPathsBySession: {},
@@ -201,6 +208,15 @@ export const useWorkspacePanelStore = create<WorkspacePanelStore>((set, get) => 
 
   isPanelOpen: (sessionId) => getSessionPanelState(get().panelBySession, sessionId).isOpen,
   getActiveView: (sessionId) => getSessionPanelState(get().panelBySession, sessionId).activeView,
+  getMode: (sessionId) => get().modeBySession[sessionId] ?? DEFAULT_WORKBENCH_MODE,
+
+  setMode: (sessionId, mode) =>
+    set((state) => ({
+      modeBySession: {
+        ...state.modeBySession,
+        [sessionId]: mode,
+      },
+    })),
 
   openPanel: (sessionId) =>
     set((state) => ({
@@ -431,9 +447,17 @@ export const useWorkspacePanelStore = create<WorkspacePanelStore>((set, get) => 
   },
 
   openPreview: async (sessionId, path, kind) => {
+    // Ensure the workspace panel is visible — openPreview is now triggered from places
+    // where the panel may be closed (e.g. the chat "打开方式" menu / turn-changes card),
+    // not only from inside the already-open file tree. Opening a file always switches the
+    // unified workbench into file ("workspace") mode.
+    get().openPanel(sessionId)
+    get().setMode(sessionId, 'workspace')
     const tabId = getWorkspacePreviewTabId(path, kind)
     const requestKey = makePreviewKey(sessionId, tabId)
     const existing = get().previewTabsBySession[sessionId]?.find((tab) => tab.id === tabId)
+
+    const requestId = nextRequestId(previewRequestIds, requestKey)
 
     if (existing) {
       set((state) => ({
@@ -441,43 +465,55 @@ export const useWorkspacePanelStore = create<WorkspacePanelStore>((set, get) => 
           ...state.activePreviewTabIdBySession,
           [sessionId]: tabId,
         },
+        loading: {
+          ...state.loading,
+          previewByTabId: {
+            ...state.loading.previewByTabId,
+            [requestKey]: true,
+          },
+        },
+        errors: {
+          ...state.errors,
+          previewByTabId: {
+            ...state.errors.previewByTabId,
+            [requestKey]: null,
+          },
+        },
       }))
-      return
-    }
+    } else {
+      const baseTab: WorkspacePreviewTab = {
+        id: tabId,
+        path,
+        kind,
+        title: getPathTitle(path),
+        state: 'loading',
+      }
 
-    const requestId = nextRequestId(previewRequestIds, requestKey)
-    const baseTab: WorkspacePreviewTab = {
-      id: tabId,
-      path,
-      kind,
-      title: getPathTitle(path),
-      state: 'loading',
+      set((state) => ({
+        previewTabsBySession: {
+          ...state.previewTabsBySession,
+          [sessionId]: [...(state.previewTabsBySession[sessionId] ?? []), baseTab],
+        },
+        activePreviewTabIdBySession: {
+          ...state.activePreviewTabIdBySession,
+          [sessionId]: tabId,
+        },
+        loading: {
+          ...state.loading,
+          previewByTabId: {
+            ...state.loading.previewByTabId,
+            [requestKey]: true,
+          },
+        },
+        errors: {
+          ...state.errors,
+          previewByTabId: {
+            ...state.errors.previewByTabId,
+            [requestKey]: null,
+          },
+        },
+      }))
     }
-
-    set((state) => ({
-      previewTabsBySession: {
-        ...state.previewTabsBySession,
-        [sessionId]: [...(state.previewTabsBySession[sessionId] ?? []), baseTab],
-      },
-      activePreviewTabIdBySession: {
-        ...state.activePreviewTabIdBySession,
-        [sessionId]: tabId,
-      },
-      loading: {
-        ...state.loading,
-        previewByTabId: {
-          ...state.loading.previewByTabId,
-          [requestKey]: true,
-        },
-      },
-      errors: {
-        ...state.errors,
-        previewByTabId: {
-          ...state.errors.previewByTabId,
-          [requestKey]: null,
-        },
-      },
-    }))
 
     try {
       if (kind === 'diff') {
@@ -691,6 +727,7 @@ export const useWorkspacePanelStore = create<WorkspacePanelStore>((set, get) => 
 
     set((state) => ({
       panelBySession: removeRecordKey(state.panelBySession, sessionId),
+      modeBySession: removeRecordKey(state.modeBySession, sessionId),
       statusBySession: removeRecordKey(state.statusBySession, sessionId),
       expandedPathsBySession: removeRecordKey(state.expandedPathsBySession, sessionId),
       treeBySessionPath: removeRecordKey(state.treeBySessionPath, sessionId),

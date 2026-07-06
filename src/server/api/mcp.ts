@@ -9,6 +9,7 @@ import {
 } from '../../services/mcp/client.js'
 import {
   addMcpConfig,
+  getAllMcpConfigs,
   getClaudeCodeMcpConfigs,
   getMcpConfigByName,
   isMcpServerDisabled,
@@ -25,9 +26,10 @@ import type {
   ScopedMcpServerConfig,
 } from '../../services/mcp/types.js'
 import { describeMcpConfigFilePath, ensureConfigScope } from '../../services/mcp/utils.js'
-import { enableConfigs } from '../../utils/config.js'
+import { enableConfigs, getGlobalConfig } from '../../utils/config.js'
 import { getCwd, runWithCwdOverride } from '../../utils/cwd.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
+import { conversationService } from '../services/conversationService.js'
 
 type McpEditableConfigDto =
   | {
@@ -69,8 +71,16 @@ type McpServerDto = {
 
 type McpMutationBody = {
   cwd?: string
+  previousCwd?: string
   scope?: string
+  sessionId?: string
   config?: unknown
+}
+
+type McpSessionSyncDto = {
+  applied: boolean
+  reason?: 'not_running' | 'failed'
+  error?: string
 }
 
 const EDITABLE_SCOPES = new Set<ConfigScope>(['local', 'project', 'user'])
@@ -82,6 +92,36 @@ function parseJsonBody(req: Request): Promise<Record<string, unknown>> {
     .catch(() => {
       throw ApiError.badRequest('Invalid JSON body')
     })
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+async function syncMcpToggleToSession(
+  sessionId: string | undefined,
+  serverName: string,
+  enabled: boolean,
+): Promise<McpSessionSyncDto | undefined> {
+  if (!sessionId) return undefined
+  if (!conversationService.hasSession(sessionId)) {
+    return { applied: false, reason: 'not_running' }
+  }
+
+  try {
+    await conversationService.requestControl(
+      sessionId,
+      { subtype: 'mcp_toggle', serverName, enabled },
+      120_000,
+    )
+    return { applied: true }
+  } catch (error) {
+    return {
+      applied: false,
+      reason: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
 }
 
 function resolveRequestCwd(url: URL, body?: Record<string, unknown>): string {
@@ -301,7 +341,7 @@ async function resolveServerForRuntimeAction(
     return configured
   }
 
-  const { servers } = await getClaudeCodeMcpConfigs()
+  const { servers } = await getAllMcpConfigs()
   return servers[name] ?? null
 }
 
@@ -386,13 +426,23 @@ function cleanupSecureStorage(name: string, config: ScopedMcpServerConfig) {
 }
 
 async function listServers(): Promise<Response> {
-  const { servers } = await getClaudeCodeMcpConfigs()
+  const { servers } = await getAllMcpConfigs()
   const visibleServers = Object.entries(servers)
     .filter(([name, config]) => isVisibleServer(name, config))
     .sort((a, b) => a[0].localeCompare(b[0]))
   return Response.json({
     servers: visibleServers.map(([name, config]) => serializeServerSnapshot(name, config)),
   })
+}
+
+function listProjectPathsWithPrivateMcp(): Response {
+  const projects = getGlobalConfig().projects ?? {}
+  const projectPaths = Object.entries(projects)
+    .filter(([, projectConfig]) => Object.keys(projectConfig.mcpServers ?? {}).length > 0)
+    .map(([projectPath]) => projectPath)
+    .sort((a, b) => a.localeCompare(b))
+
+  return Response.json({ projectPaths })
 }
 
 async function getServerStatus(name: string): Promise<Response> {
@@ -442,7 +492,10 @@ async function createServer(body: Record<string, unknown>): Promise<Response> {
 }
 
 async function updateServer(name: string, body: Record<string, unknown>): Promise<Response> {
-  const existing = getMcpConfigByName(name)
+  const targetCwd = getCwd()
+  const previousCwd = optionalString(body.previousCwd)
+  const previousLookupCwd = previousCwd ?? targetCwd
+  const existing = runWithCwdOverride(previousLookupCwd, () => getMcpConfigByName(name))
   if (!existing) {
     throw ApiError.notFound(`MCP server not found: ${name}`)
   }
@@ -458,13 +511,13 @@ async function updateServer(name: string, body: Record<string, unknown>): Promis
   const previousScope = existing.scope
 
   try {
-    await removeMcpConfig(name, previousScope)
+    await runWithCwdOverride(previousLookupCwd, () => removeMcpConfig(name, previousScope))
     await addMcpConfig(name, nextConfig, nextScope)
   } catch (error) {
     try {
-      const restored = getMcpConfigByName(name)
+      const restored = runWithCwdOverride(previousLookupCwd, () => getMcpConfigByName(name))
       if (!restored) {
-        await addMcpConfig(name, previousConfig, previousScope)
+        await runWithCwdOverride(previousLookupCwd, () => addMcpConfig(name, previousConfig, previousScope))
       }
     } catch {
       // Preserve the original update error below.
@@ -499,7 +552,7 @@ async function deleteServer(name: string, url: URL): Promise<Response> {
   return Response.json({ ok: true })
 }
 
-async function toggleServer(name: string): Promise<Response> {
+async function toggleServer(name: string, sessionId?: string): Promise<Response> {
   const existing = await resolveServerForRuntimeAction(name)
   if (!existing) {
     throw ApiError.notFound(`MCP server not found: ${name}`)
@@ -507,11 +560,12 @@ async function toggleServer(name: string): Promise<Response> {
 
   const enabled = isMcpServerDisabled(name)
   setMcpServerEnabled(name, enabled)
+  const sessionSync = await syncMcpToggleToSession(sessionId, name, enabled)
 
   if (!enabled) {
     await clearServerCache(name, existing).catch(() => {})
     const updated = serializeServerSnapshot(name, existing)
-    return Response.json({ server: updated })
+    return Response.json({ server: updated, ...(sessionSync ? { sessionSync } : {}) })
   }
 
   const hostPreflightStatus = await getHostPreflightStatus(existing, true)
@@ -534,6 +588,7 @@ async function toggleServer(name: string): Promise<Response> {
       ...updated,
       ...(statusDetail ? { statusDetail } : {}),
     },
+    ...(sessionSync ? { sessionSync } : {}),
   })
 }
 
@@ -582,6 +637,10 @@ export async function handleMcpApi(
         : undefined
 
     return await runWithCwdOverride(resolveRequestCwd(url, body), async () => {
+      if (req.method === 'GET' && serverName === 'project-paths' && !action) {
+        return listProjectPathsWithPrivateMcp()
+      }
+
       if (req.method === 'GET' && !serverName) {
         return listServers()
       }
@@ -603,7 +662,7 @@ export async function handleMcpApi(
       }
 
       if (req.method === 'POST' && serverName && action === 'toggle') {
-        return toggleServer(serverName)
+        return toggleServer(serverName, optionalString(body?.sessionId))
       }
 
       if (req.method === 'POST' && serverName && action === 'reconnect') {

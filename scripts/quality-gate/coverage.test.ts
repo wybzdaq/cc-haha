@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
+  collectServerTestFiles,
   evaluateChangedLineCoverage,
   evaluateThresholds,
   parseChangedLinesFromDiff,
@@ -112,6 +116,50 @@ describe('coverage gate helpers', () => {
     expect(failures).toEqual(['changed-lines: coverage 50% is below minimum 90%'])
   })
 
+  test('excludes non-instrumented desktop styles from changed-line coverage', () => {
+    const changedLines = parseChangedLinesFromDiff([
+      'diff --git a/desktop/src/theme/globals.css b/desktop/src/theme/globals.css',
+      '--- a/desktop/src/theme/globals.css',
+      '+++ b/desktop/src/theme/globals.css',
+      '@@ -10,0 +11,2 @@',
+      '+.sidebar {',
+      '+  color: var(--color-text-primary);',
+      '+}',
+      'diff --git a/desktop/src/main.tsx b/desktop/src/main.tsx',
+      '--- a/desktop/src/main.tsx',
+      '+++ b/desktop/src/main.tsx',
+      '@@ -20,0 +21,1 @@',
+      '+bootstrapDesktopApp()',
+    ].join('\n'))
+
+    const result = evaluateChangedLineCoverage(
+      changedLines,
+      new Map([
+        ['desktop/src/main.tsx', {
+          suiteId: 'desktop',
+          executableLines: new Set([21]),
+          coveredLines: new Set([21]),
+        }],
+      ]),
+      [{
+        id: 'desktop',
+        title: 'Desktop',
+        includePrefixes: ['desktop/src/'],
+        excludeSuffixes: ['.css'],
+      }],
+      90,
+    )
+
+    expect(result.files).toEqual([{
+      file: 'desktop/src/main.tsx',
+      suiteId: 'desktop',
+      covered: 1,
+      total: 1,
+      pct: 100,
+    }])
+    expect(result.failures).toEqual([])
+  })
+
   test('reports minimum threshold failures', () => {
     const failures = evaluateThresholds([
       {
@@ -157,6 +205,34 @@ describe('coverage gate helpers', () => {
     })
 
     expect(failures).toEqual(['desktop: coverage command exited with 1'])
+  })
+
+  test('collects non-quarantined server tests when review windows have expired', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cc-haha-coverage-'))
+    try {
+      mkdirSync(join(root, 'src/server/__tests__'), { recursive: true })
+      mkdirSync(join(root, 'src/tools'), { recursive: true })
+      mkdirSync(join(root, 'src/utils'), { recursive: true })
+      writeFileSync(join(root, 'src/server/__tests__/active.test.ts'), '')
+      writeFileSync(join(root, 'src/server/__tests__/quarantined.test.ts'), '')
+
+      const files = collectServerTestFiles(root, {
+        quarantined: [
+          {
+            id: 'server:expired',
+            path: 'src/server/__tests__/quarantined.test.ts',
+            reason: 'Known instability under review.',
+            owner: 'maintainers',
+            reviewAfter: '2026-01-01',
+            exitCriteria: 'Make deterministic or remove from quarantine.',
+          },
+        ],
+      })
+
+      expect(files).toEqual(['src/server/__tests__/active.test.ts'])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('does not require every suite to exist in the ratchet baseline', () => {

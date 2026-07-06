@@ -54,6 +54,8 @@ import {
   classifyYoloAction,
 } from '../../utils/permissions/yoloClassifier.js'
 import { emitTaskProgress as emitTaskProgressEvent } from '../../utils/task/sdkProgress.js'
+import { emitAgentToolActivity, type AgentToolActivity } from '../../utils/sdkEventQueue.js'
+import { SYNTHETIC_OUTPUT_TOOL_NAME } from '../SyntheticOutputTool/SyntheticOutputTool.js'
 import { isInProcessTeammate } from '../../utils/teammateContext.js'
 import { getTokenCountFromUsage } from '../../utils/tokens.js'
 import { EXIT_PLAN_MODE_V2_TOOL_NAME } from '../ExitPlanModeTool/constants.js'
@@ -366,6 +368,59 @@ export function getLastToolUseName(message: MessageType): string | undefined {
   return block?.type === 'tool_use' ? block.name : undefined
 }
 
+/**
+ * Extract the tool_use / tool_result blocks from a background agent message so
+ * they can be streamed to the desktop as the agent's tool activity. Skips the
+ * internal StructuredOutput tool (matches updateProgressFromMessage) and
+ * non-array user content (string-only messages carry no tool_result).
+ */
+export function extractAgentToolActivities(
+  message: MessageType,
+): AgentToolActivity[] {
+  if (message.type === 'assistant') {
+    const activities: AgentToolActivity[] = []
+    for (const block of message.message.content) {
+      if (block.type === 'tool_use' && block.name !== SYNTHETIC_OUTPUT_TOOL_NAME) {
+        activities.push({
+          kind: 'tool_use',
+          tool_name: block.name,
+          tool_use_id: block.id,
+          input: block.input,
+        })
+      }
+    }
+    return activities
+  }
+  if (message.type === 'user') {
+    const content = message.message.content
+    if (!Array.isArray(content)) return []
+    const activities: AgentToolActivity[] = []
+    for (const block of content) {
+      if (block.type === 'tool_result') {
+        activities.push({
+          kind: 'tool_result',
+          tool_use_id: block.tool_use_id,
+          content: block.content,
+          is_error: block.is_error === true,
+        })
+      }
+    }
+    return activities
+  }
+  return []
+}
+
+export function emitAgentToolActivitiesForMessage(
+  message: MessageType,
+  taskId: string,
+  parentToolUseId: string | undefined,
+): void {
+  if (!parentToolUseId) return
+  for (const activity of extractAgentToolActivities(message)) {
+    emitAgentToolActivity(taskId, parentToolUseId, activity)
+  }
+}
+
 export function emitTaskProgress(
   tracker: ProgressTracker,
   taskId: string,
@@ -579,6 +634,18 @@ export async function runAsyncAgentLifecycle({
         getProgressUpdate(tracker),
         rootSetAppState,
       )
+      // Stream this background agent's tool activity to the desktop so its
+      // card shows tool_use/tool_result in real time (childToolCallsByParent),
+      // instead of being stuck on "no tool activity". Synchronous subagents
+      // surface activity through the normal in-loop progress path; background
+      // agents are detached (void runAsyncAgentLifecycle), so we route through
+      // the SDK event queue → stdout → ws handler, tagged with the parent
+      // Agent tool_use_id so the UI groups it under the right card.
+      emitAgentToolActivitiesForMessage(
+        message,
+        taskId,
+        toolUseContext.toolUseId,
+      )
       const lastToolName = getLastToolUseName(message)
       if (lastToolName) {
         emitTaskProgress(
@@ -597,44 +664,44 @@ export async function runAsyncAgentLifecycle({
     const agentResult = finalizeAgentTool(agentMessages, taskId, metadata)
 
     // Mark task completed FIRST so TaskOutput(block=true) unblocks
-    // immediately. classifyHandoffIfNeeded (API call) and getWorktreeResult
-    // (git exec) are notification embellishments that can hang — they must
-    // not gate the status transition (gh-20236).
+    // immediately, then notify the parent before any optional cleanup. The
+    // parent session depends on this notification to resume its loop.
     completeAsyncAgent(agentResult, rootSetAppState)
-
-    let finalMessage = extractTextContent(agentResult.content, '\n')
-
-    if (feature('TRANSCRIPT_CLASSIFIER')) {
-      const handoffWarning = await classifyHandoffIfNeeded({
-        agentMessages,
-        tools: toolUseContext.options.tools,
-        toolPermissionContext:
-          toolUseContext.getAppState().toolPermissionContext,
-        abortSignal: abortController.signal,
-        subagentType: metadata.agentType,
-        totalToolUseCount: agentResult.totalToolUseCount,
-      })
-      if (handoffWarning) {
-        finalMessage = `${handoffWarning}\n\n${finalMessage}`
-      }
-    }
-
-    const worktreeResult = await getWorktreeResult()
 
     enqueueAgentNotification({
       taskId,
       description,
       status: 'completed',
       setAppState: rootSetAppState,
-      finalMessage,
+      finalMessage: extractTextContent(agentResult.content, '\n'),
       usage: {
         totalTokens: getTokenCountFromTracker(tracker),
         toolUses: agentResult.totalToolUseCount,
         durationMs: agentResult.totalDurationMs,
       },
       toolUseId: toolUseContext.toolUseId,
-      ...worktreeResult,
     })
+
+    void (async () => {
+      try {
+        await getWorktreeResult()
+        if (feature('TRANSCRIPT_CLASSIFIER')) {
+          await classifyHandoffIfNeeded({
+            agentMessages,
+            tools: toolUseContext.options.tools,
+            toolPermissionContext:
+              toolUseContext.getAppState().toolPermissionContext,
+            abortSignal: abortController.signal,
+            subagentType: metadata.agentType,
+            totalToolUseCount: agentResult.totalToolUseCount,
+          })
+        }
+      } catch (cleanupError) {
+        logForDebugging(
+          `Async agent post-completion cleanup failed: ${errorMessage(cleanupError)}`,
+        )
+      }
+    })()
   } catch (error) {
     stopSummarization?.()
     if (error instanceof AbortError) {
@@ -654,7 +721,6 @@ export async function runAsyncAgentLifecycle({
         reason:
           'user_kill_async' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       })
-      const worktreeResult = await getWorktreeResult()
       const partialResult = extractPartialResult(agentMessages)
       enqueueAgentNotification({
         taskId,
@@ -663,13 +729,16 @@ export async function runAsyncAgentLifecycle({
         setAppState: rootSetAppState,
         toolUseId: toolUseContext.toolUseId,
         finalMessage: partialResult,
-        ...worktreeResult,
       })
+      void getWorktreeResult().catch(cleanupError =>
+        logForDebugging(
+          `Async agent post-cancel cleanup failed: ${errorMessage(cleanupError)}`,
+        ),
+      )
       return
     }
     const msg = errorMessage(error)
     failAsyncAgent(taskId, msg, rootSetAppState)
-    const worktreeResult = await getWorktreeResult()
     enqueueAgentNotification({
       taskId,
       description,
@@ -677,8 +746,12 @@ export async function runAsyncAgentLifecycle({
       error: msg,
       setAppState: rootSetAppState,
       toolUseId: toolUseContext.toolUseId,
-      ...worktreeResult,
     })
+    void getWorktreeResult().catch(cleanupError =>
+      logForDebugging(
+        `Async agent post-failure cleanup failed: ${errorMessage(cleanupError)}`,
+      ),
+    )
   } finally {
     clearInvokedSkillsForAgent(agentIdForCleanup)
     clearDumpState(agentIdForCleanup)

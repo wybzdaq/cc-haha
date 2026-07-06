@@ -3,6 +3,14 @@ import { createPortal } from 'react-dom'
 import { sessionsApi, type RecentProject } from '../../api/sessions'
 import { filesystemApi } from '../../api/filesystem'
 import { useTranslation } from '../../i18n'
+import { useMobileViewport } from '../../hooks/useMobileViewport'
+import { getDesktopHost } from '../../lib/desktopHost'
+import {
+  getCachedRecentProjects,
+  invalidateRecentProjectsCache,
+  setCachedRecentProjects,
+} from '../../lib/recentProjectsCache'
+import { MobileBottomSheet } from './MobileBottomSheet'
 
 type Props = {
   value: string
@@ -13,14 +21,13 @@ type Props = {
 
 type DirEntry = { name: string; path: string; isDirectory: boolean }
 
-// Module-level cache for recent projects (shared across instances, survives re-renders)
-let cachedProjects: RecentProject[] | null = null
-let cacheTimestamp = 0
-const CACHE_TTL = 30_000 // 30s
 const DESKTOP_WORKTREE_MARKER = '/.claude/worktrees/'
+const DROPDOWN_WIDTH = 400
+const DROPDOWN_VIEWPORT_MARGIN = 12
+const DROPDOWN_HEIGHT = 380 // approximate max height
 
-function isTauriRuntime() {
-  return typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+function isDesktopRuntime() {
+  return typeof window !== 'undefined' && getDesktopHost().isDesktop
 }
 
 function projectNameFromPath(filePath: string) {
@@ -39,22 +46,26 @@ export function DirectoryPicker({ value, onChange, variant = 'chip', isGitProjec
   const [browsePath, setBrowsePath] = useState('')
   const [browseParent, setBrowseParent] = useState('')
   const [loading, setLoading] = useState(false)
-  const [dropdownPos, setDropdownPos] = useState<{ top: number; left: number; direction: 'up' | 'down' } | null>(null)
+  const [dropdownPos, setDropdownPos] = useState<{ top: number; left: number; width: number; direction: 'up' | 'down' } | null>(null)
   const ref = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
+  const isMobileBrowser = useMobileViewport() && !isDesktopRuntime()
 
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   const updateDropdownPos = useCallback(() => {
     if (!triggerRef.current) return
     const rect = triggerRef.current.getBoundingClientRect()
-    const DROPDOWN_HEIGHT = 380 // approximate max height
     const spaceAbove = rect.top
     const spaceBelow = window.innerHeight - rect.bottom
     const direction = spaceBelow >= DROPDOWN_HEIGHT || spaceBelow >= spaceAbove ? 'down' : 'up'
+    const width = Math.min(DROPDOWN_WIDTH, Math.max(0, window.innerWidth - DROPDOWN_VIEWPORT_MARGIN * 2))
+    const maxLeft = Math.max(DROPDOWN_VIEWPORT_MARGIN, window.innerWidth - width - DROPDOWN_VIEWPORT_MARGIN)
+    const left = Math.min(Math.max(rect.left, DROPDOWN_VIEWPORT_MARGIN), maxLeft)
     setDropdownPos({
       top: direction === 'down' ? rect.bottom + 4 : rect.top - 4,
-      left: rect.left,
+      left,
+      width,
       direction,
     })
   }, [])
@@ -88,15 +99,15 @@ export function DirectoryPicker({ value, onChange, variant = 'chip', isGitProjec
   useEffect(() => {
     if (!isOpen || mode !== 'recent') return
     // Use cache if fresh
-    if (cachedProjects && Date.now() - cacheTimestamp < CACHE_TTL) {
+    const cachedProjects = getCachedRecentProjects()
+    if (cachedProjects) {
       setProjects(cachedProjects)
       return
     }
     setLoading(true)
     sessionsApi.getRecentProjects()
       .then(({ projects: p }) => {
-        cachedProjects = p
-        cacheTimestamp = Date.now()
+        setCachedRecentProjects(p)
         setProjects(p)
       })
       .catch(() => setProjects([]))
@@ -119,21 +130,21 @@ export function DirectoryPicker({ value, onChange, variant = 'chip', isGitProjec
     setIsOpen(false)
     setMode('recent')
     // Invalidate cache so next open reflects the new selection
-    cachedProjects = null
+    invalidateRecentProjectsCache()
   }
 
   const handleChooseFolder = async () => {
-    if (isTauriRuntime()) {
+    const host = getDesktopHost()
+    if (host.isDesktop && host.capabilities.dialogs) {
       // Desktop: native OS folder dialog
       setIsOpen(false)
       try {
-        const { open } = await import('@tauri-apps/plugin-dialog')
-        const selected = await open({
+        const selected = await host.dialogs.open({
           directory: true,
           multiple: false,
           title: t('dirPicker.chooseProjectFolder'),
         })
-        if (selected) onChange(selected)
+        if (typeof selected === 'string' && selected.length > 0) onChange(selected)
       } catch (err) {
         console.error('[DirectoryPicker] Failed to open folder dialog:', err)
       }
@@ -156,8 +167,142 @@ export function DirectoryPicker({ value, onChange, variant = 'chip', isGitProjec
     ? 'flex h-9 min-w-0 items-center gap-1.5 rounded-[7px] border border-transparent px-2.5 text-[13px] font-medium leading-none text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-container-lowest)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35'
     : 'flex items-center gap-2 text-xs text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] transition-colors'
 
+  const dropdownClassName = 'overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-dropdown)]'
+  const dropdownStyle = {
+    position: 'fixed' as const,
+    left: dropdownPos?.left,
+    width: dropdownPos?.width,
+    ...(dropdownPos?.direction === 'down'
+      ? { top: dropdownPos.top }
+      : { bottom: window.innerHeight - (dropdownPos?.top ?? 0) }),
+    zIndex: 9999,
+  }
+  const dropdownTitle = mode === 'recent' ? t('dirPicker.recent') : t('dirPicker.chooseProjectFolder')
+  const dropdownContent = mode === 'recent' ? (
+    <>
+      {!isMobileBrowser && (
+        <div className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-[var(--color-outline)]">
+          {t('dirPicker.recent')}
+        </div>
+      )}
+      <div className={`${isMobileBrowser ? '' : 'max-h-[300px]'} overflow-y-auto`}>
+        {loading ? (
+          <div className="px-4 py-6 text-center text-xs text-[var(--color-text-tertiary)]">{t('common.loading')}</div>
+        ) : projects.length === 0 ? (
+          <div className="px-4 py-6 text-center text-xs text-[var(--color-text-tertiary)]">{t('dirPicker.noRecent')}</div>
+        ) : (
+          projects.map((project) => {
+            const isSelected = project.realPath === value
+            return (
+              <button
+                key={project.projectPath}
+                onClick={() => handleSelect(project.realPath)}
+                className={`flex w-full items-center gap-3 px-4 text-left transition-colors hover:bg-[var(--color-surface-hover)] ${
+                  isMobileBrowser ? 'min-h-[72px] py-3.5' : 'py-3'
+                } ${
+                  isSelected ? 'bg-[var(--color-surface-selected)]' : ''
+                }`}
+              >
+                {project.isGit ? (
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-secondary)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0">
+                    <circle cx="18" cy="18" r="3" /><circle cx="6" cy="6" r="3" />
+                    <path d="M13 6h3a2 2 0 0 1 2 2v7" /><line x1="6" y1="9" x2="6" y2="21" />
+                  </svg>
+                ) : (
+                  <span className="material-symbols-outlined flex-shrink-0 text-[20px] text-[var(--color-text-secondary)]">folder</span>
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-semibold text-[var(--color-text-primary)]">
+                    {project.repoName || project.projectName}
+                  </div>
+                  <div className="truncate font-[var(--font-mono)] text-[11px] text-[var(--color-text-tertiary)]">
+                    {project.realPath}
+                  </div>
+                </div>
+                {isSelected && (
+                  <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-brand)]" style={{ fontVariationSettings: "'FILL' 1" }}>
+                    check
+                  </span>
+                )}
+              </button>
+            )
+          })
+        )}
+      </div>
+      <div className="border-t border-[var(--color-border)]">
+        <button
+          onClick={handleChooseFolder}
+          className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-[var(--color-surface-hover)]"
+        >
+          <span className="material-symbols-outlined text-[20px] text-[var(--color-text-tertiary)]">create_new_folder</span>
+          <span className="text-sm text-[var(--color-text-secondary)]">{t('dirPicker.chooseFolder')}</span>
+        </button>
+      </div>
+    </>
+  ) : (
+    <>
+      <div className="flex flex-wrap items-center gap-1 border-b border-[var(--color-border)] px-3 py-2">
+        <button onClick={() => setMode('recent')} className="mr-2 text-xs text-[var(--color-text-accent)] hover:underline">
+          {'← ' + t('dirPicker.recent')}
+        </button>
+        <button onClick={() => loadBrowseDir('/')} className="text-[10px] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]">/</button>
+        {browsePath.split('/').filter(Boolean).map((seg, i, arr) => (
+          <span key={i} className="flex items-center gap-1">
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">/</span>
+            <button
+              onClick={() => loadBrowseDir('/' + arr.slice(0, i + 1).join('/'))}
+              className="text-[10px] text-[var(--color-text-accent)] hover:underline"
+            >{seg}</button>
+          </span>
+        ))}
+      </div>
+
+      <div className={`${isMobileBrowser ? '' : 'max-h-[240px]'} overflow-y-auto`}>
+        {loading ? (
+          <div className="px-3 py-4 text-center text-xs text-[var(--color-text-tertiary)]">{t('common.loading')}</div>
+        ) : (
+          <>
+            {browseParent && browseParent !== browsePath && (
+              <button onClick={() => loadBrowseDir(browseParent)} className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--color-surface-hover)]">
+                <span className="material-symbols-outlined text-[16px] text-[var(--color-text-tertiary)]">arrow_upward</span>
+                <span className="text-xs text-[var(--color-text-secondary)]">..</span>
+              </button>
+            )}
+            {browseEntries.length === 0 ? (
+              <div className="px-3 py-4 text-center text-xs text-[var(--color-text-tertiary)]">{t('dirPicker.noSubdirs')}</div>
+            ) : browseEntries.map((entry) => (
+              <div
+                key={entry.path}
+                className="flex w-full items-center gap-2 px-3 py-2 hover:bg-[var(--color-surface-hover)]"
+              >
+                <button
+                  type="button"
+                  onClick={() => loadBrowseDir(entry.path)}
+                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                >
+                  <span className="material-symbols-outlined text-[16px] text-[var(--color-text-tertiary)]">folder</span>
+                  <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text-primary)]">{entry.name}</span>
+                </button>
+                <button type="button" onClick={() => handleSelect(entry.path)} className="rounded px-2 py-0.5 text-[10px] font-semibold text-[var(--color-brand)] transition-colors hover:bg-[var(--color-primary-fixed)]">
+                  {t('common.select')}
+                </button>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+
+      <div className="flex items-center justify-between border-t border-[var(--color-border)] px-3 py-2">
+        <span className="truncate font-[var(--font-mono)] text-[10px] text-[var(--color-text-tertiary)]">{browsePath}</span>
+        <button onClick={() => handleSelect(browsePath)} className="rounded-lg bg-[var(--color-brand)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90">
+          {t('dirPicker.useThisFolder')}
+        </button>
+      </div>
+    </>
+  )
+
   return (
-    <div ref={ref} className={isWorkbar ? 'relative min-w-0 max-w-[320px] shrink' : 'relative'}>
+    <div ref={ref} className={isWorkbar ? `relative min-w-0 ${isMobileBrowser ? 'flex-1' : 'max-w-[320px] shrink'}` : 'relative'}>
       {/* Trigger — shows selected project chip or placeholder */}
       {value ? (
         <button
@@ -190,144 +335,28 @@ export function DirectoryPicker({ value, onChange, variant = 'chip', isGitProjec
         </button>
       )}
 
-      {/* Dropdown — rendered via portal to escape overflow clipping */}
-      {isOpen && dropdownPos && createPortal(
-        <div
-          ref={dropdownRef}
-          className="w-[400px] bg-[var(--color-surface-container-lowest)] border border-[var(--color-border)] rounded-xl shadow-[var(--shadow-dropdown)] overflow-hidden"
-          style={{
-            position: 'fixed',
-            left: dropdownPos.left,
-            ...(dropdownPos.direction === 'down'
-              ? { top: dropdownPos.top }
-              : { bottom: window.innerHeight - dropdownPos.top }),
-            zIndex: 9999,
-          }}
-        >
-          {mode === 'recent' ? (
-            <>
-              <div className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-[var(--color-outline)]">
-                {t('dirPicker.recent')}
-              </div>
-              <div className="max-h-[300px] overflow-y-auto">
-                {loading ? (
-                  <div className="px-4 py-6 text-center text-xs text-[var(--color-text-tertiary)]">{t('common.loading')}</div>
-                ) : projects.length === 0 ? (
-                  <div className="px-4 py-6 text-center text-xs text-[var(--color-text-tertiary)]">{t('dirPicker.noRecent')}</div>
-                ) : (
-                  projects.map((project) => {
-                    const isSelected = project.realPath === value
-                    return (
-                      <button
-                        key={project.projectPath}
-                        onClick={() => handleSelect(project.realPath)}
-                        className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-[var(--color-surface-hover)] ${
-                          isSelected ? 'bg-[var(--color-surface-selected)]' : ''
-                        }`}
-                      >
-                        {project.isGit ? (
-                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-secondary)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0">
-                            <circle cx="18" cy="18" r="3" /><circle cx="6" cy="6" r="3" />
-                            <path d="M13 6h3a2 2 0 0 1 2 2v7" /><line x1="6" y1="9" x2="6" y2="21" />
-                          </svg>
-                        ) : (
-                          <span className="material-symbols-outlined text-[20px] text-[var(--color-text-secondary)] flex-shrink-0">folder</span>
-                        )}
-                        <div className="flex-1 min-w-0">
-                          <div className="text-sm font-semibold text-[var(--color-text-primary)] truncate">
-                            {project.repoName || project.projectName}
-                          </div>
-                          <div className="text-[11px] text-[var(--color-text-tertiary)] truncate font-[var(--font-mono)]">
-                            {project.realPath}
-                          </div>
-                        </div>
-                        {isSelected && (
-                          <span className="material-symbols-outlined text-[18px] text-[var(--color-brand)] flex-shrink-0" style={{ fontVariationSettings: "'FILL' 1" }}>
-                            check
-                          </span>
-                        )}
-                      </button>
-                    )
-                  })
-                )}
-              </div>
-
-              {/* Divider + Choose different folder */}
-              <div className="border-t border-[var(--color-border)]">
-                <button
-                  onClick={handleChooseFolder}
-                  className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-[var(--color-surface-hover)] transition-colors"
-                >
-                  <span className="material-symbols-outlined text-[20px] text-[var(--color-text-tertiary)]">create_new_folder</span>
-                  <span className="text-sm text-[var(--color-text-secondary)]">{t('dirPicker.chooseFolder')}</span>
-                </button>
-              </div>
-            </>
-          ) : (
-            /* Directory tree browser (web only) */
-            <>
-              <div className="px-3 py-2 border-b border-[var(--color-border)] flex items-center gap-1 flex-wrap">
-                <button onClick={() => setMode('recent')} className="text-xs text-[var(--color-text-accent)] hover:underline mr-2">
-                  {'← ' + t('dirPicker.recent')}
-                </button>
-                <button onClick={() => loadBrowseDir('/')} className="text-[10px] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]">/</button>
-                {browsePath.split('/').filter(Boolean).map((seg, i, arr) => (
-                  <span key={i} className="flex items-center gap-1">
-                    <span className="text-[10px] text-[var(--color-text-tertiary)]">/</span>
-                    <button
-                      onClick={() => loadBrowseDir('/' + arr.slice(0, i + 1).join('/'))}
-                      className="text-[10px] text-[var(--color-text-accent)] hover:underline"
-                    >{seg}</button>
-                  </span>
-                ))}
-              </div>
-
-              <div className="max-h-[240px] overflow-y-auto">
-                {loading ? (
-                  <div className="px-3 py-4 text-center text-xs text-[var(--color-text-tertiary)]">{t('common.loading')}</div>
-                ) : (
-                  <>
-                    {browseParent && browseParent !== browsePath && (
-                      <button onClick={() => loadBrowseDir(browseParent)} className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-[var(--color-surface-hover)]">
-                        <span className="material-symbols-outlined text-[16px] text-[var(--color-text-tertiary)]">arrow_upward</span>
-                        <span className="text-xs text-[var(--color-text-secondary)]">..</span>
-                      </button>
-                    )}
-                    {browseEntries.length === 0 ? (
-                      <div className="px-3 py-4 text-center text-xs text-[var(--color-text-tertiary)]">{t('dirPicker.noSubdirs')}</div>
-                    ) : browseEntries.map((entry) => (
-                      <div
-                        key={entry.path}
-                        className="flex w-full items-center gap-2 px-3 py-2 hover:bg-[var(--color-surface-hover)]"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => loadBrowseDir(entry.path)}
-                          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                        >
-                          <span className="material-symbols-outlined text-[16px] text-[var(--color-text-tertiary)]">folder</span>
-                          <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text-primary)]">{entry.name}</span>
-                        </button>
-                        <button type="button" onClick={() => handleSelect(entry.path)} className="rounded px-2 py-0.5 text-[10px] font-semibold text-[var(--color-brand)] transition-colors hover:bg-[var(--color-primary-fixed)]">
-                          {t('common.select')}
-                        </button>
-                      </div>
-                    ))}
-                  </>
-                )}
-              </div>
-
-              {/* Use current folder */}
-              <div className="px-3 py-2 border-t border-[var(--color-border)] flex justify-between items-center">
-                <span className="text-[10px] text-[var(--color-text-tertiary)] font-[var(--font-mono)] truncate">{browsePath}</span>
-                <button onClick={() => handleSelect(browsePath)} className="px-3 py-1.5 bg-[var(--color-brand)] text-white text-xs font-semibold rounded-lg hover:opacity-90">
-                  {t('dirPicker.useThisFolder')}
-                </button>
-              </div>
-            </>
-          )}
-        </div>,
-        document.body
+      {isOpen && dropdownPos && (
+        isMobileBrowser ? (
+          <MobileBottomSheet
+            open={isOpen}
+            onClose={() => setIsOpen(false)}
+            title={dropdownTitle}
+            closeLabel={t('tabs.close')}
+            panelRef={dropdownRef}
+          >
+            {dropdownContent}
+          </MobileBottomSheet>
+        ) : createPortal(
+          <div
+            ref={dropdownRef}
+            data-testid="directory-picker-menu"
+            className={dropdownClassName}
+            style={dropdownStyle}
+          >
+            {dropdownContent}
+          </div>,
+          document.body,
+        )
       )}
     </div>
   )

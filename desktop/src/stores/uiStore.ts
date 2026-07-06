@@ -1,20 +1,51 @@
 import { create } from 'zustand'
-import type { ThemeMode } from '../types/settings'
+import { isThemeMode, THEME_MODES, type ThemeMode } from '../types/settings'
 
 const THEME_STORAGE_KEY = 'cc-haha-theme'
+const ACTIVE_SETTINGS_TAB_STORAGE_KEY = 'cc-haha-active-settings-tab'
+
+const SETTINGS_TABS = [
+  'providers',
+  'activity',
+  'general',
+  'h5Access',
+  'adapters',
+  'terminal',
+  'mcp',
+  'agents',
+  'skills',
+  'memory',
+  'plugins',
+  'computerUse',
+  'trace',
+  'diagnostics',
+  'about',
+] as const
 
 function getStoredTheme(): ThemeMode {
   try {
     const stored = localStorage.getItem(THEME_STORAGE_KEY)
-    if (stored === 'light' || stored === 'dark') return stored
+    if (isThemeMode(stored)) return stored
   } catch { /* localStorage unavailable */ }
-  return 'light'
+  return 'white'
+}
+
+function isSettingsTab(value: unknown): value is SettingsTab {
+  return typeof value === 'string' && (SETTINGS_TABS as readonly string[]).includes(value)
+}
+
+function getStoredSettingsTab(): SettingsTab {
+  try {
+    const stored = localStorage.getItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY)
+    if (isSettingsTab(stored)) return stored
+  } catch { /* localStorage unavailable */ }
+  return 'providers'
 }
 
 export function applyTheme(theme: ThemeMode) {
   if (typeof document === 'undefined') return
   document.documentElement.setAttribute('data-theme', theme)
-  document.documentElement.style.colorScheme = theme
+  document.documentElement.style.colorScheme = theme === 'dark' ? 'dark' : 'light'
 }
 
 export function initializeTheme() {
@@ -30,15 +61,18 @@ export type Toast = {
 
 export type SettingsTab =
   | 'providers'
-  | 'permissions'
+  | 'activity'
   | 'general'
+  | 'h5Access'
   | 'adapters'
   | 'terminal'
   | 'mcp'
   | 'agents'
   | 'skills'
+  | 'memory'
   | 'plugins'
   | 'computerUse'
+  | 'trace'
   | 'diagnostics'
   | 'about'
 
@@ -48,7 +82,9 @@ type UIStore = {
   theme: ThemeMode
   sidebarOpen: boolean
   activeView: ActiveView
+  activeSettingsTab: SettingsTab
   pendingSettingsTab: SettingsTab | null
+  pendingMemoryPath: string | null
   activeModal: string | null
   toasts: Toast[]
 
@@ -57,7 +93,9 @@ type UIStore = {
   toggleSidebar: () => void
   setSidebarOpen: (open: boolean) => void
   setActiveView: (view: ActiveView) => void
+  setActiveSettingsTab: (tab: SettingsTab) => void
   setPendingSettingsTab: (tab: SettingsTab | null) => void
+  setPendingMemoryPath: (path: string | null) => void
   openModal: (id: string) => void
   closeModal: () => void
   addToast: (toast: Omit<Toast, 'id'>) => void
@@ -70,7 +108,9 @@ export const useUIStore = create<UIStore>((set) => ({
   theme: getStoredTheme(),
   sidebarOpen: true,
   activeView: 'code',
+  activeSettingsTab: getStoredSettingsTab(),
   pendingSettingsTab: null,
+  pendingMemoryPath: null,
   activeModal: null,
   toasts: [],
 
@@ -82,7 +122,8 @@ export const useUIStore = create<UIStore>((set) => ({
 
   toggleTheme: () => {
     set((state) => {
-      const next = state.theme === 'light' ? 'dark' : 'light'
+      const currentIndex = THEME_MODES.indexOf(state.theme)
+      const next = THEME_MODES[(currentIndex + 1) % THEME_MODES.length] ?? 'white'
       applyTheme(next)
       try { localStorage.setItem(THEME_STORAGE_KEY, next) } catch { /* noop */ }
       return { theme: next }
@@ -92,7 +133,12 @@ export const useUIStore = create<UIStore>((set) => ({
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   setActiveView: (view) => set({ activeView: view }),
+  setActiveSettingsTab: (tab) => {
+    try { localStorage.setItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY, tab) } catch { /* noop */ }
+    set({ activeSettingsTab: tab })
+  },
   setPendingSettingsTab: (tab) => set({ pendingSettingsTab: tab }),
+  setPendingMemoryPath: (path) => set({ pendingMemoryPath: path }),
   openModal: (id) => set({ activeModal: id }),
   closeModal: () => set({ activeModal: null }),
 

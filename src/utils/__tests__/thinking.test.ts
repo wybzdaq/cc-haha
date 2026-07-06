@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { get3PModelCapabilityOverride } from '../model/modelSupportOverrides.js'
 import { resolveSideQueryThinkingConfig } from '../sideQuery.js'
+import { modelSupportsEffort, modelSupportsMaxEffort } from '../effort.js'
 import {
   modelSupportsAdaptiveThinking,
   modelSupportsThinking,
@@ -75,6 +76,55 @@ describe('provider-aware thinking support', () => {
 
     process.env.CC_HAHA_SEND_DISABLED_THINKING = '1'
     expect(shouldSendExplicitDisabledThinking()).toBe(true)
+  })
+
+  test('DeepSeek preset can follow the global thinking setting through capability overrides', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'deepseek-v4-pro'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES =
+      'thinking,effort,adaptive_thinking,max_effort'
+    delete process.env.CC_HAHA_SEND_DISABLED_THINKING
+    clearCapabilityCache()
+
+    expect(modelSupportsThinking('deepseek-v4-pro')).toBe(true)
+    expect(modelSupportsAdaptiveThinking('deepseek-v4-pro')).toBe(true)
+    expect(modelSupportsEffort('deepseek-v4-pro')).toBe(true)
+    expect(modelSupportsMaxEffort('deepseek-v4-pro')).toBe(true)
+    expect(shouldSendExplicitDisabledThinking()).toBe(false)
+  })
+
+  test('MiniMax preset models declare adaptive thinking without effort passthrough', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/anthropic'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'MiniMax-M3[1m]'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES =
+      'thinking,adaptive_thinking'
+    clearCapabilityCache()
+
+    expect(modelSupportsThinking('MiniMax-M3[1m]')).toBe(true)
+    expect(modelSupportsAdaptiveThinking('MiniMax-M3[1m]')).toBe(true)
+    expect(modelSupportsEffort('MiniMax-M3[1m]')).toBe(false)
+    expect(modelSupportsMaxEffort('MiniMax-M3[1m]')).toBe(false)
+  })
+
+  test('Kimi preset models declare thinking without effort passthrough', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://api.moonshot.cn/anthropic'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'kimi-k2.7-code'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES = 'thinking'
+    clearCapabilityCache()
+
+    expect(modelSupportsThinking('kimi-k2.7-code')).toBe(true)
+    expect(modelSupportsAdaptiveThinking('kimi-k2.7-code')).toBe(false)
+    expect(modelSupportsEffort('kimi-k2.7-code')).toBe(false)
+    expect(modelSupportsMaxEffort('kimi-k2.7-code')).toBe(false)
+  })
+
+  test('third-party base URLs do not default unknown model names to effort support', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://api.moonshot.cn/anthropic'
+    delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES
+    clearCapabilityCache()
+
+    expect(modelSupportsEffort('kimi-k2.6')).toBe(false)
+    expect(modelSupportsMaxEffort('kimi-k2.6')).toBe(false)
   })
 
   test('side queries inherit explicit disabled thinking for opted-in providers', () => {

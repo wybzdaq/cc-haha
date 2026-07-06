@@ -6,6 +6,7 @@ import btw from './commands/btw/index.js'
 import goodClaude from './commands/good-claude/index.js'
 import issue from './commands/issue/index.js'
 import feedback from './commands/feedback/index.js'
+import goal from './commands/goal/index.js'
 import clear from './commands/clear/index.js'
 import color from './commands/color/index.js'
 import commit from './commands/commit.js'
@@ -129,6 +130,7 @@ import privacySettings from './commands/privacy-settings/index.js'
 import hooks from './commands/hooks/index.js'
 import files from './commands/files/index.js'
 import branch from './commands/branch/index.js'
+import agent from './commands/agent.js'
 import agents from './commands/agents/index.js'
 import plugin from './commands/plugin/index.js'
 import reloadPlugins from './commands/reload-plugins/index.js'
@@ -256,6 +258,7 @@ export const INTERNAL_ONLY_COMMANDS = [
 const COMMANDS = memoize((): Command[] => [
   addDir,
   advisor,
+  agent,
   agents,
   branch,
   btw,
@@ -303,6 +306,7 @@ const COMMANDS = memoize((): Command[] => [
   tag,
   theme,
   feedback,
+  goal,
   review,
   ultrareview,
   rewind,

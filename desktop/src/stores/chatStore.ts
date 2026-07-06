@@ -9,28 +9,70 @@ import { useTabStore } from './tabStore'
 import { randomSpinnerVerb } from '../config/spinnerVerbs'
 import { notifyDesktop } from '../lib/desktopNotifications'
 import { deriveSessionTitle, isPlaceholderSessionTitle } from '../lib/sessionTitle'
+import { hasRunningBackgroundTasks } from '../lib/backgroundTasks'
 import { AGENT_LIFECYCLE_TYPES } from '../types/team'
+import type { ComposerAttachment } from '../lib/composerAttachments'
 import type { MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
 import type { RuntimeSelection } from '../types/runtime'
 import type {
+  ActiveGoalState,
   AgentTaskNotification,
+  ApiRetryState,
   AttachmentRef,
+  BackgroundAgentTask,
+  BackgroundAgentTaskUsage,
   ChatState,
   ComputerUsePermissionRequest,
   ComputerUsePermissionResponse,
+  GoalEventAction,
+  MemoryEventFile,
+  StreamingFallbackState,
   UIAttachment,
   UIMessage,
   ServerMessage,
   TokenUsage,
+  PermissionUpdate,
 } from '../types/chat'
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
+type CompactSummaryMessage = Extract<UIMessage, { type: 'compact_summary' }>
+
+export type ComposerDraftState = {
+  input: string
+  attachments: ComposerAttachment[]
+}
+
+export type QueuedUserMessage = {
+  id: string
+  content: string
+  attachments?: AttachmentRef[]
+  displayContent: string
+  displayAttachments?: AttachmentRef[]
+  createdAt: number
+}
+
+export type ComposerReferenceInsertion = {
+  text: string
+  reference?: {
+    kind: 'file'
+    path: string
+    absolutePath?: string
+    name: string
+    isDirectory?: boolean
+  }
+  nonce: number
+}
+
+export type ComposerPrefillMode = 'replace' | 'append'
 
 export type PerSessionState = {
   messages: UIMessage[]
   chatState: ChatState
   connectionState: ConnectionState
+  historyStatus?: 'idle' | 'loading' | 'ready' | 'error'
+  historyError?: string | null
   streamingText: string
   streamingToolInput: string
   activeToolUseId: string | null
@@ -48,22 +90,47 @@ export type PerSessionState = {
     request: ComputerUsePermissionRequest
   } | null
   tokenUsage: TokenUsage
+  /**
+   * Bumped each time a compact boundary arrives. The context usage indicator
+   * watches this to force an immediate re-read of the (now much smaller)
+   * context instead of waiting for the next API response (#743).
+   * Optional: legacy persisted sessions predate the field.
+   */
+  compactCount?: number
+  /**
+   * Characters streamed by the assistant during the current turn (text,
+   * thinking, tool input). ÷4 approximates output tokens for the streaming
+   * indicator — same estimation the CLI spinner uses. Reset on each send.
+   */
+  streamingResponseChars: number
   elapsedSeconds: number
   statusVerb: string
-  slashCommands: Array<{ name: string; description: string }>
+  apiRetry?: ApiRetryState | null
+  // 流式→非流式降级提示（活动回合状态，与 apiRetry 同清除时机）。
+  streamingFallback?: StreamingFallbackState | null
+  slashCommands: Array<{ name: string; description: string; argumentHint?: string }>
   agentTaskNotifications: Record<string, AgentTaskNotification>
+  backgroundAgentTasks?: Record<string, BackgroundAgentTask>
+  suppressNextTaskNotificationResponse?: boolean
+  activeGoal?: ActiveGoalState | null
   elapsedTimer: ReturnType<typeof setInterval> | null
   composerPrefill?: {
     text: string
     attachments?: UIAttachment[]
+    mode?: ComposerPrefillMode
     nonce: number
   } | null
+  composerInsertion?: ComposerReferenceInsertion | null
+  composerDraft?: ComposerDraftState | null
+  queuedUserMessages?: QueuedUserMessage[]
 }
 
 const DEFAULT_SESSION_STATE: PerSessionState = {
   messages: [],
   chatState: 'idle',
   connectionState: 'disconnected',
+  historyStatus: 'idle',
+  historyError: null,
   streamingText: '',
   streamingToolInput: '',
   activeToolUseId: null,
@@ -72,16 +139,31 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   pendingPermission: null,
   pendingComputerUsePermission: null,
   tokenUsage: { input_tokens: 0, output_tokens: 0 },
+  compactCount: 0,
+  streamingResponseChars: 0,
   elapsedSeconds: 0,
   statusVerb: '',
+  apiRetry: null,
+  streamingFallback: null,
   slashCommands: [],
   agentTaskNotifications: {},
+  backgroundAgentTasks: {},
+  suppressNextTaskNotificationResponse: false,
+  activeGoal: null,
   elapsedTimer: null,
   composerPrefill: null,
+  composerInsertion: null,
+  composerDraft: null,
+  queuedUserMessages: [],
 }
 
 function createDefaultSessionState(): PerSessionState {
-  return { ...DEFAULT_SESSION_STATE, messages: [], tokenUsage: { input_tokens: 0, output_tokens: 0 } }
+  return {
+    ...DEFAULT_SESSION_STATE,
+    messages: [],
+    tokenUsage: { input_tokens: 0, output_tokens: 0 },
+    queuedUserMessages: [],
+  }
 }
 
 type ChatStore = {
@@ -94,7 +176,7 @@ type ChatStore = {
     sessionId: string,
     content: string,
     attachments?: AttachmentRef[],
-    options?: { displayContent?: string; displayAttachments?: AttachmentRef[] },
+    options?: { displayContent?: string; displayAttachments?: AttachmentRef[]; hideDisplayContent?: boolean },
   ) => void
   respondToPermission: (
     sessionId: string,
@@ -103,6 +185,8 @@ type ChatStore = {
     options?: {
       rule?: string
       updatedInput?: Record<string, unknown>
+      denyMessage?: string
+      permissionUpdates?: PermissionUpdate[]
     },
   ) => void
   respondToComputerUsePermission: (
@@ -117,14 +201,31 @@ type ChatStore = {
   reloadHistory: (sessionId: string) => Promise<void>
   queueComposerPrefill: (
     sessionId: string,
-    prefill: { text: string; attachments?: UIAttachment[] },
+    prefill: { text: string; attachments?: UIAttachment[]; mode?: ComposerPrefillMode },
   ) => void
+  clearComposerPrefill: (sessionId: string, nonce?: number) => void
+  queueComposerInsertion: (
+    sessionId: string,
+    insertion: Omit<ComposerReferenceInsertion, 'nonce'>,
+  ) => void
+  clearComposerInsertion: (sessionId: string, nonce?: number) => void
+  setComposerDraft: (sessionId: string, draft: ComposerDraftState) => void
+  clearComposerDraft: (sessionId: string) => void
+  queueUserMessage: (
+    sessionId: string,
+    message: Omit<QueuedUserMessage, 'id' | 'createdAt'>,
+  ) => string
+  updateQueuedUserMessage: (sessionId: string, messageId: string, content: string) => void
+  removeQueuedUserMessage: (sessionId: string, messageId: string) => void
+  sendQueuedUserMessage: (sessionId: string, messageId: string) => void
   clearMessages: (sessionId: string) => void
   handleServerMessage: (sessionId: string, msg: ServerMessage) => void
 }
 
 const TASK_TOOL_NAMES = new Set(['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TodoWrite'])
+const TASK_STOP_TOOL_NAMES = new Set(['TaskStop', 'KillShell'])
 const pendingTaskToolUseIdsBySession = new Map<string, Set<string>>()
+const pendingToolParentUseIdsBySession = new Map<string, Map<string, string>>()
 
 function addPendingTaskToolUseId(sessionId: string, toolUseId: string): void {
   const ids = pendingTaskToolUseIdsBySession.get(sessionId) ?? new Set<string>()
@@ -143,15 +244,151 @@ function consumePendingTaskToolUseId(sessionId: string, toolUseId: string): bool
 function clearPendingTaskToolUseIds(sessionId: string): void {
   pendingTaskToolUseIdsBySession.delete(sessionId)
 }
+
+function rememberPendingToolParentUseId(
+  sessionId: string,
+  toolUseId: string | null | undefined,
+  parentToolUseId: string | undefined,
+): void {
+  if (!toolUseId || !parentToolUseId) return
+  const parentUseIds = pendingToolParentUseIdsBySession.get(sessionId) ?? new Map<string, string>()
+  parentUseIds.set(toolUseId, parentToolUseId)
+  pendingToolParentUseIdsBySession.set(sessionId, parentUseIds)
+}
+
+function getPendingToolParentUseId(sessionId: string, toolUseId: string): string | undefined {
+  return pendingToolParentUseIdsBySession.get(sessionId)?.get(toolUseId)
+}
+
+function consumePendingToolParentUseId(sessionId: string, toolUseId: string): string | undefined {
+  const parentUseIds = pendingToolParentUseIdsBySession.get(sessionId)
+  if (!parentUseIds) return undefined
+  const parentToolUseId = parentUseIds.get(toolUseId)
+  parentUseIds.delete(toolUseId)
+  if (parentUseIds.size === 0) pendingToolParentUseIdsBySession.delete(sessionId)
+  return parentToolUseId
+}
+
+function clearPendingToolParentUseIds(sessionId: string): void {
+  pendingToolParentUseIdsBySession.delete(sessionId)
+}
 const AGENT_COMPLETION_NOTIFICATION_PREVIEW_CHARS = 160
+const COMPACT_SUMMARY_PREFIX =
+  'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.'
+const COMPACT_SUMMARY_CUTOFFS = [
+  '\n\nIf you need specific details from before compaction',
+  '\n\nContinue the conversation from where it left off',
+  '\nContinue the conversation from where it left off',
+]
 
 let msgCounter = 0
 const nextId = () => `msg-${++msgCounter}-${Date.now()}`
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function readJsonStringLiteral(source: string, quoteIndex: number): string | undefined {
+  if (source[quoteIndex] !== '"') return undefined
+  let value = ''
+  for (let index = quoteIndex + 1; index < source.length; index += 1) {
+    const char = source[index]
+    if (char === '\\') {
+      const escaped = source[index + 1]
+      if (escaped === undefined) return undefined
+      value += char + escaped
+      index += 1
+      continue
+    }
+    if (char === '"') {
+      try {
+        return JSON.parse(`"${value}"`) as string
+      } catch {
+        return value
+      }
+    }
+    value += char
+  }
+  return undefined
+}
+
+function extractPartialJsonStringField(source: string, field: string): string | undefined {
+  const key = `"${field}"`
+  const keyIndex = source.indexOf(key)
+  if (keyIndex < 0) return undefined
+  const colonIndex = source.indexOf(':', keyIndex + key.length)
+  if (colonIndex < 0) return undefined
+
+  let valueIndex = colonIndex + 1
+  while (valueIndex < source.length && /\s/.test(source[valueIndex] ?? '')) {
+    valueIndex += 1
+  }
+  return readJsonStringLiteral(source, valueIndex)
+}
+
+function buildPartialToolInputPreview(
+  partialInput: string,
+  previousInput: unknown,
+): Record<string, unknown> {
+  const previous = isRecord(previousInput) ? previousInput : {}
+  const preview: Record<string, unknown> = { ...previous }
+  for (const field of ['file_path', 'filePath', 'path', 'command', 'pattern', 'url', 'query', 'description']) {
+    const value = extractPartialJsonStringField(partialInput, field)
+    if (value !== undefined) {
+      preview[field] = value
+    }
+  }
+  return preview
+}
+
+function upsertToolUseMessage(
+  messages: UIMessage[],
+  toolUseId: string,
+  build: (existing?: ToolCall) => ToolCall,
+): UIMessage[] {
+  const existingIndex = messages.findIndex(
+    (message): message is ToolCall =>
+      message.type === 'tool_use' && message.toolUseId === toolUseId,
+  )
+  if (existingIndex < 0) {
+    return [...messages, build()]
+  }
+
+  const next = [...messages]
+  next[existingIndex] = build(messages[existingIndex] as ToolCall)
+  return next
+}
+
+function markPendingToolUseMessagesStopped(messages: UIMessage[]): UIMessage[] {
+  const resolvedToolUseIds = new Set(
+    messages
+      .filter((message) => message.type === 'tool_result')
+      .map((message) => message.toolUseId),
+  )
+  let changed = false
+  const stoppedMessages = messages.map((message) => {
+    if (
+      message.type !== 'tool_use' ||
+      (!message.isPending && resolvedToolUseIds.has(message.toolUseId))
+    ) {
+      return message
+    }
+    changed = true
+    return {
+      ...message,
+      isPending: false,
+      status: 'stopped' as const,
+    }
+  })
+  return changed ? stoppedMessages : messages
+}
 
 // Streaming throttle for content_delta. Buffers must be per-session because
 // multiple desktop tabs can stream at the same time.
 const pendingDeltaBySession = new Map<string, string>()
 const flushTimerBySession = new Map<string, ReturnType<typeof setTimeout>>()
+const pendingToolInputDeltaBySession = new Map<string, string>()
+const toolInputFlushTimerBySession = new Map<string, ReturnType<typeof setTimeout>>()
 
 function consumePendingDelta(sessionId: string): string {
   const flushTimer = flushTimerBySession.get(sessionId)
@@ -180,20 +417,70 @@ function clearPendingDelta(sessionId: string): void {
   pendingDeltaBySession.delete(sessionId)
 }
 
+function consumePendingToolInputDelta(sessionId: string): string {
+  const flushTimer = toolInputFlushTimerBySession.get(sessionId)
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    toolInputFlushTimerBySession.delete(sessionId)
+  }
+  const text = pendingToolInputDeltaBySession.get(sessionId) ?? ''
+  pendingToolInputDeltaBySession.delete(sessionId)
+  return text
+}
+
+function appendPendingToolInputDelta(sessionId: string, text: string): void {
+  pendingToolInputDeltaBySession.set(
+    sessionId,
+    `${pendingToolInputDeltaBySession.get(sessionId) ?? ''}${text}`,
+  )
+}
+
+function clearPendingToolInputDelta(sessionId: string): void {
+  const flushTimer = toolInputFlushTimerBySession.get(sessionId)
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    toolInputFlushTimerBySession.delete(sessionId)
+  }
+  pendingToolInputDeltaBySession.delete(sessionId)
+}
+
 function appendAssistantTextMessage(
   messages: UIMessage[],
   content: string,
   timestamp: number,
   model?: string,
+  transcriptMessageId?: string,
 ): UIMessage[] {
-  if (!content.trim()) return messages
+  const trimmedContent = content.trim()
+  if (!trimmedContent) return messages
 
   const last = messages[messages.length - 1]
-  if (last?.type === 'assistant_text') {
+  // Wake/reconnect replay can resend persisted assistant text without a
+  // transcript id. Ignore chunks that are already present in the hydrated tail.
+  if (
+    last?.type === 'assistant_text' &&
+    last.transcriptMessageId &&
+    !transcriptMessageId &&
+    last.content.trim().includes(trimmedContent)
+  ) {
+    return messages
+  }
+
+  const canMergeIntoLast =
+    last?.type === 'assistant_text' &&
+    (
+      transcriptMessageId
+        ? last.transcriptMessageId === transcriptMessageId
+        : !last.transcriptMessageId
+    )
+  if (canMergeIntoLast) {
     const merged: UIMessage = {
       ...last,
       content: last.content + content,
       ...(model ?? last.model ? { model: model ?? last.model } : {}),
+      ...(transcriptMessageId ?? last.transcriptMessageId
+        ? { transcriptMessageId: transcriptMessageId ?? last.transcriptMessageId }
+        : {}),
     }
     return [...messages.slice(0, -1), merged]
   }
@@ -205,9 +492,318 @@ function appendAssistantTextMessage(
       type: 'assistant_text',
       content,
       timestamp,
+      ...(transcriptMessageId ? { transcriptMessageId } : {}),
       ...(model ? { model } : {}),
     },
   ]
+}
+
+function extractCompactSummaryContent(content: unknown): string | null {
+  if (typeof content !== 'string') return null
+  const trimmed = content.trim()
+  if (!trimmed.startsWith(COMPACT_SUMMARY_PREFIX)) return null
+
+  let summary = trimmed.slice(COMPACT_SUMMARY_PREFIX.length).trim()
+  for (const marker of COMPACT_SUMMARY_CUTOFFS) {
+    const index = summary.indexOf(marker)
+    if (index >= 0) {
+      summary = summary.slice(0, index).trim()
+    }
+  }
+  return summary || null
+}
+
+function compactMetadataFromUnknown(data: unknown): Pick<CompactSummaryMessage, 'trigger' | 'preTokens' | 'messagesSummarized'> {
+  if (!data || typeof data !== 'object') return {}
+  const record = data as Record<string, unknown>
+  const trigger = record.trigger === 'manual' || record.trigger === 'auto'
+    ? record.trigger
+    : undefined
+  const preTokens = typeof record.preTokens === 'number'
+    ? record.preTokens
+    : typeof record.pre_tokens === 'number'
+      ? record.pre_tokens
+      : undefined
+  const messagesSummarized = typeof record.messagesSummarized === 'number'
+    ? record.messagesSummarized
+    : typeof record.messages_summarized === 'number'
+      ? record.messages_summarized
+      : undefined
+
+  return {
+    ...(trigger ? { trigger } : {}),
+    ...(preTokens !== undefined ? { preTokens } : {}),
+    ...(messagesSummarized !== undefined ? { messagesSummarized } : {}),
+  }
+}
+
+function appendOrUpdateTailCompactSummary(
+  messages: UIMessage[],
+  update: Partial<Omit<CompactSummaryMessage, 'id' | 'type' | 'timestamp'>>,
+  timestamp: number,
+): UIMessage[] {
+  const existingIndex = messages.length - 1
+  const existingMessage = messages[existingIndex]
+  if (existingMessage?.type === 'compact_summary') {
+    const existing = existingMessage
+    const next: CompactSummaryMessage = {
+      ...existing,
+      ...update,
+      title: update.title ?? existing.title,
+      timestamp: existing.timestamp,
+    }
+    return [
+      ...messages.slice(0, existingIndex),
+      next,
+      ...messages.slice(existingIndex + 1),
+    ]
+  }
+
+  return [
+    ...messages,
+    {
+      id: nextId(),
+      type: 'compact_summary',
+      title: update.title ?? 'Context compacted',
+      ...update,
+      timestamp,
+    },
+  ]
+}
+
+function dropTailCompactingCompactSummary(messages: UIMessage[]): UIMessage[] {
+  const tail = messages[messages.length - 1]
+  if (tail?.type === 'compact_summary' && tail.phase === 'compacting') {
+    return messages.slice(0, -1)
+  }
+  return messages
+}
+
+function upsertBackgroundTaskMessage(
+  messages: UIMessage[],
+  task: BackgroundAgentTask,
+  timestamp: number,
+): UIMessage[] {
+  const isSameTaskMessage = (message: UIMessage) =>
+    message.type === 'background_task' &&
+    (message.task.taskId === task.taskId ||
+      (task.toolUseId && message.task.toolUseId === task.toolUseId))
+
+  if (isAgentBackgroundTask(task)) {
+    return messages.filter((message) => !isSameTaskMessage(message))
+  }
+
+  const existingIndex = messages.findIndex((message) =>
+    isSameTaskMessage(message))
+  if (existingIndex === -1) {
+    return [...messages, {
+      id: `background-task-${task.taskId}`,
+      type: 'background_task',
+      task,
+      timestamp,
+    }]
+  }
+
+  return messages.map((message, index) =>
+    index === existingIndex && message.type === 'background_task'
+      ? { ...message, task: { ...message.task, ...task }, timestamp: message.timestamp || timestamp }
+      : message)
+}
+
+function buildBackgroundTaskSessionUpdate(
+  session: PerSessionState,
+  backgroundAgentTasks: Record<string, BackgroundAgentTask>,
+  task: BackgroundAgentTask | undefined,
+  timestamp: number,
+): Partial<PerSessionState> {
+  const messages = task
+    ? upsertBackgroundTaskMessage(session.messages, task, timestamp)
+    : session.messages
+
+  return {
+    backgroundAgentTasks,
+    ...(messages !== session.messages ? { messages } : {}),
+  }
+}
+
+function mergeBackgroundTaskMessages(
+  messages: UIMessage[],
+  tasks: Record<string, BackgroundAgentTask>,
+): UIMessage[] {
+  const merged = Object.values(tasks).reduce(
+    (current, task) => upsertBackgroundTaskMessage(current, task, task.updatedAt),
+    messages,
+  )
+  return [...merged].sort((a, b) => a.timestamp - b.timestamp)
+}
+
+function isAgentBackgroundTask(task: Pick<BackgroundAgentTask, 'taskType' | 'summary'>): boolean {
+  if (task.taskType === 'local_agent' || task.taskType === 'remote_agent' || task.taskType === 'dream') {
+    return true
+  }
+  return /^Agent (?:(?:"[^"]+" )?(completed|was stopped)|(?:"[^"]+" )?failed(?::|$))/.test(
+    task.summary ?? '',
+  )
+}
+
+function shouldSuppressTaskNotificationResponse(session: PerSessionState): boolean {
+  const lastMessage = session.messages[session.messages.length - 1]
+  const hasVisibleActiveOutput =
+    session.streamingText.trim().length > 0 ||
+    Boolean(session.activeToolUseId) ||
+    session.chatState === 'streaming' ||
+    session.chatState === 'tool_executing' ||
+    session.chatState === 'permission_pending'
+  return !hasVisibleActiveOutput && lastMessage?.type !== 'user_text'
+}
+
+function mergeRestoredTerminalGoalEvents(
+  messages: UIMessage[],
+  restoredMessages: UIMessage[],
+): UIMessage[] {
+  const existingKeys = new Set(messages
+    .filter((message): message is Extract<UIMessage, { type: 'goal_event' }> =>
+      message.type === 'goal_event')
+    .map((message) => `${message.action}:${message.message ?? ''}:${message.objective ?? ''}`))
+
+  const missingTerminalEvents = restoredMessages.filter((
+    message,
+  ): message is Extract<UIMessage, { type: 'goal_event' }> =>
+    message.type === 'goal_event' &&
+    (message.action === 'completed' || message.action === 'cleared') &&
+    !existingKeys.has(`${message.action}:${message.message ?? ''}:${message.objective ?? ''}`))
+
+  return missingTerminalEvents.length > 0
+    ? [...messages, ...missingTerminalEvents]
+    : messages
+}
+
+function mergeRestoredTranscriptMessageIds(
+  messages: UIMessage[],
+  restoredMessages: UIMessage[],
+): UIMessage[] {
+  const restoredCandidates = restoredMessages.filter((
+    message,
+  ): message is Extract<UIMessage, { type: 'user_text' | 'assistant_text' }> =>
+    (message.type === 'user_text' || message.type === 'assistant_text') &&
+    typeof message.transcriptMessageId === 'string' &&
+    message.transcriptMessageId.length > 0)
+
+  if (restoredCandidates.length === 0) return messages
+
+  let restoredCursor = 0
+  let changed = false
+  const merged = messages.map((message) => {
+    if (
+      (message.type !== 'user_text' && message.type !== 'assistant_text') ||
+      message.transcriptMessageId
+    ) {
+      return message
+    }
+
+    const matchIndex = restoredCandidates.findIndex((candidate, index) =>
+      index >= restoredCursor &&
+      candidate.type === message.type &&
+      candidate.content.trim() === message.content.trim())
+
+    if (matchIndex === -1) return message
+
+    restoredCursor = matchIndex + 1
+    changed = true
+    return {
+      ...message,
+      transcriptMessageId: restoredCandidates[matchIndex]!.transcriptMessageId,
+    }
+  })
+
+  return changed ? merged : messages
+}
+
+function dropDuplicateTranscriptTextMessages(messages: UIMessage[]): UIMessage[] {
+  const seen = new Set<string>()
+  const deduped: UIMessage[] = []
+  let changed = false
+
+  for (const message of messages) {
+    if (
+      (message.type === 'user_text' || message.type === 'assistant_text') &&
+      message.transcriptMessageId
+    ) {
+      const key = `${message.type}:${message.transcriptMessageId}:${message.content.trim()}`
+      if (seen.has(key)) {
+        changed = true
+        continue
+      }
+      seen.add(key)
+    }
+
+    deduped.push(message)
+  }
+
+  return changed ? deduped : messages
+}
+
+function mergeRestoredHistoryIntoLiveMessages(
+  messages: UIMessage[],
+  restoredMessages: UIMessage[],
+): UIMessage[] {
+  return mergeRestoredTerminalGoalEvents(
+    dropDuplicateTranscriptTextMessages(
+      mergeRestoredTranscriptMessageIds(messages, restoredMessages),
+    ),
+    restoredMessages,
+  )
+}
+
+function needsTranscriptIdHydrationRetry(session: PerSessionState | undefined): boolean {
+  if (!session || session.chatState !== 'idle') return false
+
+  let currentTurnHasHydratedUser = false
+  for (const message of session.messages) {
+    if (message.type === 'user_text') {
+      currentTurnHasHydratedUser = Boolean(message.transcriptMessageId)
+      continue
+    }
+    if (
+      currentTurnHasHydratedUser &&
+      message.type === 'assistant_text' &&
+      !message.transcriptMessageId
+    ) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function refreshCompletedTranscriptHistory(
+  get: () => ChatStore,
+  sessionId: string,
+): void {
+  void get().loadHistory(sessionId).then(() => {
+    if (!needsTranscriptIdHydrationRetry(get().sessions[sessionId])) return
+    setTimeout(() => {
+      if (!needsTranscriptIdHydrationRetry(get().sessions[sessionId])) return
+      void get().loadHistory(sessionId)
+    }, 750)
+  })
+}
+
+function normalizeMemoryEventFiles(data: unknown): MemoryEventFile[] {
+  if (!data || typeof data !== 'object') return []
+  const writtenPaths = (data as { writtenPaths?: unknown }).writtenPaths
+  if (!Array.isArray(writtenPaths)) return []
+  return writtenPaths
+    .filter((path): path is string => typeof path === 'string' && path.trim().length > 0)
+    .map((path) => ({ path, action: 'saved' as const }))
+}
+
+function normalizeMemoryTeamCount(data: unknown): number | undefined {
+  if (!data || typeof data !== 'object') return undefined
+  const teamCount = (data as { teamCount?: unknown }).teamCount
+  return typeof teamCount === 'number' && Number.isFinite(teamCount)
+    ? teamCount
+    : undefined
 }
 
 function normalizeNotificationPreview(content: string): string {
@@ -249,18 +845,96 @@ function updateSessionIn(
   return { ...sessions, [sessionId]: { ...session, ...updater(session) } }
 }
 
+type SlashCommandState = PerSessionState['slashCommands'][number]
+
+function normalizeSlashCommand(command: unknown): SlashCommandState | null {
+  if (!command || typeof command !== 'object') return null
+  const candidate = command as { name?: unknown; description?: unknown; argumentHint?: unknown }
+  if (typeof candidate.name !== 'string' || !candidate.name) return null
+  return {
+    name: candidate.name,
+    description: typeof candidate.description === 'string' ? candidate.description : '',
+    ...(typeof candidate.argumentHint === 'string' && candidate.argumentHint
+      ? { argumentHint: candidate.argumentHint }
+      : {}),
+  }
+}
+
+function normalizeSlashCommandList(commands: ReadonlyArray<unknown>): SlashCommandState[] {
+  return commands
+    .map(normalizeSlashCommand)
+    .filter((command): command is SlashCommandState => command !== null)
+}
+
+function mergeSlashCommandUpdates(
+  current: ReadonlyArray<SlashCommandState>,
+  incoming: ReadonlyArray<SlashCommandState>,
+): SlashCommandState[] {
+  const merged = new Map<string, SlashCommandState>()
+  for (const command of current) {
+    if (command.name) merged.set(command.name, command)
+  }
+  for (const command of incoming) {
+    if (command.name) merged.set(command.name, command)
+  }
+  return [...merged.values()]
+}
+
+function readUsageToken(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function summarizeTokenUsageFromHistory(messages: MessageEntry[]): TokenUsage | null {
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens = 0
+  let cacheCreationTokens = 0
+
+  for (const message of messages) {
+    const usage = message.usage
+    if (!usage) continue
+    inputTokens += readUsageToken(usage.input_tokens)
+    outputTokens += readUsageToken(usage.output_tokens)
+    cacheReadTokens += readUsageToken(usage.cache_read_input_tokens)
+    cacheCreationTokens += readUsageToken(usage.cache_creation_input_tokens)
+  }
+
+  if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheCreationTokens === 0) {
+    return null
+  }
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    ...(cacheReadTokens > 0 ? { cache_read_tokens: cacheReadTokens } : {}),
+    ...(cacheCreationTokens > 0 ? { cache_creation_tokens: cacheCreationTokens } : {}),
+  }
+}
+
 async function fetchAndMapSessionHistory(sessionId: string) {
   const { messages, taskNotifications } = await sessionsApi.getMessages(sessionId)
+  const uiMessages = mapHistoryMessagesToUiMessages(messages)
+  const restoredNotifications = {
+    ...reconstructAgentNotifications(messages),
+    ...agentNotificationRecordFromList(taskNotifications ?? []),
+  }
   return {
     rawMessages: messages,
-    uiMessages: mapHistoryMessagesToUiMessages(messages),
-    restoredNotifications: {
-      ...reconstructAgentNotifications(messages),
-      ...agentNotificationRecordFromList(taskNotifications ?? []),
-    },
+    uiMessages,
+    activeGoal: deriveActiveGoalFromMessages(uiMessages),
+    restoredNotifications,
+    restoredBackgroundTasks: backgroundTaskRecordFromNotifications(Object.values(restoredNotifications)),
     lastTodos: extractLastTodoWriteFromHistory(messages),
     hasMessagesAfterTaskCompletion: hasUserMessagesAfterTaskCompletion(messages),
+    tokenUsage: summarizeTokenUsageFromHistory(messages),
   }
+}
+
+const historyLoadsInFlight = new Map<string, Promise<void>>()
+
+function shouldPrewarmSession(sessionId: string): boolean {
+  const knownSession = useSessionStore.getState().sessions.find((session) => session.id === sessionId)
+  return !knownSession || knownSession.messageCount === 0
 }
 
 export const useChatStore = create<ChatStore>((set, get) => ({
@@ -272,7 +946,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     void useCLITaskStore.getState().fetchSessionTasks(sessionId)
 
     const existing = get().sessions[sessionId]
-    if (existing && existing.connectionState !== 'disconnected') return
+    if (existing && existing.connectionState !== 'disconnected') {
+      if (
+        existing.messages.length === 0 &&
+        (existing.historyStatus === 'idle' || existing.historyStatus === 'error')
+      ) {
+        void get().loadHistory(sessionId)
+      }
+      return
+    }
 
     set((s) => ({
       sessions: {
@@ -281,6 +963,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           ...createDefaultSessionState(),
           connectionState: 'connecting',
           messages: existing?.messages ?? [],
+          activeGoal: existing?.activeGoal ?? null,
+          composerDraft: existing?.composerDraft ?? null,
+          queuedUserMessages: existing?.queuedUserMessages ?? [],
         },
       },
     }))
@@ -298,7 +983,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (runtimeSelection) {
       wsManager.send(sessionId, { type: 'set_runtime_config', ...runtimeSelection })
     }
-    if (!sessionId.startsWith('__') && !useTeamStore.getState().getMemberBySessionId(sessionId)) {
+    if (
+      !sessionId.startsWith('__') &&
+      !useTeamStore.getState().getMemberBySessionId(sessionId) &&
+      shouldPrewarmSession(sessionId)
+    ) {
       wsManager.send(sessionId, { type: 'prewarm_session' })
     }
 
@@ -323,7 +1012,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const text = consumePendingDelta(sessionId)
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
     }
+    clearPendingToolInputDelta(sessionId)
     clearPendingTaskToolUseIds(sessionId)
+    clearPendingToolParentUseIds(sessionId)
     wsManager.disconnect(sessionId)
     set((s) => {
       const { [sessionId]: _, ...rest } = s.sessions
@@ -332,10 +1023,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   sendMessage: (sessionId, content, attachments, options) => {
-    const userFacingContent =
-      options?.displayContent?.trim() || content.trim()
-    const modelFacingContent = buildModelContent(content, attachments)
     const isMemberSession = !!useTeamStore.getState().getMemberBySessionId(sessionId)
+    const hideDisplayContent = !isMemberSession && options?.hideDisplayContent === true
+    const userFacingContent =
+      hideDisplayContent
+        ? ''
+        : options?.displayContent?.trim() || content.trim()
+    const modelFacingContent = buildModelContent(content, attachments)
     const visibleAttachments = options?.displayAttachments ?? attachments
     const uiAttachments: UIAttachment[] | undefined =
       visibleAttachments && visibleAttachments.length > 0
@@ -364,23 +1058,24 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
 
     if (!isMemberSession) {
-      updateOptimisticSessionTitle(sessionId, userFacingContent)
+      updateOptimisticSessionTitle(sessionId, userFacingContent || content.trim())
     }
 
     set((s) => {
       const session = s.sessions[sessionId] ?? createDefaultSessionState()
       const bufferedDelta = consumePendingDelta(sessionId)
       const pendingAssistantText = `${session.streamingText}${bufferedDelta}`
+      const now = Date.now()
 
       const newMessages = pendingAssistantText.trim()
-        ? appendAssistantTextMessage(session.messages, pendingAssistantText, Date.now())
+        ? appendAssistantTextMessage(session.messages, pendingAssistantText, now)
         : [...session.messages]
       if (!isMemberSession && allTasksDone) {
         newMessages.push({
           id: nextId(),
           type: 'task_summary',
           tasks: completedTaskSummary,
-          timestamp: Date.now(),
+          timestamp: now,
         })
       }
       newMessages.push({
@@ -389,7 +1084,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         content: userFacingContent,
         ...(userFacingContent !== modelFacingContent ? { modelContent: modelFacingContent } : {}),
         attachments: isMemberSession ? undefined : uiAttachments,
-        timestamp: Date.now(),
+        timestamp: now,
         ...(isMemberSession ? { pending: true } : {}),
       })
 
@@ -409,8 +1104,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             messages: newMessages,
             chatState: 'thinking',
             elapsedSeconds: 0,
+            suppressNextTaskNotificationResponse: false,
             streamingText: '',
+            streamingResponseChars: 0,
             statusVerb: isMemberSession ? '' : randomSpinnerVerb(),
+            apiRetry: null,
+            streamingFallback: null,
             elapsedTimer: timer,
             connectionState: isMemberSession ? 'connected' : session.connectionState,
           },
@@ -450,6 +1149,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       allowed,
       ...(options?.rule ? { rule: options.rule } : {}),
       ...(options?.updatedInput ? { updatedInput: options.updatedInput } : {}),
+      ...(options?.denyMessage ? { denyMessage: options.denyMessage } : {}),
+      ...(options?.permissionUpdates?.length ? { permissionUpdates: options.permissionUpdates } : {}),
     })
     set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({ pendingPermission: null, chatState: allowed ? 'tool_executing' : 'idle' })) }))
   },
@@ -482,66 +1183,147 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   stopGeneration: (sessionId) => {
     wsManager.send(sessionId, { type: 'stop_generation' })
-    if (pendingDeltaBySession.has(sessionId)) {
-      const text = consumePendingDelta(sessionId)
-      set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
-    }
+    const bufferedText = consumePendingDelta(sessionId)
+    clearPendingToolInputDelta(sessionId)
+    clearPendingTaskToolUseIds(sessionId)
+    clearPendingToolParentUseIds(sessionId)
+    let hasRunningBackgroundAgents = false
     set((s) => {
       const session = s.sessions[sessionId]
       if (!session) return s
+      hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
       if (session.elapsedTimer) clearInterval(session.elapsedTimer)
+      const pendingAssistantText = `${session.streamingText}${bufferedText}`
+      const messagesWithFlushedText = pendingAssistantText.trim()
+        ? appendAssistantTextMessage(session.messages, pendingAssistantText, Date.now())
+        : session.messages
       return {
         sessions: {
           ...s.sessions,
           [sessionId]: {
             ...session,
+            messages: markPendingToolUseMessagesStopped(messagesWithFlushedText),
             chatState: 'idle',
+            activeToolUseId: null,
+            activeToolName: null,
+            activeThinkingId: null,
+            streamingText: '',
+            streamingToolInput: '',
+            statusVerb: '',
             pendingPermission: null,
             pendingComputerUsePermission: null,
+            apiRetry: null,
+            streamingFallback: null,
+            suppressNextTaskNotificationResponse: false,
             elapsedTimer: null,
           },
         },
       }
     })
+    useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
   },
 
   loadHistory: async (sessionId) => {
-    try {
-      const {
-        uiMessages,
-        restoredNotifications,
-        lastTodos,
-        hasMessagesAfterTaskCompletion,
-      } = await fetchAndMapSessionHistory(sessionId)
-      set((state) => {
-        const session = state.sessions[sessionId]
-        if (!session || session.messages.length > 0) return state
-        return { sessions: updateSessionIn(state.sessions, sessionId, (s) => ({
-          messages: uiMessages,
-          agentTaskNotifications: { ...s.agentTaskNotifications, ...restoredNotifications },
-        })) }
-      })
-      if (lastTodos && lastTodos.length > 0) {
-        const taskStore = useCLITaskStore.getState()
-        if (taskStore.sessionId === sessionId && taskStore.tasks.length === 0) taskStore.setTasksFromTodos(lastTodos, sessionId)
-      } else {
-        useCLITaskStore.getState().setTasksFromTodos([], sessionId)
+    const existingLoad = historyLoadsInFlight.get(sessionId)
+    if (existingLoad) return existingLoad
+
+    let load!: Promise<void>
+    load = (async () => {
+      try {
+        set((state) => {
+          const session = state.sessions[sessionId]
+          if (!session) return state
+          return {
+            sessions: updateSessionIn(state.sessions, sessionId, () => ({
+              historyStatus: 'loading',
+              historyError: null,
+            })),
+          }
+        })
+        const {
+          uiMessages,
+          activeGoal,
+          restoredNotifications,
+          restoredBackgroundTasks,
+          lastTodos,
+          hasMessagesAfterTaskCompletion,
+          tokenUsage,
+        } = await fetchAndMapSessionHistory(sessionId)
+        set((state) => {
+          const session = state.sessions[sessionId]
+          if (!session) return state
+          if (session.messages.length > 0) {
+            return { sessions: updateSessionIn(state.sessions, sessionId, (s) => ({
+              historyStatus: 'ready',
+              historyError: null,
+              activeGoal: activeGoal ?? s.activeGoal ?? null,
+              agentTaskNotifications: { ...s.agentTaskNotifications, ...restoredNotifications },
+              backgroundAgentTasks: mergeBackgroundAgentTaskRecords(
+                s.backgroundAgentTasks ?? {},
+                restoredBackgroundTasks,
+              ),
+              tokenUsage: tokenUsage ?? s.tokenUsage,
+              messages: mergeRestoredHistoryIntoLiveMessages(
+                mergeBackgroundTaskMessages(s.messages, restoredBackgroundTasks),
+                uiMessages,
+              ),
+            })) }
+          }
+          return { sessions: updateSessionIn(state.sessions, sessionId, (s) => ({
+            historyStatus: 'ready',
+            historyError: null,
+            messages: mergeBackgroundTaskMessages(uiMessages, restoredBackgroundTasks),
+            activeGoal,
+            agentTaskNotifications: { ...s.agentTaskNotifications, ...restoredNotifications },
+            backgroundAgentTasks: mergeBackgroundAgentTaskRecords(
+              s.backgroundAgentTasks ?? {},
+              restoredBackgroundTasks,
+            ),
+            tokenUsage: tokenUsage ?? s.tokenUsage,
+          })) }
+        })
+        if (lastTodos && lastTodos.length > 0) {
+          const taskStore = useCLITaskStore.getState()
+          if (taskStore.sessionId === sessionId && taskStore.tasks.length === 0) taskStore.setTasksFromTodos(lastTodos, sessionId)
+        } else {
+          useCLITaskStore.getState().setTasksFromTodos([], sessionId)
+        }
+        if (hasMessagesAfterTaskCompletion) {
+          useCLITaskStore.getState().markCompletedAndDismissed(sessionId)
+        }
+      } catch (error) {
+        // Session may not have messages yet
+        set((state) => {
+          const session = state.sessions[sessionId]
+          if (!session) return state
+          return {
+            sessions: updateSessionIn(state.sessions, sessionId, () => ({
+              historyStatus: 'error',
+              historyError: error instanceof Error ? error.message : String(error),
+            })),
+          }
+        })
+      } finally {
+        if (historyLoadsInFlight.get(sessionId) === load) {
+          historyLoadsInFlight.delete(sessionId)
+        }
       }
-      if (hasMessagesAfterTaskCompletion) {
-        useCLITaskStore.getState().markCompletedAndDismissed(sessionId)
-      }
-    } catch {
-      // Session may not have messages yet
-    }
+    })()
+
+    historyLoadsInFlight.set(sessionId, load)
+    return load
   },
 
   reloadHistory: async (sessionId) => {
     try {
       const {
         uiMessages,
+        activeGoal,
         restoredNotifications,
+        restoredBackgroundTasks,
         lastTodos,
         hasMessagesAfterTaskCompletion,
+        tokenUsage,
       } = await fetchAndMapSessionHistory(sessionId)
 
       set((state) => {
@@ -550,8 +1332,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (session.elapsedTimer) clearInterval(session.elapsedTimer)
         return {
           sessions: updateSessionIn(state.sessions, sessionId, () => ({
-            messages: uiMessages,
+            historyStatus: 'ready',
+            historyError: null,
+            messages: mergeBackgroundTaskMessages(uiMessages, restoredBackgroundTasks),
+            activeGoal,
             agentTaskNotifications: restoredNotifications,
+            backgroundAgentTasks: restoredBackgroundTasks,
+            tokenUsage: tokenUsage ?? session.tokenUsage,
             chatState: 'idle',
             activeThinkingId: null,
             activeToolUseId: null,
@@ -562,6 +1349,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             pendingComputerUsePermission: null,
             elapsedTimer: null,
             statusVerb: '',
+            apiRetry: null,
+            streamingFallback: null,
           })),
         }
       })
@@ -585,20 +1374,194 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         composerPrefill: {
           text: prefill.text,
           attachments: prefill.attachments,
+          mode: prefill.mode,
           nonce: Date.now(),
         },
       })),
     }))
   },
 
+  clearComposerPrefill: (sessionId, nonce) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => {
+        if (nonce !== undefined && session.composerPrefill?.nonce !== nonce) return {}
+        return { composerPrefill: null }
+      }),
+    }))
+  },
+
+  queueComposerInsertion: (sessionId, insertion) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        composerInsertion: {
+          ...insertion,
+          nonce: Date.now(),
+        },
+      })),
+    }))
+  },
+
+  clearComposerInsertion: (sessionId, nonce) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => {
+        if (nonce !== undefined && session.composerInsertion?.nonce !== nonce) return {}
+        return { composerInsertion: null }
+      }),
+    }))
+  },
+
+  setComposerDraft: (sessionId, draft) => {
+    set((state) => {
+      const session = state.sessions[sessionId] ?? createDefaultSessionState()
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...session,
+            composerDraft: draft,
+          },
+        },
+      }
+    })
+  },
+
+  clearComposerDraft: (sessionId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        composerDraft: null,
+      })),
+    }))
+  },
+
+  queueUserMessage: (sessionId, message) => {
+    const id = `queued-user-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    set((state) => {
+      const session = state.sessions[sessionId] ?? createDefaultSessionState()
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...session,
+            queuedUserMessages: [
+              ...(session.queuedUserMessages ?? []),
+              {
+                ...message,
+                id,
+                createdAt: Date.now(),
+              },
+            ],
+          },
+        },
+      }
+    })
+    return id
+  },
+
+  updateQueuedUserMessage: (sessionId, messageId, content) => {
+    const nextContent = content.trim()
+    if (!nextContent) return
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => ({
+        queuedUserMessages: (session.queuedUserMessages ?? []).map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                content: replaceQueuedMessageDisplayContent(message, nextContent),
+                displayContent: nextContent,
+              }
+            : message),
+      })),
+    }))
+  },
+
+  removeQueuedUserMessage: (sessionId, messageId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (session) => ({
+        queuedUserMessages: (session.queuedUserMessages ?? []).filter((message) => message.id !== messageId),
+      })),
+    }))
+  },
+
+  sendQueuedUserMessage: (sessionId, messageId) => {
+    const session = get().sessions[sessionId]
+    const queuedMessage = (session?.queuedUserMessages ?? []).find((message) => message.id === messageId)
+    if (!session || !queuedMessage) return
+
+    if (session.chatState === 'idle') {
+      get().removeQueuedUserMessage(sessionId, messageId)
+      get().sendMessage(
+        sessionId,
+        queuedMessage.content,
+        queuedMessage.attachments,
+        {
+          displayContent: queuedMessage.displayContent,
+          displayAttachments: queuedMessage.displayAttachments,
+        },
+      )
+      return
+    }
+
+    const now = Date.now()
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, (currentSession) => {
+        const pendingText = `${currentSession.streamingText}${consumePendingDelta(sessionId)}`
+        const baseMessages = pendingText.trim()
+          ? appendAssistantTextMessage(currentSession.messages, pendingText, now)
+          : currentSession.messages
+        return {
+          messages: appendOptimisticQueuedUserMessage(baseMessages, queuedMessage, now),
+          queuedUserMessages: (currentSession.queuedUserMessages ?? [])
+            .filter((message) => message.id !== messageId),
+          ...(pendingText.trim() ? { streamingText: '' } : {}),
+          suppressNextTaskNotificationResponse: false,
+        }
+      }),
+    }))
+
+    wsManager.send(sessionId, {
+      type: 'user_message',
+      content: queuedMessage.content,
+      attachments: queuedMessage.attachments,
+    })
+  },
+
   clearMessages: (sessionId) => {
     clearPendingTaskToolUseIds(sessionId)
-    set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({ messages: [], streamingText: '', chatState: 'idle' })) }))
+    clearPendingToolParentUseIds(sessionId)
+    clearPendingToolInputDelta(sessionId)
+    set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({
+      messages: [],
+      activeGoal: null,
+      streamingText: '',
+      chatState: 'idle',
+      apiRetry: null,
+      streamingFallback: null,
+      suppressNextTaskNotificationResponse: false,
+      queuedUserMessages: [],
+    })) }))
   },
 
   handleServerMessage: (sessionId, msg) => {
     const update = (updater: (session: PerSessionState) => Partial<PerSessionState>) => {
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, updater) }))
+    }
+    const ensureElapsedTimer = () => {
+      const session = get().sessions[sessionId]
+      if (!session || session.elapsedTimer) return
+      const timer = setInterval(() => {
+        set((st) => ({
+          sessions: updateSessionIn(st.sessions, sessionId, (sess) => ({
+            elapsedSeconds: sess.elapsedSeconds + 1,
+          })),
+        }))
+      }, 1000)
+      update(() => ({ elapsedTimer: timer }))
+    }
+    const clearElapsedTimer = () => {
+      const session = get().sessions[sessionId]
+      if (!session?.elapsedTimer) return
+      clearInterval(session.elapsedTimer)
+      update(() => ({ elapsedTimer: null }))
     }
 
     switch (msg.type) {
@@ -654,33 +1617,79 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           // streaming one markdown reply. Keep that turn intact so we do not
           // split formatting markers (for example backticks/strong markers)
           // across separate bubbles.
-          const preserveStreamingTurn = hasPendingStreamText && msg.state !== 'idle'
-          const shouldFlush = hasPendingStreamText && msg.state === 'idle'
+          const preserveStreamingTurn = hasPendingStreamText && msg.state !== 'idle' && msg.state !== 'compacting'
+          const shouldFlush = hasPendingStreamText && (msg.state === 'idle' || msg.state === 'compacting')
+          let nextMessages = session.messages
+          if (shouldFlush) {
+            nextMessages = appendAssistantTextMessage(nextMessages, pendingText, Date.now())
+          }
+          if (msg.state === 'compacting') {
+            nextMessages = appendOrUpdateTailCompactSummary(
+              nextMessages,
+              {
+                title: 'Context compacted',
+                phase: 'compacting',
+              },
+              Date.now(),
+            )
+          } else {
+            nextMessages = dropTailCompactingCompactSummary(nextMessages)
+          }
           return {
             chatState: preserveStreamingTurn ? 'streaming' : msg.state,
-            ...(msg.verb && msg.verb !== 'Thinking' ? { statusVerb: msg.verb } : {}),
-            ...(msg.tokens ? { tokenUsage: { ...session.tokenUsage, output_tokens: msg.tokens } } : {}),
-            ...(msg.state === 'idle' ? { activeThinkingId: null, statusVerb: '' } : {}),
+            statusVerb: msg.state === 'idle'
+              ? ''
+              : msg.verb && msg.verb !== 'Thinking'
+                ? msg.verb
+                : '',
+            ...(msg.state === 'idle' ? { activeThinkingId: null } : {}),
+            ...(msg.state === 'idle' ? { apiRetry: null, streamingFallback: null } : {}),
+            ...(nextMessages !== session.messages ? { messages: nextMessages } : {}),
             ...(shouldFlush ? {
-              messages: appendAssistantTextMessage(session.messages, pendingText, Date.now()),
               streamingText: '',
             } : pendingText !== session.streamingText ? { streamingText: pendingText } : {}),
           }
         })
+        if (msg.state !== 'idle') ensureElapsedTimer()
         if (msg.state === 'idle') {
-          const session = get().sessions[sessionId]
-          if (session?.elapsedTimer) {
-            clearInterval(session.elapsedTimer)
-            update(() => ({ elapsedTimer: null }))
-          }
+          clearElapsedTimer()
         }
         // Sync tab status
-        useTabStore.getState().updateTabStatus(sessionId, msg.state === 'idle' ? 'idle' : 'running')
+        useTabStore.getState().updateTabStatus(
+          sessionId,
+          msg.state === 'idle' && !hasRunningBackgroundTasks(get().sessions[sessionId]?.backgroundAgentTasks)
+            ? 'idle'
+            : 'running',
+        )
         break
+
+      case 'permission_mode_changed': {
+        // CLI 是权限模式的真相来源。这里把它恢复/切换后的权威值校正到本地镜像。
+        // 注意：只更新本地状态，**不要**走 setSessionPermissionMode —— 那会把
+        // set_permission_mode 再回发给 CLI 形成回环。未知模式（如未启用对应特性
+        // 的 'auto'）直接忽略，避免选择器拿到无法渲染的值。
+        const KNOWN_MODES: PermissionMode[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions', 'dontAsk']
+        if (KNOWN_MODES.includes(msg.mode)) {
+          useSessionStore.getState().updateSessionPermissionMode(sessionId, msg.mode)
+        }
+        break
+      }
 
       case 'content_start': {
         const session = get().sessions[sessionId]
         if (!session) break
+        if (session.suppressNextTaskNotificationResponse && msg.blockType === 'text') {
+          consumePendingDelta(sessionId)
+          update(() => ({
+            streamingText: '',
+            activeThinkingId: null,
+            statusVerb: '',
+          }))
+          break
+        }
+        if (session.suppressNextTaskNotificationResponse) {
+          update(() => ({ suppressNextTaskNotificationResponse: false }))
+        }
         const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
         if (msg.blockType !== 'text' && pendingText.trim()) {
           update((s) => ({
@@ -693,37 +1702,157 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...(pendingText !== s.streamingText ? { streamingText: pendingText } : {}),
             chatState: 'streaming',
             activeThinkingId: null,
+            apiRetry: null,
+            streamingFallback: null,
           }))
         } else if (msg.blockType === 'tool_use') {
-          update(() => ({
-            activeToolUseId: msg.toolUseId ?? null,
-            activeToolName: msg.toolName ?? null,
+          clearPendingToolInputDelta(sessionId)
+          rememberPendingToolParentUseId(sessionId, msg.toolUseId, msg.parentToolUseId)
+          const toolUseId = msg.toolUseId ?? null
+          const toolName = msg.toolName ?? 'unknown'
+          update((s) => ({
+            ...(toolUseId
+              ? {
+                  messages: upsertToolUseMessage(s.messages, toolUseId, (existing) => ({
+                    id: existing?.id ?? nextId(),
+                    type: 'tool_use',
+                    toolName,
+                    toolUseId,
+                    input: existing?.input ?? {},
+                    timestamp: existing?.timestamp ?? Date.now(),
+                    parentToolUseId: msg.parentToolUseId ?? existing?.parentToolUseId,
+                    isPending: true,
+                    partialInput: existing?.partialInput ?? '',
+                  })),
+                }
+              : {}),
+            activeToolUseId: toolUseId,
+            activeToolName: toolName,
             streamingToolInput: '',
             chatState: 'tool_executing',
             activeThinkingId: null,
+            apiRetry: null,
+            streamingFallback: null,
           }))
         }
+        ensureElapsedTimer()
+        break
+      }
+
+      case 'api_retry': {
+        const attempt = Math.max(1, Math.trunc(msg.attempt))
+        const maxRetries = Math.max(attempt, Math.trunc(msg.maxRetries))
+        const retryDelayMs = Math.max(0, Math.trunc(msg.retryDelayMs))
+        update((session) => ({
+          apiRetry: {
+            attempt,
+            maxRetries,
+            retryDelayMs,
+            errorStatus: msg.errorStatus ?? null,
+            errorType: msg.errorType,
+            errorMessage: msg.errorMessage,
+            receivedAt: Date.now(),
+          },
+          chatState: session.chatState === 'idle' ? 'thinking' : session.chatState,
+          activeThinkingId: null,
+          statusVerb: '',
+        }))
+        ensureElapsedTimer()
+        useTabStore.getState().updateTabStatus(sessionId, 'running')
+        break
+      }
+
+      case 'streaming_fallback': {
+        // 进入非流式降级阶段：旧的重试横幅（针对失败的流式请求）已过时，
+        // 清掉换成降级提示；后续非流式重试到来的 api_retry 会重新接管显示。
+        update((session) => ({
+          streamingFallback: {
+            cause: msg.cause,
+            receivedAt: Date.now(),
+          },
+          apiRetry: null,
+          chatState: session.chatState === 'idle' ? 'thinking' : session.chatState,
+          activeThinkingId: null,
+          statusVerb: '',
+        }))
+        ensureElapsedTimer()
+        useTabStore.getState().updateTabStatus(sessionId, 'running')
         break
       }
 
       case 'content_delta':
+        if (get().sessions[sessionId]?.suppressNextTaskNotificationResponse) {
+          consumePendingDelta(sessionId)
+          break
+        }
+        let receivedLiveDelta = false
         if (msg.text !== undefined) {
           if (!get().sessions[sessionId]) break
+          receivedLiveDelta = true
           appendPendingDelta(sessionId, msg.text)
           if (!flushTimerBySession.has(sessionId)) {
             const timer = setTimeout(() => {
               const text = pendingDeltaBySession.get(sessionId) ?? ''
               pendingDeltaBySession.delete(sessionId)
               flushTimerBySession.delete(sessionId)
-              update((s) => ({ streamingText: s.streamingText + text }))
+              update((s) => ({
+                streamingText: s.streamingText + text,
+                streamingResponseChars: s.streamingResponseChars + text.length,
+              }))
             }, 50)
             flushTimerBySession.set(sessionId, timer)
           }
         }
-        if (msg.toolInput !== undefined) update((s) => ({ streamingToolInput: s.streamingToolInput + msg.toolInput }))
+        if (msg.toolInput !== undefined) {
+          receivedLiveDelta = true
+          appendPendingToolInputDelta(sessionId, msg.toolInput)
+          if (!toolInputFlushTimerBySession.has(sessionId)) {
+            const timer = setTimeout(() => {
+              const text = consumePendingToolInputDelta(sessionId)
+              if (!text) return
+              update((s) => {
+                const partialInput = s.streamingToolInput + text
+                const activeToolUseId = s.activeToolUseId
+                return {
+                  streamingToolInput: partialInput,
+                  streamingResponseChars: s.streamingResponseChars + text.length,
+                  ...(activeToolUseId
+                    ? {
+                        messages: upsertToolUseMessage(s.messages, activeToolUseId, (existing) => {
+                          const toolName = existing?.toolName ?? s.activeToolName ?? 'unknown'
+                          return {
+                            id: existing?.id ?? nextId(),
+                            type: 'tool_use',
+                            toolName,
+                            toolUseId: activeToolUseId,
+                            input: buildPartialToolInputPreview(partialInput, existing?.input),
+                            timestamp: existing?.timestamp ?? Date.now(),
+                            parentToolUseId: existing?.parentToolUseId ?? getPendingToolParentUseId(sessionId, activeToolUseId),
+                            isPending: true,
+                            partialInput,
+                          }
+                        }),
+                      }
+                    : {}),
+                }
+              })
+            }, 50)
+            toolInputFlushTimerBySession.set(sessionId, timer)
+          }
+        }
+        if (receivedLiveDelta && get().sessions[sessionId]?.chatState !== 'idle') ensureElapsedTimer()
         break
 
       case 'thinking':
+        if (get().sessions[sessionId]?.suppressNextTaskNotificationResponse) {
+          consumePendingDelta(sessionId)
+          update(() => ({
+            streamingText: '',
+            activeThinkingId: null,
+            statusVerb: '',
+          }))
+          break
+        }
         update((s) => {
           const pendingText = `${s.streamingText}${consumePendingDelta(sessionId)}`
           const base = pendingText.trim()
@@ -733,7 +1862,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           if (last && last.type === 'thinking') {
             const updated = [...base]
             updated[updated.length - 1] = { ...last, content: last.content + msg.text }
-            return { messages: updated, chatState: 'thinking', activeThinkingId: last.id, streamingText: '' }
+            return {
+              messages: updated,
+              chatState: 'thinking',
+              activeThinkingId: last.id,
+              streamingText: '',
+              streamingResponseChars: s.streamingResponseChars + msg.text.length,
+            }
           }
           const id = nextId()
           return {
@@ -741,19 +1876,37 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             chatState: 'thinking',
             activeThinkingId: id,
             streamingText: '',
+            streamingResponseChars: s.streamingResponseChars + msg.text.length,
           }
         })
+        ensureElapsedTimer()
         break
 
       case 'tool_use_complete': {
+        clearPendingToolInputDelta(sessionId)
         const session = get().sessions[sessionId]
         const toolName = msg.toolName || session?.activeToolName || 'unknown'
+        const toolUseId = msg.toolUseId || session?.activeToolUseId || ''
+        const parentToolUseId = msg.parentToolUseId ?? getPendingToolParentUseId(sessionId, toolUseId)
+        rememberPendingToolParentUseId(sessionId, toolUseId, parentToolUseId)
         update((s) => ({
-          messages: [...s.messages, {
-            id: nextId(), type: 'tool_use', toolName,
-            toolUseId: msg.toolUseId || s.activeToolUseId || '',
-            input: msg.input, timestamp: Date.now(), parentToolUseId: msg.parentToolUseId,
-          }],
+          messages: toolUseId
+            ? upsertToolUseMessage(s.messages, toolUseId, (existing) => ({
+                id: existing?.id ?? nextId(),
+                type: 'tool_use',
+                toolName,
+                toolUseId,
+                input: msg.input,
+                timestamp: existing?.timestamp ?? Date.now(),
+                parentToolUseId,
+                isPending: false,
+              }))
+            : [...s.messages, {
+                id: nextId(), type: 'tool_use', toolName,
+                toolUseId,
+                input: msg.input, timestamp: Date.now(), parentToolUseId,
+                isPending: false,
+              }],
           activeToolUseId: null, activeToolName: null, activeThinkingId: null, streamingToolInput: '',
         }))
         if (toolName === 'TodoWrite' && Array.isArray((msg.input as any)?.todos)) {
@@ -765,18 +1918,38 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
       }
 
-      case 'tool_result':
-        update((s) => ({
-          messages: [...s.messages, {
+      case 'tool_result': {
+        const now = Date.now()
+        const pendingParentToolUseId = consumePendingToolParentUseId(sessionId, msg.toolUseId)
+        const parentToolUseId = msg.parentToolUseId ?? pendingParentToolUseId
+        update((s) => {
+          let messages: UIMessage[] = [...s.messages, {
             id: nextId(), type: 'tool_result', toolUseId: msg.toolUseId,
-            content: msg.content, isError: msg.isError, timestamp: Date.now(), parentToolUseId: msg.parentToolUseId,
-          }],
-          chatState: 'thinking', activeThinkingId: null,
-        }))
+            content: msg.content, isError: msg.isError, timestamp: now, parentToolUseId,
+          }]
+          let backgroundAgentTasks = s.backgroundAgentTasks ?? {}
+          const stoppedTask = msg.isError
+            ? null
+            : getStoppedBackgroundTaskFromToolResult(s.messages, msg.toolUseId, msg.content)
+          if (stoppedTask) {
+            backgroundAgentTasks = upsertBackgroundAgentTask(backgroundAgentTasks, stoppedTask, now)
+            const task = backgroundAgentTasks[stoppedTask.taskId]
+            if (task) {
+              messages = upsertBackgroundTaskMessage(messages, task, now)
+            }
+          }
+          return {
+            messages,
+            ...(stoppedTask ? { backgroundAgentTasks } : {}),
+            chatState: 'thinking',
+            activeThinkingId: null,
+          }
+        })
         if (consumePendingTaskToolUseId(sessionId, msg.toolUseId)) {
           useCLITaskStore.getState().refreshTasks(sessionId)
         }
         break
+      }
 
       case 'permission_request':
         notifyDesktop({
@@ -800,6 +1973,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           pendingComputerUsePermission: null,
           chatState: 'permission_pending',
           activeThinkingId: null,
+          apiRetry: null,
+          streamingFallback: null,
           messages:
             msg.toolName === 'AskUserQuestion'
               ? s.messages
@@ -833,17 +2008,45 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           pendingPermission: null,
           chatState: 'permission_pending',
           activeThinkingId: null,
+          apiRetry: null,
+          streamingFallback: null,
         }))
         break
 
       case 'message_complete': {
         const session = get().sessions[sessionId]
         if (!session) break
+        if (session.suppressNextTaskNotificationResponse) {
+          consumePendingDelta(sessionId)
+          clearPendingToolInputDelta(sessionId)
+          if (session.elapsedTimer) clearInterval(session.elapsedTimer)
+          const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
+          update(() => ({
+            tokenUsage: msg.usage,
+            chatState: 'idle',
+            activeThinkingId: null,
+            pendingPermission: null,
+            pendingComputerUsePermission: null,
+            elapsedTimer: null,
+            apiRetry: null,
+            streamingFallback: null,
+            streamingText: '',
+            streamingToolInput: '',
+            suppressNextTaskNotificationResponse: false,
+          }))
+          useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
+          refreshCompletedTranscriptHistory(get, sessionId)
+          for (const queuedMessage of get().sessions[sessionId]?.queuedUserMessages ?? []) {
+            get().sendQueuedUserMessage(sessionId, queuedMessage.id)
+          }
+          break
+        }
+        const completedAt = Date.now()
         const wasAgentRunning = session.chatState !== 'idle'
         const text = `${session.streamingText}${consumePendingDelta(sessionId)}`
         let completionMessages = session.messages
         if (text.trim()) {
-          completionMessages = appendAssistantTextMessage(session.messages, text, Date.now())
+          completionMessages = appendAssistantTextMessage(session.messages, text, completedAt)
           update(() => ({
             messages: completionMessages,
             streamingText: '',
@@ -851,17 +2054,24 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         } else if (text !== session.streamingText) {
           update(() => ({ streamingText: text }))
         }
+        const appendedCompletionMessage = completionMessages !== session.messages
+        const finalMessages = markPendingToolUseMessagesStopped(completionMessages)
+        const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
         if (session.elapsedTimer) clearInterval(session.elapsedTimer)
         update(() => ({
+          messages: finalMessages,
           tokenUsage: msg.usage,
           chatState: 'idle',
           activeThinkingId: null,
           pendingPermission: null,
           pendingComputerUsePermission: null,
           elapsedTimer: null,
+          apiRetry: null,
+          streamingFallback: null,
         }))
-        const notification = wasAgentRunning
-          ? buildAgentCompletionNotification(sessionId, completionMessages, text)
+        useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
+        const notification = wasAgentRunning && appendedCompletionMessage
+          ? buildAgentCompletionNotification(sessionId, finalMessages, text)
           : null
         if (notification) {
           void notifyDesktop({
@@ -872,6 +2082,26 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             target: { type: 'session', sessionId },
           })
         }
+        refreshCompletedTranscriptHistory(get, sessionId)
+        for (const queuedMessage of get().sessions[sessionId]?.queuedUserMessages ?? []) {
+          get().sendQueuedUserMessage(sessionId, queuedMessage.id)
+        }
+        break
+      }
+
+      case 'user_message_replay': {
+        update((session) => {
+          const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
+          const baseMessages = pendingText.trim()
+            ? appendAssistantTextMessage(session.messages, pendingText, Date.now())
+            : session.messages
+          return {
+            messages: appendReplayedUserMessage(baseMessages, msg.content, Date.now()),
+            ...(pendingText.trim() ? { streamingText: '' } : {}),
+            activeThinkingId: null,
+            suppressNextTaskNotificationResponse: false,
+          }
+        })
         break
       }
 
@@ -882,14 +2112,29 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           if (pendingText.trim()) {
             newMessages = appendAssistantTextMessage(newMessages, pendingText, Date.now())
           }
-          newMessages = [...newMessages, { id: nextId(), type: 'error', message: msg.message, code: msg.code, timestamp: Date.now() }]
+          newMessages = dropTailCompactingCompactSummary(newMessages)
+          newMessages = [
+            ...newMessages,
+            {
+              id: nextId(),
+              type: 'error',
+              message: msg.message,
+              code: msg.code,
+              ...(msg.businessErrorCode ? { businessErrorCode: msg.businessErrorCode } : {}),
+              timestamp: Date.now(),
+            },
+          ]
           return {
             messages: newMessages,
             chatState: 'idle',
             activeThinkingId: null,
             streamingText: '',
+            statusVerb: '',
             pendingPermission: null,
             pendingComputerUsePermission: null,
+            apiRetry: null,
+            streamingFallback: null,
+            suppressNextTaskNotificationResponse: false,
           }
         })
         useTabStore.getState().updateTabStatus(sessionId, 'error')
@@ -919,7 +2164,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
       case 'system_notification':
         if (msg.subtype === 'slash_commands' && Array.isArray(msg.data)) {
-          update(() => ({ slashCommands: msg.data as Array<{ name: string; description: string }> }))
+          const incomingCommands = normalizeSlashCommandList(msg.data)
+          update((session) => ({
+            slashCommands: mergeSlashCommandUpdates(session.slashCommands, incomingCommands),
+          }))
+          void sessionsApi.getSlashCommands(sessionId)
+            .then(({ commands }) => {
+              if (!get().sessions[sessionId]) return
+              set((s) => ({
+                sessions: updateSessionIn(s.sessions, sessionId, () => ({
+                  slashCommands: normalizeSlashCommandList(commands),
+                })),
+              }))
+            })
+            .catch(() => {
+              // Keep the last known local + CLI union when the authoritative refresh is unavailable.
+            })
         }
         if (msg.subtype === 'session_cleared') {
           const session = get().sessions[sessionId]
@@ -937,65 +2197,178 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             elapsedTimer: null,
             elapsedSeconds: 0,
             statusVerb: '',
+            apiRetry: null,
+            streamingFallback: null,
             tokenUsage: { input_tokens: 0, output_tokens: 0 },
+            streamingResponseChars: 0,
             slashCommands: [],
+            activeGoal: null,
+            backgroundAgentTasks: {},
+            agentTaskNotifications: {},
           }))
           clearPendingDelta(sessionId)
           clearPendingTaskToolUseIds(sessionId)
+          clearPendingToolParentUseIds(sessionId)
           useCLITaskStore.getState().clearTasks(sessionId)
           useSessionStore.getState().updateSessionTitle(sessionId, 'New Session')
+          useSessionStore.getState().updateSessionMessageCount(sessionId, 0)
           useTabStore.getState().updateTabTitle(sessionId, 'New Session')
           useTabStore.getState().updateTabStatus(sessionId, 'idle')
         }
         if (msg.subtype === 'compact_boundary') {
+          const metadata = compactMetadataFromUnknown(msg.data)
           update((session) => ({
-            messages: [
-              ...session.messages,
+            chatState: session.chatState === 'compacting' ? 'thinking' : session.chatState,
+            statusVerb: session.chatState === 'compacting' ? '' : session.statusVerb,
+            compactCount: (session.compactCount ?? 0) + 1,
+            messages: appendOrUpdateTailCompactSummary(
+              session.messages,
               {
-                id: nextId(),
-                type: 'system',
-                content: typeof msg.message === 'string' && msg.message.trim()
+                title: typeof msg.message === 'string' && msg.message.trim()
                   ? msg.message
                   : 'Context compacted',
-                timestamp: Date.now(),
+                phase: 'complete',
+                ...metadata,
               },
-            ],
+              Date.now(),
+            ),
           }))
+        }
+        if (msg.subtype === 'compact_summary') {
+          const summary = extractCompactSummaryContent(msg.message)
+          if (summary) {
+            update((session) => ({
+              messages: appendOrUpdateTailCompactSummary(
+                session.messages,
+                {
+                  title: 'Context compacted',
+                  phase: 'complete',
+                  summary,
+                  ...compactMetadataFromUnknown(msg.data),
+                },
+                Date.now(),
+              ),
+            }))
+          }
+        }
+        if (msg.subtype === 'memory_saved') {
+          const files = normalizeMemoryEventFiles(msg.data)
+          if (files.length > 0) {
+            update((session) => ({
+              messages: [
+                ...session.messages,
+                {
+                  id: nextId(),
+                  type: 'memory_event',
+                  event: 'saved',
+                  files,
+                  message: msg.message,
+                  teamCount: normalizeMemoryTeamCount(msg.data),
+                  timestamp: Date.now(),
+                },
+              ],
+            }))
+          }
+        }
+        if (msg.subtype === 'goal_event') {
+          const goalEvent = normalizeGoalEventData(msg.data, msg.message)
+          if (goalEvent) {
+            update((session) => ({
+              activeGoal: applyGoalEventToActiveGoal(session.activeGoal ?? null, goalEvent, Date.now()),
+              messages: [
+                ...session.messages,
+                {
+                  id: nextId(),
+                  type: 'goal_event',
+                  ...goalEvent,
+                  timestamp: Date.now(),
+                },
+              ],
+            }))
+          }
+        }
+        if ((msg.subtype === 'task_started' || msg.subtype === 'task_progress') && msg.data && typeof msg.data === 'object') {
+          const taskEvent = normalizeBackgroundAgentTaskEvent(msg.data, msg.subtype)
+          if (taskEvent) {
+            const now = Date.now()
+            let shouldUpdateIdleTabStatus = false
+            let hasRunningBackgroundAgentsAfterUpdate = false
+            update((session) => {
+              const backgroundAgentTasks = upsertBackgroundAgentTask(
+                session.backgroundAgentTasks ?? {},
+                taskEvent,
+                now,
+              )
+              shouldUpdateIdleTabStatus = session.chatState === 'idle'
+              hasRunningBackgroundAgentsAfterUpdate = hasRunningBackgroundTasks(backgroundAgentTasks)
+              const task = backgroundAgentTasks[taskEvent.taskId]
+              return buildBackgroundTaskSessionUpdate(session, backgroundAgentTasks, task, now)
+            })
+            if (shouldUpdateIdleTabStatus) {
+              useTabStore.getState().updateTabStatus(
+                sessionId,
+                hasRunningBackgroundAgentsAfterUpdate ? 'running' : 'idle',
+              )
+            }
+          }
         }
         if (msg.subtype === 'task_notification' && msg.data && typeof msg.data === 'object') {
           const data = msg.data as Record<string, unknown>
+          const taskEvent = normalizeBackgroundAgentTaskEvent(data, 'task_notification')
           const toolUseId =
             typeof data.tool_use_id === 'string' && data.tool_use_id.trim()
               ? data.tool_use_id
               : null
+          const taskResult = readNonEmptyString(data, 'result')
           const taskStatus = data.status
-          if (
-            toolUseId &&
-            (taskStatus === 'completed' ||
-              taskStatus === 'failed' ||
-              taskStatus === 'stopped')
-          ) {
-            update((session) => ({
-              agentTaskNotifications: {
-                ...session.agentTaskNotifications,
-                [toolUseId]: {
-                  taskId:
-                    typeof data.task_id === 'string' && data.task_id.trim()
-                      ? data.task_id
-                      : toolUseId,
-                  toolUseId,
-                  status: taskStatus,
-                  summary:
-                    typeof data.summary === 'string' && data.summary.trim()
-                      ? data.summary
-                      : undefined,
-                  outputFile:
-                    typeof data.output_file === 'string' && data.output_file.trim()
-                      ? data.output_file
-                      : undefined,
+          if (taskEvent) {
+            const now = Date.now()
+            let shouldUpdateIdleTabStatus = false
+            let hasRunningBackgroundAgentsAfterUpdate = false
+            update((session) => {
+              const backgroundAgentTasks = upsertBackgroundAgentTask(
+                session.backgroundAgentTasks ?? {},
+                taskEvent,
+                now,
+              )
+              shouldUpdateIdleTabStatus = session.chatState === 'idle'
+              hasRunningBackgroundAgentsAfterUpdate = hasRunningBackgroundTasks(backgroundAgentTasks)
+              const task = backgroundAgentTasks[taskEvent.taskId]
+              const suppressNotificationResponse =
+                (taskEvent.status === 'completed' ||
+                  taskEvent.status === 'failed' ||
+                  taskEvent.status === 'stopped') &&
+                shouldSuppressTaskNotificationResponse(session)
+              return {
+                ...buildBackgroundTaskSessionUpdate(session, backgroundAgentTasks, task, now),
+                ...(suppressNotificationResponse ? { suppressNextTaskNotificationResponse: true } : {}),
+                agentTaskNotifications: {
+                  ...session.agentTaskNotifications,
+                  ...(toolUseId &&
+                  (taskStatus === 'completed' ||
+                    taskStatus === 'failed' ||
+                    taskStatus === 'stopped')
+                    ? {
+                        [toolUseId]: {
+                          taskId: taskEvent.taskId,
+                          toolUseId,
+                          status: taskStatus,
+                          summary: taskEvent.summary,
+                          result: taskResult,
+                          outputFile: taskEvent.outputFile,
+                          usage: taskEvent.usage,
+                        },
+                      }
+                    : {}),
                 },
-              },
-            }))
+              }
+            })
+            if (shouldUpdateIdleTabStatus) {
+              useTabStore.getState().updateTabStatus(
+                sessionId,
+                hasRunningBackgroundAgentsAfterUpdate ? 'running' : 'idle',
+              )
+            }
           }
         }
         break
@@ -1016,12 +2389,22 @@ function updateOptimisticSessionTitle(sessionId: string, content: string): void 
   useTabStore.getState().updateTabTitle(sessionId, title)
 }
 
-// ─── History mapping helpers (unchanged from original) ─────────
+// ─── History mapping helpers ─────────
 
 type AssistantHistoryBlock = { type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }
-type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string }; mimeType?: string; media_type?: string; name?: string }
+type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string; media_type?: string }; mimeType?: string; media_type?: string; name?: string }
 
 const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
+const GOAL_EVENT_ACTIONS = new Set<GoalEventAction>([
+  'created',
+  'replaced',
+  'status',
+  'paused',
+  'resumed',
+  'completed',
+  'cleared',
+  'message',
+])
 
 /**
  * Check if text is a teammate-message (internal agent-to-agent communication).
@@ -1030,6 +2413,130 @@ const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification
  */
 function isTeammateMessage(text: string): boolean {
   return text.includes('<teammate-message') && text.includes('</teammate-message>')
+}
+
+const SIMPLE_IMAGE_SOURCE_RE = /^\[Image source: (.+)\]$/
+const DETAILED_IMAGE_SOURCE_RE = /^\[Image: source: (.+?)(?:, original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by \d+(?:\.\d+)? to map to original image\.)?\]$/
+const IMAGE_RESIZE_METADATA_RE = /^\[Image: original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by \d+(?:\.\d+)? to map to original image\.\]$/
+const VISUAL_SELECTION_PROMPT_HEADER = '请根据截图中编号 1 的蓝色标注修改本地前端。'
+const VISUAL_SELECTION_PROMPT_FOOTER = '请优先依据截图里的编号标注定位元素，selector 只作为辅助线索。'
+
+type VisualSelectionHistoryDisplay = {
+  displayName: string
+  selector?: string
+  note?: string
+}
+
+function getHistoryImageMediaType(block: UserHistoryBlock): string {
+  const mediaType = block.source?.media_type ?? block.mimeType ?? block.media_type
+  return mediaType?.startsWith('image/') ? mediaType : 'image/png'
+}
+
+function normalizeHistoryImageData(data: string | undefined, mediaType: string): string | undefined {
+  const trimmed = data?.trim()
+  if (!trimmed) return undefined
+  if (/^data:image\//i.test(trimmed)) return trimmed
+  return `data:${mediaType};base64,${trimmed}`
+}
+
+function extractImageMetadataSourcePath(text: string): string | undefined {
+  const trimmed = text.trim()
+  const simpleMatch = trimmed.match(SIMPLE_IMAGE_SOURCE_RE)
+  if (simpleMatch?.[1]) return simpleMatch[1]
+  const detailedMatch = trimmed.match(DETAILED_IMAGE_SOURCE_RE)
+  if (detailedMatch?.[1]) return detailedMatch[1]
+  return undefined
+}
+
+function isGeneratedImageMetadataText(text: string): boolean {
+  return Boolean(extractImageMetadataSourcePath(text)) || IMAGE_RESIZE_METADATA_RE.test(text.trim())
+}
+
+/**
+ * Strip the generated image-metadata lines (`[Image source: …]`, resize notes)
+ * that the server appends to a user turn's text. The optimistic message never
+ * carried them, so live-replay dedupe must normalize them away first — otherwise
+ * `findCurrentTurnUserMessageIndex` never matches and the raw prompt leaks in as
+ * a duplicate bubble. This was most visible on Windows, where the appended
+ * absolute upload path (`[Image source: C:\Users\…\uploads\…png]`) made the
+ * mismatch obvious, but it affects any message that carries an image.
+ */
+export function stripGeneratedImageMetadataLines(text: string): string {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .filter((line) => !isGeneratedImageMetadataText(line))
+    .join('\n')
+    .trim()
+}
+
+function parseVisualSelectionHistoryPrompt(text: string): VisualSelectionHistoryDisplay | null {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n')
+  if (lines[0]?.trim() !== VISUAL_SELECTION_PROMPT_HEADER) return null
+
+  let displayName: string | undefined
+  let selector: string | undefined
+  let note: string | undefined
+
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index]?.trim() ?? ''
+    if (line.startsWith('目标元素：')) {
+      displayName = line.slice('目标元素：'.length).trim()
+    } else if (line.startsWith('Selector：')) {
+      selector = line.slice('Selector：'.length).trim()
+    } else if (line === '用户注释：') {
+      const noteLines: string[] = []
+      for (let noteIndex = index + 1; noteIndex < lines.length; noteIndex += 1) {
+        const noteLine = lines[noteIndex] ?? ''
+        if (noteLine.trim() === VISUAL_SELECTION_PROMPT_FOOTER) break
+        noteLines.push(noteLine)
+      }
+      const trimmedNote = noteLines.join('\n').trim()
+      note = trimmedNote || undefined
+      break
+    }
+  }
+
+  return displayName
+    ? {
+        displayName,
+        ...(selector ? { selector } : {}),
+        ...(note ? { note } : {}),
+      }
+    : null
+}
+
+function applyVisualSelectionHistoryDisplay(attachments: UIAttachment[], display: VisualSelectionHistoryDisplay): void {
+  const imageAttachment = attachments.find((attachment) => attachment.type === 'image')
+  if (!imageAttachment) return
+  imageAttachment.name = display.displayName
+  if (display.selector) imageAttachment.quote = display.selector
+  if (display.note) imageAttachment.note = display.note
+}
+
+function normalizeHistoryImageAttachment(block: UserHistoryBlock): UIAttachment {
+  const mediaType = getHistoryImageMediaType(block)
+  return {
+    type: 'image',
+    name: block.name || 'image',
+    data: normalizeHistoryImageData(block.source?.data, mediaType),
+    mimeType: mediaType,
+  }
+}
+
+function applyImageMetadataSourcePaths(attachments: UIAttachment[], sourcePaths: string[]): void {
+  let imageIndex = 0
+  for (const sourcePath of sourcePaths) {
+    const attachment = attachments
+      .slice(imageIndex)
+      .find((candidate) => candidate.type === 'image')
+    if (!attachment) return
+    imageIndex = attachments.indexOf(attachment) + 1
+    attachment.path = sourcePath
+    if (!attachment.name || attachment.name === 'image') {
+      attachment.name = getReferenceName(sourcePath)
+    }
+  }
 }
 
 function extractHistoryTextBlocks(content: unknown): string[] {
@@ -1046,6 +2553,76 @@ function extractHistoryTextBlocks(content: unknown): string[] {
     })
     .map((text) => text.trim())
     .filter(Boolean)
+}
+
+const COMMAND_METADATA_TAGS = new Set([
+  'command-name',
+  'command-message',
+  'command-args',
+  'local-command-caveat',
+  'skill-format',
+])
+const COMMAND_METADATA_BLOCK_RE = /<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>\s*/gi
+
+function hasCommandMetadataTag(text: string): boolean {
+  return (
+    text.includes('<command-name>') ||
+    text.includes('<command-message>') ||
+    text.includes('<command-args>') ||
+    text.includes('<local-command-caveat>') ||
+    text.includes('<skill-format>')
+  )
+}
+
+function isOnlyKnownCommandMetadata(text: string): boolean {
+  const remainder = text.replace(COMMAND_METADATA_BLOCK_RE, (match, tag: string) => (
+    COMMAND_METADATA_TAGS.has(tag.toLowerCase()) ? '' : match
+  ))
+  return remainder.trim().length === 0
+}
+
+function formatCommandMetadataDisplayText(
+  commandName: string,
+  args: string,
+  skillFormat: boolean,
+  commandMessage?: string,
+): string {
+  if (skillFormat) {
+    return `Skill(${commandMessage || commandName.replace(/^\//, '')})`
+  }
+
+  const normalizedName = commandName.startsWith('/') ? commandName : `/${commandName}`
+  return [normalizedName, args.trim()].filter(Boolean).join(' ')
+}
+
+function parseCommandMetadataText(text: string): string | null {
+  const trimmed = text.trim()
+  if (!hasCommandMetadataTag(trimmed)) return null
+  if (!isOnlyKnownCommandMetadata(trimmed)) return null
+
+  const commandName = readXmlTag(trimmed, 'command-name')
+  if (!commandName) return null
+
+  const args = readXmlTag(trimmed, 'command-args') ?? ''
+  const commandMessage = readXmlTag(trimmed, 'command-message')
+  const skillFormat = readXmlTag(trimmed, 'skill-format') === 'true'
+  return formatCommandMetadataDisplayText(commandName, args, skillFormat, commandMessage)
+}
+
+function getCommandMetadataDisplayText(content: unknown): string | null {
+  const textBlocks = extractHistoryTextBlocks(content)
+  if (textBlocks.length === 0) return null
+
+  const displayBlocks = textBlocks.map(parseCommandMetadataText)
+  if (displayBlocks.some((text) => text === null)) return null
+  return displayBlocks.join('\n')
+}
+
+function shouldHideCommandMetadataContent(content: unknown): boolean {
+  const textBlocks = extractHistoryTextBlocks(content)
+  if (textBlocks.length === 0) return false
+  if (!textBlocks.some(hasCommandMetadataTag)) return false
+  return getCommandMetadataDisplayText(content) === null
 }
 
 function isTaskNotificationContent(content: unknown): boolean {
@@ -1073,6 +2650,308 @@ function readXmlTag(xml: string, tag: string): string | undefined {
   return match?.[1] ? decodeXmlText(match[1].trim()) : undefined
 }
 
+function readNonEmptyString(record: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function readRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
+function normalizeHistoryToolResultContent(content: unknown, toolUseResult: unknown): unknown {
+  const result = readRecord(toolUseResult)
+  const answers = readRecord(result?.answers)
+  if (!result || !answers || !Array.isArray(result.questions)) return content
+  return {
+    questions: result.questions,
+    answers,
+  }
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> | null {
+  const record = readRecord(value)
+  if (record) return record
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed.startsWith('{')) return null
+  try {
+    return readRecord(JSON.parse(trimmed))
+  } catch {
+    return null
+  }
+}
+
+function findToolUseMessage(messages: UIMessage[], toolUseId: string): ToolCall | null {
+  return messages.find((
+    message,
+  ): message is ToolCall =>
+    message.type === 'tool_use' &&
+    message.toolUseId === toolUseId) ?? null
+}
+
+function getStoppedBackgroundTaskFromToolResult(
+  messages: UIMessage[],
+  toolUseId: string,
+  content: unknown,
+): (Partial<BackgroundAgentTask> & Pick<BackgroundAgentTask, 'taskId' | 'status'>) | null {
+  const toolUse = findToolUseMessage(messages, toolUseId)
+  if (!toolUse || !TASK_STOP_TOOL_NAMES.has(toolUse.toolName)) return null
+
+  const input = readRecord(toolUse.input) ?? {}
+  const output = parseJsonRecord(content) ?? {}
+  const taskId = readNonEmptyString(output, 'task_id', 'taskId') ??
+    readNonEmptyString(input, 'task_id', 'taskId', 'shell_id', 'shellId')
+  if (!taskId) return null
+
+  return {
+    taskId,
+    status: 'stopped',
+    taskType: readNonEmptyString(output, 'task_type', 'taskType'),
+    description: readNonEmptyString(output, 'command', 'description', 'message'),
+    summary: readNonEmptyString(output, 'message'),
+  }
+}
+
+function normalizeBackgroundTaskUsage(value: unknown): BackgroundAgentTaskUsage | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  const usage: BackgroundAgentTaskUsage = {}
+  const totalTokens = record.total_tokens ?? record.totalTokens
+  const toolUses = record.tool_uses ?? record.toolUses
+  const durationMs = record.duration_ms ?? record.durationMs
+  if (typeof totalTokens === 'number') usage.totalTokens = totalTokens
+  if (typeof toolUses === 'number') usage.toolUses = toolUses
+  if (typeof durationMs === 'number') usage.durationMs = durationMs
+  return Object.keys(usage).length > 0 ? usage : undefined
+}
+
+function normalizeBackgroundAgentTaskEvent(
+  data: unknown,
+  subtype: string,
+): Partial<BackgroundAgentTask> & Pick<BackgroundAgentTask, 'taskId' | 'status'> | null {
+  if (!data || typeof data !== 'object') return null
+  const record = data as Record<string, unknown>
+  const taskId = readNonEmptyString(record, 'task_id', 'taskId')
+  const toolUseId = readNonEmptyString(record, 'tool_use_id', 'toolUseId')
+  const id = taskId ?? toolUseId
+  if (!id) return null
+
+  const rawStatus = readNonEmptyString(record, 'status')
+  const status = rawStatus === 'completed' || rawStatus === 'failed' || rawStatus === 'stopped'
+    ? rawStatus
+    : rawStatus === 'killed'
+      ? 'stopped'
+      : subtype === 'task_notification'
+        ? 'completed'
+        : 'running'
+
+  return {
+    taskId: id,
+    toolUseId,
+    status,
+    description: readNonEmptyString(record, 'description', 'message', 'title'),
+    taskType: readNonEmptyString(record, 'task_type', 'taskType'),
+    workflowName: readNonEmptyString(record, 'workflow_name', 'workflowName'),
+    prompt: readNonEmptyString(record, 'prompt'),
+    result: readNonEmptyString(record, 'result'),
+    summary: readNonEmptyString(record, 'summary'),
+    lastToolName: readNonEmptyString(record, 'last_tool_name', 'lastToolName'),
+    outputFile: readNonEmptyString(record, 'output_file', 'outputFile'),
+    usage: normalizeBackgroundTaskUsage(record.usage),
+  }
+}
+
+function upsertBackgroundAgentTask(
+  current: Record<string, BackgroundAgentTask>,
+  event: Partial<BackgroundAgentTask> & Pick<BackgroundAgentTask, 'taskId' | 'status'>,
+  now: number,
+): Record<string, BackgroundAgentTask> {
+  const existingKey = current[event.taskId]
+    ? event.taskId
+    : event.toolUseId
+      ? Object.keys(current).find((key) =>
+        key === event.toolUseId || current[key]?.toolUseId === event.toolUseId)
+      : undefined
+  const existing = existingKey ? current[existingKey] : undefined
+  const next = { ...current }
+  if (existingKey && existingKey !== event.taskId) {
+    delete next[existingKey]
+  }
+  const startsNewLifecycle = Boolean(existing && (
+    (existing.status !== 'running' && event.status === 'running') ||
+    (existing.status !== 'running' && event.status !== 'running' && hasTerminalTaskPayloadChanged(existing, event))
+  ))
+  return {
+    ...next,
+    [event.taskId]: {
+      taskId: event.taskId,
+      toolUseId: event.toolUseId ?? existing?.toolUseId,
+      status: event.status,
+      description: event.description ?? existing?.description,
+      taskType: event.taskType ?? existing?.taskType,
+      workflowName: event.workflowName ?? existing?.workflowName,
+      prompt: event.prompt ?? existing?.prompt,
+      result: event.result ?? existing?.result,
+      summary: event.summary ?? existing?.summary,
+      lastToolName: event.lastToolName ?? existing?.lastToolName,
+      outputFile: event.outputFile ?? existing?.outputFile,
+      usage: event.usage ?? existing?.usage,
+      startedAt: startsNewLifecycle ? now : existing?.startedAt ?? now,
+      updatedAt: now,
+    },
+  }
+}
+
+function hasTerminalTaskPayloadChanged(
+  existing: BackgroundAgentTask,
+  event: Partial<BackgroundAgentTask> & Pick<BackgroundAgentTask, 'taskId' | 'status'>,
+): boolean {
+  return event.summary != null && event.summary !== existing.summary ||
+    event.result != null && event.result !== existing.result ||
+    event.outputFile != null && event.outputFile !== existing.outputFile ||
+    event.usage != null && !areBackgroundTaskUsageEqual(event.usage, existing.usage)
+}
+
+function areBackgroundTaskUsageEqual(
+  a: BackgroundAgentTaskUsage | undefined,
+  b: BackgroundAgentTaskUsage | undefined,
+): boolean {
+  return a?.totalTokens === b?.totalTokens &&
+    a?.toolUses === b?.toolUses &&
+    a?.durationMs === b?.durationMs
+}
+
+function normalizeGoalEventData(
+  data: unknown,
+  fallbackMessage?: string,
+): Omit<Extract<UIMessage, { type: 'goal_event' }>, 'id' | 'type' | 'timestamp'> | null {
+  if (!data || typeof data !== 'object') {
+    const message = typeof fallbackMessage === 'string' ? fallbackMessage.trim() : ''
+    return message ? { action: 'message', message } : null
+  }
+
+  const record = data as Record<string, unknown>
+  const action = typeof record.action === 'string' && GOAL_EVENT_ACTIONS.has(record.action as GoalEventAction)
+    ? record.action as GoalEventAction
+    : 'message'
+  const read = (key: string) =>
+    typeof record[key] === 'string' && record[key].trim()
+      ? record[key].trim()
+      : undefined
+  return {
+    action,
+    status: read('status'),
+    objective: read('objective'),
+    budget: read('budget'),
+    elapsed: read('elapsed'),
+    continuations: read('continuations'),
+    message: read('message') ?? (typeof fallbackMessage === 'string' ? fallbackMessage.trim() : undefined),
+  }
+}
+
+function applyGoalEventToActiveGoal(
+  current: ActiveGoalState | null,
+  event: Omit<Extract<UIMessage, { type: 'goal_event' }>, 'id' | 'type' | 'timestamp'>,
+  updatedAt: number,
+): ActiveGoalState | null {
+  if (event.action === 'cleared') return null
+  if (
+    event.action === 'message' &&
+    event.message &&
+    /no (active )?goal/i.test(event.message)
+  ) {
+    return current
+  }
+  if (event.action === 'message') return current
+  const baseGoal = event.action === 'created' || event.action === 'replaced' ? null : current
+
+  return {
+    action: event.action,
+    status: event.status ?? (event.action === 'completed' ? 'complete' : baseGoal?.status),
+    objective: event.objective ?? baseGoal?.objective,
+    budget: event.budget ?? baseGoal?.budget,
+    elapsed: event.elapsed ?? baseGoal?.elapsed,
+    continuations: event.continuations ?? baseGoal?.continuations,
+    message: event.message ?? baseGoal?.message,
+    updatedAt,
+  }
+}
+
+function deriveActiveGoalFromMessages(messages: UIMessage[]): ActiveGoalState | null {
+  return messages.reduce<ActiveGoalState | null>((activeGoal, message) => {
+    if (message.type !== 'goal_event') return activeGoal
+    return applyGoalEventToActiveGoal(activeGoal, message, message.timestamp)
+  }, null)
+}
+
+function extractLocalCommandText(content: unknown): string | null {
+  if (typeof content !== 'string') return null
+  return content.trim() || null
+}
+
+function parseGoalCommandFromLocalCommand(content: unknown): { name: string; args: string } | null {
+  const text = extractLocalCommandText(content)
+  if (!text) return null
+  const commandName = readXmlTag(text, 'command-name')
+  if (!commandName) return null
+  return {
+    name: commandName.replace(/^\//, ''),
+    args: readXmlTag(text, 'command-args') ?? '',
+  }
+}
+
+function formatVisibleLocalCommand(command: { name: string; args: string }): string {
+  const normalizedName = command.name.replace(/^\//, '')
+  const args = command.args.trim()
+  return `/${normalizedName}${args ? ` ${args}` : ''}`
+}
+
+function extractLocalCommandOutputText(content: unknown): string | null {
+  const text = extractLocalCommandText(content)
+  if (!text) return null
+  return readXmlTag(text, 'local-command-stdout') ?? readXmlTag(text, 'local-command-stderr') ?? null
+}
+
+function isCompactLocalCommandOutput(output: string): boolean {
+  return output.trim() === 'Compacted'
+}
+
+function parseGoalEventFromLocalCommandOutput(
+  output: string,
+  command: { name: string; args: string } | null,
+): Omit<Extract<UIMessage, { type: 'goal_event' }>, 'id' | 'type' | 'timestamp'> | null {
+  if (command && command.name !== 'goal') return null
+  const trimmed = output.trim()
+  if (!trimmed) return null
+
+  if (trimmed === 'Goal cleared.' || trimmed.startsWith('Goal cleared:')) return { action: 'cleared', message: trimmed }
+  if (trimmed === 'Goal marked complete.') return { action: 'completed', message: trimmed }
+  if (trimmed === 'No active goal.') return { action: 'message', message: trimmed }
+  if (trimmed.startsWith('Goal continuing:')) {
+    return {
+      action: 'status',
+      status: 'continuing',
+      message: trimmed,
+    }
+  }
+  if (trimmed.startsWith('Goal set:')) {
+    const objective = trimmed.slice('Goal set:'.length).trim()
+    return {
+      action: 'created',
+      status: 'active',
+      objective: objective || undefined,
+      message: trimmed,
+    }
+  }
+
+  return command?.name === 'goal' ? { action: 'message', message: trimmed } : null
+}
+
 function extractTaskNotification(content: unknown): AgentTaskNotification | null {
   const xml = extractHistoryTextBlocks(content)
     .map((text) => extractTaskNotificationXml(text))
@@ -1090,12 +2969,14 @@ function extractTaskNotification(content: unknown): AgentTaskNotification | null
 
   const taskId = readXmlTag(xml, 'task-id') || toolUseId
   const summary = readXmlTag(xml, 'summary')
+  const result = readXmlTag(xml, 'result')
   const outputFile = readXmlTag(xml, 'output-file')
   return {
     taskId,
     toolUseId,
     status,
     ...(summary ? { summary } : {}),
+    ...(result ? { result } : {}),
     ...(outputFile ? { outputFile } : {}),
   }
 }
@@ -1105,6 +2986,33 @@ function agentNotificationRecordFromList(
 ): Record<string, AgentTaskNotification> {
   return Object.fromEntries(
     notifications.map((notification) => [notification.toolUseId, notification]),
+  )
+}
+
+function backgroundTaskRecordFromNotifications(
+  notifications: AgentTaskNotification[],
+): Record<string, BackgroundAgentTask> {
+  return notifications.reduce<Record<string, BackgroundAgentTask>>((tasks, notification) => {
+    const parsedTimestamp = notification.timestamp ? new Date(notification.timestamp).getTime() : NaN
+    const now = Number.isFinite(parsedTimestamp) ? parsedTimestamp : Date.now()
+    return upsertBackgroundAgentTask(tasks, {
+      taskId: notification.taskId,
+      toolUseId: notification.toolUseId,
+      status: notification.status,
+      summary: notification.summary,
+      outputFile: notification.outputFile,
+      usage: notification.usage,
+    }, now)
+  }, {})
+}
+
+function mergeBackgroundAgentTaskRecords(
+  current: Record<string, BackgroundAgentTask>,
+  restored: Record<string, BackgroundAgentTask>,
+): Record<string, BackgroundAgentTask> {
+  return Object.values(restored).reduce(
+    (tasks, task) => upsertBackgroundAgentTask(tasks, task, task.updatedAt),
+    current,
   )
 }
 
@@ -1139,13 +3047,24 @@ function pushAssistantHistoryText(
   content: string,
   timestamp: number,
   model?: string,
+  transcriptMessageId?: string,
 ): void {
   if (!content.trim()) return
 
   const last = messages[messages.length - 1]
-  if (last?.type === 'assistant_text') {
+  const canMergeIntoLast =
+    last?.type === 'assistant_text' &&
+    (
+      transcriptMessageId
+        ? last.transcriptMessageId === transcriptMessageId
+        : !last.transcriptMessageId
+    )
+  if (canMergeIntoLast) {
     last.content += content
     if (model && !last.model) last.model = model
+    if (transcriptMessageId && !last.transcriptMessageId) {
+      last.transcriptMessageId = transcriptMessageId
+    }
     return
   }
 
@@ -1154,6 +3073,7 @@ function pushAssistantHistoryText(
     type: 'assistant_text',
     content,
     timestamp,
+    ...(transcriptMessageId ? { transcriptMessageId } : {}),
     ...(model ? { model } : {}),
   })
 }
@@ -1207,6 +3127,122 @@ function extractLeadingFileReferences(text: string): {
     attachments,
     modelContent: text,
   }
+}
+
+export function appendReplayedUserMessage(
+  messages: UIMessage[],
+  content: string,
+  timestamp: number,
+): UIMessage[] {
+  // The replayed text carries server-appended image-metadata lines that the
+  // optimistic message never had. Normalize them away (same as the history
+  // mapping) so the dedupe below can match the already-rendered message instead
+  // of appending the raw prompt — paths and all — as a duplicate bubble.
+  const sanitized = stripGeneratedImageMetadataLines(content) || content.trim()
+  const parsed = extractLeadingFileReferences(sanitized)
+  const displayContent = parsed.content.trim() || sanitized
+  if (!displayContent) return messages
+
+  const modelContent = parsed.modelContent ?? sanitized
+  const currentTurnUserIndex = findCurrentTurnUserMessageIndex(messages, modelContent)
+  if (currentTurnUserIndex >= 0) {
+    const optimisticMessage = messages[currentTurnUserIndex]
+    if (optimisticMessage?.type === 'user_text' && optimisticMessage.optimisticQueued) {
+      const { optimisticQueued: _optimisticQueued, ...confirmedMessage } = optimisticMessage
+      return [
+        ...messages.slice(0, currentTurnUserIndex),
+        confirmedMessage,
+        ...messages.slice(currentTurnUserIndex + 1),
+      ]
+    }
+    return messages
+  }
+
+  return [
+    ...messages,
+    {
+      id: nextId(),
+      type: 'user_text',
+      content: displayContent,
+      ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
+      ...(parsed.attachments ? { attachments: parsed.attachments } : {}),
+      timestamp,
+    },
+  ]
+}
+
+function appendOptimisticQueuedUserMessage(
+  messages: UIMessage[],
+  message: QueuedUserMessage,
+  timestamp: number,
+): UIMessage[] {
+  const displayContent = message.displayContent.trim()
+  const modelContent = message.content.trim()
+  const attachments = mapQueuedDisplayAttachments(message.displayAttachments)
+  if (!displayContent && !attachments) return messages
+
+  return [
+    ...messages,
+    {
+      id: nextId(),
+      type: 'user_text',
+      content: displayContent,
+      ...(modelContent && modelContent !== displayContent ? { modelContent } : {}),
+      ...(attachments ? { attachments } : {}),
+      timestamp,
+      optimisticQueued: true,
+    },
+  ]
+}
+
+function mapQueuedDisplayAttachments(attachments?: AttachmentRef[]): UIAttachment[] | undefined {
+  if (!attachments?.length) return undefined
+  return attachments.map((attachment) => ({
+    type: attachment.type,
+    name: attachment.name || attachment.path || attachment.mimeType || attachment.type,
+    path: attachment.path,
+    data: attachment.data,
+    mimeType: attachment.mimeType,
+    isDirectory: attachment.isDirectory,
+    lineStart: attachment.lineStart,
+    lineEnd: attachment.lineEnd,
+    note: attachment.note,
+    quote: attachment.quote,
+  }))
+}
+
+function findCurrentTurnUserMessageIndex(
+  messages: UIMessage[],
+  modelContent: string,
+): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.type !== 'user_text') {
+      continue
+    }
+    return (message.modelContent ?? message.content).trim() === modelContent ? index : -1
+  }
+  return -1
+}
+
+function replaceQueuedMessageDisplayContent(
+  message: QueuedUserMessage,
+  nextDisplayContent: string,
+): string {
+  const currentModelContent = message.content.trim()
+  const currentDisplayContent = message.displayContent.trim()
+  if (!currentModelContent) return nextDisplayContent
+  if (!currentDisplayContent) return `${currentModelContent}\n\n${nextDisplayContent}`
+  if (currentModelContent === currentDisplayContent) return nextDisplayContent
+
+  const displaySuffix = `\n\n${currentDisplayContent}`
+  if (currentModelContent.endsWith(displaySuffix)) {
+    return `${currentModelContent.slice(0, -currentDisplayContent.length)}${nextDisplayContent}`
+  }
+  if (currentModelContent.endsWith(currentDisplayContent)) {
+    return `${currentModelContent.slice(0, -currentDisplayContent.length)}${nextDisplayContent}`
+  }
+  return `${currentModelContent}\n\n${nextDisplayContent}`
 }
 
 /**
@@ -1301,11 +3337,29 @@ export function mapHistoryMessagesToUiMessages(
   const includeTeammateMessages = options?.includeTeammateMessages === true
   const uiMessages: UIMessage[] = []
   let suppressTaskNotificationResponse = false
+  let pendingGoalCommand: { name: string; args: string } | null = null
 
   for (const msg of messages) {
     if (msg.type === 'user' && isTaskNotificationContent(msg.content)) {
       suppressTaskNotificationResponse = true
       continue
+    }
+    if (msg.type === 'user') {
+      const commandDisplayText = getCommandMetadataDisplayText(msg.content)
+      if (commandDisplayText) {
+        uiMessages.push({
+          id: msg.id || nextId(),
+          type: 'user_text',
+          content: commandDisplayText,
+          ...(msg.id ? { transcriptMessageId: msg.id } : {}),
+          timestamp: new Date(msg.timestamp).getTime(),
+        })
+        suppressTaskNotificationResponse = false
+        continue
+      }
+      if (shouldHideCommandMetadataContent(msg.content)) {
+        continue
+      }
     }
     if (msg.type === 'user') {
       suppressTaskNotificationResponse = false
@@ -1314,7 +3368,67 @@ export function mapHistoryMessagesToUiMessages(
     }
 
     const timestamp = new Date(msg.timestamp).getTime()
+    if (msg.type === 'system' && typeof msg.content === 'string') {
+      if (msg.content.trim() === 'Conversation compacted' || msg.content.trim() === 'Context compacted') {
+        const compactMessages = appendOrUpdateTailCompactSummary(
+          uiMessages,
+          { title: 'Context compacted', phase: 'complete' },
+          timestamp,
+        )
+        uiMessages.splice(0, uiMessages.length, ...compactMessages)
+        continue
+      }
+
+      const localCommand = parseGoalCommandFromLocalCommand(msg.content)
+      if (localCommand) {
+        pendingGoalCommand = localCommand
+        if (localCommand.name === 'goal') {
+          uiMessages.push({
+            id: msg.id || nextId(),
+            type: 'user_text',
+            content: formatVisibleLocalCommand(localCommand),
+            timestamp,
+          })
+        }
+        continue
+      }
+
+      const localCommandOutput = extractLocalCommandOutputText(msg.content)
+      if (localCommandOutput) {
+        const goalEvent = parseGoalEventFromLocalCommandOutput(localCommandOutput, pendingGoalCommand)
+        pendingGoalCommand = null
+        if (goalEvent) {
+          uiMessages.push({
+            id: msg.id || nextId(),
+            type: 'goal_event',
+            ...goalEvent,
+            timestamp,
+          })
+        }
+        continue
+      }
+    }
     if (msg.type === 'user' && typeof msg.content === 'string') {
+      const localCommandOutput = extractLocalCommandOutputText(msg.content)
+      if (localCommandOutput && isCompactLocalCommandOutput(localCommandOutput)) {
+        continue
+      }
+
+      const compactSummary = extractCompactSummaryContent(msg.content)
+      if (compactSummary) {
+        const compactMessages = appendOrUpdateTailCompactSummary(
+          uiMessages,
+          {
+            title: 'Context compacted',
+            phase: 'complete',
+            summary: compactSummary,
+          },
+          timestamp,
+        )
+        uiMessages.splice(0, uiMessages.length, ...compactMessages)
+        continue
+      }
+
       if (isTeammateMessage(msg.content)) {
         if (!includeTeammateMessages) continue
         const teammateContents = extractVisibleTeammateMessageContents(msg.content)
@@ -1323,6 +3437,7 @@ export function mapHistoryMessagesToUiMessages(
           id: msg.id || nextId(),
           type: 'user_text',
           content: teammateContents.join('\n\n'),
+          ...(msg.id ? { transcriptMessageId: msg.id } : {}),
           timestamp,
         })
         continue
@@ -1332,6 +3447,7 @@ export function mapHistoryMessagesToUiMessages(
         id: msg.id || nextId(),
         type: 'user_text',
         content: parsed.content,
+        ...(msg.id ? { transcriptMessageId: msg.id } : {}),
         ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
         ...(parsed.attachments ? { attachments: parsed.attachments } : {}),
         timestamp,
@@ -1340,42 +3456,102 @@ export function mapHistoryMessagesToUiMessages(
     }
     if (msg.type === 'assistant' && typeof msg.content === 'string') {
       if (!msg.content.trim()) continue
-      uiMessages.push({ id: msg.id || nextId(), type: 'assistant_text', content: msg.content, timestamp, model: msg.model })
+      uiMessages.push({
+        id: msg.id || nextId(),
+        type: 'assistant_text',
+        content: msg.content,
+        ...(msg.id ? { transcriptMessageId: msg.id } : {}),
+        timestamp,
+        model: msg.model,
+      })
       continue
     }
     if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
       for (const block of msg.content as AssistantHistoryBlock[]) {
         if (block.type === 'thinking' && block.thinking) uiMessages.push({ id: nextId(), type: 'thinking', content: block.thinking, timestamp })
-        else if (block.type === 'text' && block.text) pushAssistantHistoryText(uiMessages, block.text, timestamp, msg.model)
+        else if (block.type === 'text' && block.text) {
+          pushAssistantHistoryText(uiMessages, block.text, timestamp, msg.model, msg.id || undefined)
+        }
         else if (block.type === 'tool_use') uiMessages.push({ id: nextId(), type: 'tool_use', toolName: block.name ?? 'unknown', toolUseId: block.id ?? '', input: block.input, timestamp, parentToolUseId: msg.parentToolUseId })
       }
       continue
     }
     if ((msg.type === 'user' || msg.type === 'tool_result') && Array.isArray(msg.content)) {
-      const textParts: string[] = []
+      const visibleTextParts: string[] = []
+      const modelTextParts: string[] = []
       const attachments: UIAttachment[] = []
+      const imageSourcePaths: string[] = []
+      const hasImageBlock = (msg.content as UserHistoryBlock[]).some((block) => block.type === 'image')
       for (const block of msg.content as UserHistoryBlock[]) {
         if (block.type === 'text' && block.text && isTeammateMessage(block.text)) {
+          modelTextParts.push(block.text)
           if (!includeTeammateMessages) continue
-          textParts.push(...extractVisibleTeammateMessageContents(block.text))
+          visibleTextParts.push(...extractVisibleTeammateMessageContents(block.text))
         } else if (block.type === 'text' && block.text) {
-          textParts.push(block.text)
+          modelTextParts.push(block.text)
+          const imageSourcePath = hasImageBlock ? extractImageMetadataSourcePath(block.text) : undefined
+          if (imageSourcePath) {
+            imageSourcePaths.push(imageSourcePath)
+          }
+          if (!hasImageBlock || !isGeneratedImageMetadataText(block.text)) {
+            visibleTextParts.push(block.text)
+          }
         }
-        else if (block.type === 'image') attachments.push({ type: 'image', name: block.name || 'image', data: block.source?.data, mimeType: block.mimeType || block.media_type })
+        else if (block.type === 'image') attachments.push(normalizeHistoryImageAttachment(block))
         else if (block.type === 'file') attachments.push({ type: 'file', name: block.name || 'file' })
-        else if (block.type === 'tool_result') uiMessages.push({ id: nextId(), type: 'tool_result', toolUseId: block.tool_use_id ?? '', content: block.content, isError: !!block.is_error, timestamp, parentToolUseId: msg.parentToolUseId })
+        else if (block.type === 'tool_result') uiMessages.push({
+          id: nextId(),
+          type: 'tool_result',
+          toolUseId: block.tool_use_id ?? '',
+          content: normalizeHistoryToolResultContent(block.content, msg.toolUseResult),
+          isError: !!block.is_error,
+          timestamp,
+          parentToolUseId: msg.parentToolUseId,
+        })
       }
-      if (textParts.length > 0 || attachments.length > 0) {
-        const parsed = extractLeadingFileReferences(textParts.join('\n'))
+      applyImageMetadataSourcePaths(attachments, imageSourcePaths)
+      if (visibleTextParts.length > 0 || attachments.length > 0) {
+        const visibleText = visibleTextParts.join('\n')
+        const modelText = modelTextParts.join('\n')
+        const visualSelectionDisplay =
+          msg.type === 'user' && hasImageBlock
+            ? parseVisualSelectionHistoryPrompt(modelText)
+            : null
+        if (visualSelectionDisplay) {
+          applyVisualSelectionHistoryDisplay(attachments, visualSelectionDisplay)
+        }
+        const parsed = extractLeadingFileReferences(visibleText)
+        const userContent = visualSelectionDisplay ? '' : parsed.content
+        const modelContent = visualSelectionDisplay || modelText !== visibleText ? modelText : parsed.modelContent
         const allAttachments = [...(parsed.attachments ?? []), ...attachments]
         uiMessages.push({
           id: msg.id || nextId(),
           type: 'user_text',
-          content: parsed.content,
-          ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
+          content: userContent,
+          ...(msg.id ? { transcriptMessageId: msg.id } : {}),
+          ...(modelContent ? { modelContent } : {}),
           attachments: allAttachments.length > 0 ? allAttachments : undefined,
           timestamp,
         })
+      }
+    }
+    if (msg.type === 'system' && msg.content && typeof msg.content === 'object') {
+      const subtype = (msg.content as { subtype?: unknown }).subtype
+      if (subtype === 'memory_saved') {
+        const files = normalizeMemoryEventFiles(msg.content)
+        if (files.length > 0) {
+          uiMessages.push({
+            id: msg.id || nextId(),
+            type: 'memory_event',
+            event: 'saved',
+            files,
+            message: typeof (msg.content as { message?: unknown }).message === 'string'
+              ? (msg.content as { message: string }).message
+              : undefined,
+            teamCount: normalizeMemoryTeamCount(msg.content),
+            timestamp,
+          })
+        }
       }
     }
   }

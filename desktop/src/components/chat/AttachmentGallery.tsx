@@ -8,6 +8,7 @@ export type AttachmentPreview = {
   path?: string
   data?: string
   previewUrl?: string
+  isDirectory?: boolean
   lineStart?: number
   lineEnd?: number
   note?: string
@@ -44,13 +45,19 @@ export function AttachmentGallery({ attachments, variant = 'message', onRemove }
         {attachments.map((attachment, index) => {
           if (attachment.type === 'image' && (attachment.previewUrl || attachment.data)) {
             const src = attachment.previewUrl || attachment.data || ''
+            const selectionNote = attachment.note?.trim()
+            const hasSelectionNote = !isComposer && !!selectionNote
+            const tooltipId = hasSelectionNote
+              ? `selection-note-${(attachment.id || `${attachment.name}-${index}`).replace(/[^a-zA-Z0-9_-]/g, '-')}`
+              : undefined
             return (
               <div
                 key={attachment.id || `${attachment.name}-${index}`}
-                className={isComposer ? 'group relative' : ''}
+                className={isComposer ? 'group relative' : 'group/selection relative flex max-w-full flex-col items-end gap-1.5'}
               >
                 <button
                   type="button"
+                  aria-label={`Open ${attachment.name}`}
                   onClick={() => setActiveImageIndex(images.findIndex((image) => image.src === src))}
                   className={
                     isComposer
@@ -68,6 +75,46 @@ export function AttachmentGallery({ attachments, variant = 'message', onRemove }
                     }
                   />
                 </button>
+                {hasSelectionNote && (
+                  <>
+                    <span
+                      aria-describedby={tooltipId}
+                      aria-label={`Selection note: ${selectionNote}`}
+                      title={selectionNote}
+                      tabIndex={0}
+                      className={[
+                        'inline-flex h-7 max-w-[260px] items-center gap-1.5 rounded-full border',
+                        'border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-2.5',
+                        'text-[12px] font-medium leading-none text-[var(--color-text-primary)] shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
+                        'transition-colors hover:border-[var(--color-brand)]/45 hover:bg-[var(--color-surface-container)]',
+                        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)] focus-visible:ring-offset-2',
+                      ].join(' ')}
+                    >
+                      <span className="material-symbols-outlined text-[15px] text-[var(--color-text-tertiary)]">
+                        ads_click
+                      </span>
+                      <span className="min-w-0 truncate">{attachment.name}</span>
+                    </span>
+                    <span
+                      id={tooltipId}
+                      role="tooltip"
+                      className={[
+                        'pointer-events-none invisible absolute bottom-9 right-0 z-30 w-max max-w-[min(340px,calc(100vw-3rem))]',
+                        'translate-y-1 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-high)] px-3 py-2',
+                        'text-left text-[13px] leading-5 text-[var(--color-text-primary)] opacity-0 shadow-[var(--shadow-dropdown)]',
+                        'transition-all duration-150 group-hover/selection:visible group-hover/selection:translate-y-0 group-hover/selection:opacity-100',
+                        'group-focus-within/selection:visible group-focus-within/selection:translate-y-0 group-focus-within/selection:opacity-100',
+                      ].join(' ')}
+                    >
+                      <span className="block text-[11px] font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">
+                        修改内容
+                      </span>
+                      <span className="mt-1 block whitespace-pre-wrap break-words">
+                        {selectionNote}
+                      </span>
+                    </span>
+                  </>
+                )}
                 {onRemove && attachment.id && (
                   <button
                     type="button"
@@ -82,29 +129,41 @@ export function AttachmentGallery({ attachments, variant = 'message', onRemove }
             )
           }
 
+          const lineLabel = attachment.lineStart
+            ? `:L${attachment.lineStart}${attachment.lineEnd && attachment.lineEnd !== attachment.lineStart ? `-L${attachment.lineEnd}` : ''}`
+            : ''
+          const quotePreview = attachment.quote?.trim().replace(/\s+/g, ' ')
+          const hasQuotePreview = !!quotePreview
+
           return (
             <div
               key={attachment.id || `${attachment.name}-${index}`}
               className={[
-                'group/file inline-flex max-w-full min-w-0 items-center gap-2 rounded-full border border-[var(--color-border)]',
+                'group/file inline-flex max-w-full min-w-0 border border-[var(--color-border)]',
                 'bg-[var(--color-surface-container-low)] text-[var(--color-text-secondary)] shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
-                isComposer ? 'h-9 px-3' : 'h-9 px-3',
+                hasQuotePreview
+                  ? 'items-start gap-2 rounded-[8px] px-2.5 py-2'
+                  : 'h-9 items-center gap-2 rounded-full px-3',
               ].join(' ')}
             >
-              <span className="material-symbols-outlined shrink-0 text-[17px] text-[var(--color-text-tertiary)]">
-                {attachment.lineStart ? 'chat_bubble' : 'description'}
+              <span className={`material-symbols-outlined shrink-0 text-[17px] text-[var(--color-text-tertiary)] ${hasQuotePreview ? 'mt-0.5' : ''}`}>
+                {hasQuotePreview ? 'chat_bubble' : attachment.isDirectory ? 'folder' : 'description'}
               </span>
-              <span className="min-w-0 max-w-[220px] truncate text-[13px] font-medium leading-none text-[var(--color-text-primary)]">
-                {attachment.name}
-                {attachment.lineStart
-                  ? `:L${attachment.lineStart}${attachment.lineEnd && attachment.lineEnd !== attachment.lineStart ? `-L${attachment.lineEnd}` : ''}`
-                  : ''}
+              <span className="min-w-0">
+                <span className="block min-w-0 max-w-[260px] truncate text-[13px] font-medium leading-5 text-[var(--color-text-primary)]">
+                  {attachment.name}{lineLabel}
+                </span>
+                {hasQuotePreview && (
+                  <span className="mt-0.5 block max-w-[320px] truncate font-[var(--font-mono)] text-[11px] leading-4 text-[var(--color-text-tertiary)]">
+                    {quotePreview}
+                  </span>
+                )}
               </span>
               {onRemove && attachment.id && (
                 <button
                   type="button"
                   onClick={() => onRemove(attachment.id!)}
-                  className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-primary)]"
+                  className={`${hasQuotePreview ? 'mt-0.5' : 'ml-0.5'} flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-primary)]`}
                   aria-label={`Remove ${attachment.name}`}
                 >
                   <span className="material-symbols-outlined text-[17px]">close</span>

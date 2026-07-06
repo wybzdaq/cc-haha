@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { RefObject } from 'react'
+import { Target } from 'lucide-react'
 import {
   SCHEDULED_TAB_ID,
   SETTINGS_TAB_ID,
   TERMINAL_TAB_PREFIX,
+  TRACE_TAB_PREFIX,
+  WORKBENCH_TAB_PREFIX,
   useTabStore,
   type TabType,
 } from '../stores/tabStore'
@@ -22,16 +26,27 @@ import { MessageList } from '../components/chat/MessageList'
 import { ChatInput } from '../components/chat/ChatInput'
 import { ComputerUsePermissionModal } from '../components/chat/ComputerUsePermissionModal'
 import { SessionTaskBar } from '../components/chat/SessionTaskBar'
-import { WorkspacePanel } from '../components/workspace/WorkspacePanel'
+import { BackgroundTasksBar } from '../components/chat/BackgroundTasksBar'
+import { WorkbenchPanel } from '../components/workbench/WorkbenchPanel'
 import { TeamStatusBar } from '../components/teams/TeamStatusBar'
 import { TerminalSettings } from './TerminalSettings'
 import type { SessionListItem } from '../types/session'
+import type { ActiveGoalState, TokenUsage } from '../types/chat'
+import { useMobileViewport } from '../hooks/useMobileViewport'
+import { isDesktopRuntime } from '../lib/desktopRuntime'
+import { formatTokenCount } from '../lib/formatTokenCount'
+import { publicAssetPath } from '../lib/publicAsset'
+import {
+  createBackgroundTaskDismissKey,
+  hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks,
+} from '../lib/backgroundTasks'
 
 const TASK_POLL_INTERVAL_MS = 1000
 const WORKSPACE_RESIZE_STEP = 32
 const TERMINAL_RESIZE_STEP = 24
 const CHAT_COLUMN_WITH_WORKSPACE_CLASS =
   'min-w-[320px] flex-1 border-r border-[var(--color-border)] bg-[var(--color-surface)]'
+const EMPTY_DISMISSED_BACKGROUND_TASK_KEYS = new Set<string>()
 
 function isSessionTabState(activeTabId: string | null, activeTabType: TabType | null | undefined) {
   if (!activeTabId) return false
@@ -39,7 +54,18 @@ function isSessionTabState(activeTabId: string | null, activeTabType: TabType | 
   if (activeTabType) return false
   return activeTabId !== SETTINGS_TAB_ID &&
     activeTabId !== SCHEDULED_TAB_ID &&
-    !activeTabId.startsWith(TERMINAL_TAB_PREFIX)
+    !activeTabId.startsWith(TERMINAL_TAB_PREFIX) &&
+    !activeTabId.startsWith(TRACE_TAB_PREFIX) &&
+    !activeTabId.startsWith(WORKBENCH_TAB_PREFIX)
+}
+
+function getTokenUsageTotal(usage: TokenUsage): number {
+  return (
+    usage.input_tokens +
+    usage.output_tokens +
+    (usage.cache_read_tokens ?? 0) +
+    (usage.cache_creation_tokens ?? 0)
+  )
 }
 
 function getSessionTerminalCwd(session: SessionListItem | undefined) {
@@ -48,7 +74,68 @@ function getSessionTerminalCwd(session: SessionListItem | undefined) {
   return session.projectPath || undefined
 }
 
-function WorkspaceResizeHandle() {
+function ActiveGoalStrip({
+  goal,
+  isRunning,
+  compact,
+}: {
+  goal: ActiveGoalState | null | undefined
+  isRunning: boolean
+  compact: boolean
+}) {
+  const t = useTranslation()
+  if (!goal || goal.action === 'completed') return null
+
+  const objective = goal.objective ?? goal.message
+  if (!objective) return null
+
+  const statusLabel = isRunning
+    ? t('chat.activeGoal.running')
+    : goal.status === 'paused'
+      ? t('chat.activeGoal.paused')
+      : t('chat.activeGoal.active')
+  const meta = [
+    goal.budget ? t('chat.activeGoal.budget', { value: goal.budget }) : null,
+    goal.elapsed ? t('chat.activeGoal.elapsed', { value: goal.elapsed }) : null,
+    goal.continuations ? t('chat.activeGoal.continuations', { value: goal.continuations }) : null,
+  ].filter((value): value is string => value !== null)
+
+  return (
+    <div
+      data-testid="active-goal-strip"
+      className={[
+        'mt-2 flex max-w-full items-center gap-2 rounded-[8px] border border-[var(--color-memory-border)] bg-[var(--color-memory-surface)] px-2.5 py-1.5',
+        compact ? 'text-[11px]' : 'text-[12px]',
+      ].join(' ')}
+    >
+      <Target size={compact ? 13 : 14} className="shrink-0 text-[var(--color-memory-accent)]" strokeWidth={2.25} aria-hidden="true" />
+      <span className="shrink-0 font-semibold text-[var(--color-text-primary)]">
+        {t('chat.activeGoal.title')}
+      </span>
+      <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-memory-accent)]" aria-hidden="true" />
+      <span className="shrink-0 text-[var(--color-text-tertiary)]">{statusLabel}</span>
+      <span className="min-w-0 flex-1 truncate font-medium text-[var(--color-text-primary)]" title={objective}>
+        {objective}
+      </span>
+      {meta.length > 0 ? (
+        <span className="hidden shrink-0 items-center gap-1.5 text-[11px] text-[var(--color-text-tertiary)] lg:flex">
+          {meta.map((item) => (
+            <span key={item} className="max-w-[140px] truncate">{item}</span>
+          ))}
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+function getRenderedWorkspacePanelWidth(panelRef: RefObject<HTMLElement>, fallbackWidth: number) {
+  const renderedWidth = panelRef.current?.getBoundingClientRect().width ?? 0
+  return Number.isFinite(renderedWidth) && renderedWidth > 0
+    ? renderedWidth
+    : fallbackWidth
+}
+
+function WorkspaceResizeHandle({ panelRef }: { panelRef: RefObject<HTMLElement> }) {
   const t = useTranslation()
   const width = useWorkspacePanelStore((state) => state.width)
   const setWidth = useWorkspacePanelStore((state) => state.setWidth)
@@ -98,16 +185,17 @@ function WorkspaceResizeHandle() {
       onPointerDown={(event) => {
         if (event.button !== 0) return
         event.preventDefault()
-        setDragState({ startX: event.clientX, startWidth: width })
+        setDragState({ startX: event.clientX, startWidth: getRenderedWorkspacePanelWidth(panelRef, width) })
       }}
       onKeyDown={(event) => {
+        const renderedWidth = getRenderedWorkspacePanelWidth(panelRef, width)
         if (event.key === 'ArrowLeft') {
           event.preventDefault()
-          setWidth(width + WORKSPACE_RESIZE_STEP)
+          setWidth(renderedWidth + WORKSPACE_RESIZE_STEP)
         }
         if (event.key === 'ArrowRight') {
           event.preventDefault()
-          setWidth(width - WORKSPACE_RESIZE_STEP)
+          setWidth(renderedWidth - WORKSPACE_RESIZE_STEP)
         }
       }}
       className="group relative z-10 flex w-2 shrink-0 cursor-col-resize items-stretch justify-center bg-[var(--color-surface)] outline-none focus-visible:bg-[var(--color-surface-container)]"
@@ -198,7 +286,10 @@ function TerminalResizeHandle() {
 }
 
 export function ActiveSession() {
+  const isMobileLayout = useMobileViewport() && !isDesktopRuntime()
+  const workbenchPanelRef = useRef<HTMLElement>(null)
   const activeTabId = useTabStore((s) => s.activeTabId)
+  const [dismissedBackgroundTaskKeysBySession, setDismissedBackgroundTaskKeysBySession] = useState<Record<string, Set<string>>>({})
   const activeTabType = useTabStore((s) => s.tabs.find((tab) => tab.sessionId === s.activeTabId)?.type ?? null)
   const sessions = useSessionStore((s) => s.sessions)
   const connectToSession = useChatStore((s) => s.connectToSession)
@@ -207,22 +298,31 @@ export function ActiveSession() {
   const fetchSessionTasks = useCLITaskStore((s) => s.fetchSessionTasks)
   const trackedTaskSessionId = useCLITaskStore((s) => s.sessionId)
   const hasIncompleteTasks = useCLITaskStore((s) => s.tasks.some((task) => task.status !== 'completed'))
+  const hasRunningTasks = useCLITaskStore((s) => s.tasks.some((task) => task.status === 'in_progress'))
   const chatState = sessionState?.chatState ?? 'idle'
   const tokenUsage = sessionState?.tokenUsage ?? { input_tokens: 0, output_tokens: 0 }
+  const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(sessionState?.backgroundAgentTasks)
 
   const session = sessions.find((s) => s.id === activeTabId)
   const memberInfo = useTeamStore((s) => activeTabId ? s.getMemberBySessionId(activeTabId) : null)
   const activeTeam = useTeamStore((s) => s.activeTeam)
   const isMemberSession = !!memberInfo
-  const showWorkspacePanel = useWorkspacePanelStore((state) =>
-    activeTabId && isSessionTabState(activeTabId, activeTabType) && !isMemberSession
+  const showWorkbench = useWorkspacePanelStore((state) =>
+    activeTabId && isSessionTabState(activeTabId, activeTabType) && !isMemberSession && !isMobileLayout
       ? state.isPanelOpen(activeTabId)
       : false,
   )
+  const showRightPanel = showWorkbench
+  const rightPanelWidth = useWorkspacePanelStore((state) => state.width)
   const showTerminalPanel = useTerminalPanelStore((state) =>
-    activeTabId && isSessionTabState(activeTabId, activeTabType) && !isMemberSession
+    activeTabId && isSessionTabState(activeTabId, activeTabType) && !isMemberSession && !isMobileLayout
       ? state.isPanelOpen(activeTabId)
       : false,
+  )
+  const terminalPanelRuntimeId = useTerminalPanelStore((state) =>
+    activeTabId && isSessionTabState(activeTabId, activeTabType) && !isMemberSession && !isMobileLayout
+      ? state.panelBySession[activeTabId]?.runtimeId
+      : undefined,
   )
   const terminalPanelHeight = useTerminalPanelStore((state) => state.height)
 
@@ -260,10 +360,34 @@ export function ActiveSession() {
   const t = useTranslation()
   const messages = sessionState?.messages ?? []
   const streamingText = sessionState?.streamingText ?? ''
+  const backgroundTasks = useMemo(
+    () => Object.values(sessionState?.backgroundAgentTasks ?? {}),
+    [sessionState?.backgroundAgentTasks],
+  )
+  const dismissedBackgroundTaskKeys = activeTabId
+    ? dismissedBackgroundTaskKeysBySession[activeTabId] ?? EMPTY_DISMISSED_BACKGROUND_TASK_KEYS
+    : EMPTY_DISMISSED_BACKGROUND_TASK_KEYS
+  const activeGoal = sessionState?.activeGoal ?? null
   const isEmpty = messages.length === 0 && !streamingText && (session?.messageCount ?? 0) === 0
+  const compactEmptyHero = isEmpty && showTerminalPanel
+  const isHistoryLoading =
+    !isMemberSession &&
+    (session?.messageCount ?? 0) > 0 &&
+    messages.length === 0 &&
+    sessionState?.historyStatus === 'loading'
+  const historyError =
+    !isMemberSession &&
+    (session?.messageCount ?? 0) > 0 &&
+    messages.length === 0 &&
+    sessionState?.historyStatus === 'error'
+      ? sessionState.historyError || t('session.historyLoadFailed')
+      : null
+  const visibleMessageCount = messages.length > 0 ? messages.length : session?.messageCount ?? 0
 
-  const isActive = chatState !== 'idle'
-  const totalTokens = tokenUsage.input_tokens + tokenUsage.output_tokens
+  const isActive = chatState !== 'idle' ||
+    (trackedTaskSessionId === activeTabId && hasRunningTasks) ||
+    hasRunningBackgroundTasks
+  const totalTokens = getTokenUsageTotal(tokenUsage)
 
   const lastUpdated = useMemo(() => {
     if (!session?.modifiedAt) return ''
@@ -274,6 +398,23 @@ export function ActiveSession() {
     return t('session.timeDays', { n: Math.floor(diff / 86400000) })
   }, [session?.modifiedAt, t])
 
+  useEffect(() => {
+    if (!activeTabId || dismissedBackgroundTaskKeys.size === 0) return
+    const currentTaskKeys = new Set(backgroundTasks.map(createBackgroundTaskDismissKey))
+    const nextDismissed = new Set([...dismissedBackgroundTaskKeys].filter((taskKey) => currentTaskKeys.has(taskKey)))
+    if (nextDismissed.size === dismissedBackgroundTaskKeys.size) return
+
+    setDismissedBackgroundTaskKeysBySession((current) => {
+      const next = { ...current }
+      if (nextDismissed.size === 0) {
+        delete next[activeTabId]
+      } else {
+        next[activeTabId] = nextDismissed
+      }
+      return next
+    })
+  }, [activeTabId, backgroundTasks, dismissedBackgroundTaskKeys])
+
   if (!activeTabId) return null
 
   return (
@@ -281,7 +422,7 @@ export function ActiveSession() {
       <div data-testid="active-session-content-row" className="flex min-h-0 min-w-0 flex-1">
         <div
           data-testid="active-session-chat-column"
-          className={`flex flex-col ${showWorkspacePanel ? CHAT_COLUMN_WITH_WORKSPACE_CLASS : 'min-w-[360px] flex-1'}`}
+          className={`flex min-h-0 flex-col ${showRightPanel ? CHAT_COLUMN_WITH_WORKSPACE_CLASS : isMobileLayout ? 'min-w-0 flex-1' : 'min-w-[360px] flex-1'}`}
         >
           {isMemberSession && (
             <div className="shrink-0 border-b border-[var(--color-border)] bg-[var(--color-surface-container)]">
@@ -329,11 +470,17 @@ export function ActiveSession() {
           )}
 
           {isEmpty ? (
-            <div className="flex flex-1 flex-col items-center justify-center p-8 pb-32">
+            <div
+              data-testid="empty-session-hero"
+              className={[
+                'flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-8 pt-8',
+                compactEmptyHero ? 'pb-6' : 'pb-32',
+              ].join(' ')}
+            >
               <div className="flex max-w-md flex-col items-center text-center">
                 {isMemberSession ? (
                   <>
-                    <span className="material-symbols-outlined text-[48px] mb-4 text-[var(--color-text-tertiary)]">smart_toy</span>
+                    <span className={`material-symbols-outlined mb-4 text-[var(--color-text-tertiary)] ${compactEmptyHero ? 'text-[36px]' : 'text-[48px]'}`}>smart_toy</span>
                     <p className="text-[var(--color-text-secondary)]">
                       {memberInfo?.status === 'running'
                         ? `${memberInfo.role} ${t('teams.working')}`
@@ -342,11 +489,15 @@ export function ActiveSession() {
                   </>
                 ) : (
                   <>
-                    <img src="/app-icon.png" alt="Claude Code Haha" className="mb-6 h-24 w-24" />
-                    <h1 className="mb-2 text-3xl font-extrabold tracking-tight text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>
+                    <img
+                      src={publicAssetPath('app-icon.png')}
+                      alt="Claude Code Haha"
+                      className={compactEmptyHero ? 'mb-4 h-16 w-16' : 'mb-6 h-24 w-24'}
+                    />
+                    <h1 className={`${compactEmptyHero ? 'mb-1 text-2xl' : 'mb-2 text-3xl'} font-extrabold tracking-tight text-[var(--color-text-primary)]`} style={{ fontFamily: 'var(--font-headline)' }}>
                       {t('empty.title')}
                     </h1>
-                    <p className="mx-auto max-w-xs text-[var(--color-text-secondary)]" style={{ fontFamily: 'var(--font-body)' }}>
+                    <p className={`mx-auto max-w-xs text-[var(--color-text-secondary)] ${compactEmptyHero ? 'text-sm' : ''}`} style={{ fontFamily: 'var(--font-body)' }}>
                       {t('empty.subtitle')}
                     </p>
                   </>
@@ -355,27 +506,29 @@ export function ActiveSession() {
             </div>
           ) : (
             <>
-              {!isMemberSession && (
+              {!isMemberSession && !isMobileLayout && (
                 <div
                   className={
-                    showWorkspacePanel
+                    showRightPanel
                       ? 'flex w-full items-center border-b border-[var(--color-border)]/70 px-4 py-3'
-                      : 'mx-auto flex w-full max-w-[860px] items-center border-b border-outline-variant/10 px-8 py-3'
+                      : 'w-full border-b border-outline-variant/10 px-4 py-3'
                   }
                 >
-                  <div className="min-w-0 flex-1">
-                    <h1
-                      className={
-                        showWorkspacePanel
-                          ? 'truncate text-[15px] font-bold font-headline leading-tight text-on-surface'
-                          : 'text-lg font-bold font-headline text-on-surface leading-tight'
-                      }
-                    >
-                      {session?.title || t('session.untitled')}
-                    </h1>
+                  <div className={showRightPanel ? 'min-w-0 flex-1' : 'mx-auto w-full max-w-[860px] min-w-0'}>
+                    <div className="flex min-w-0 items-center gap-3">
+                      <h1
+                        className={
+                          showRightPanel
+                            ? 'min-w-0 flex-1 truncate text-[15px] font-bold font-headline leading-tight text-on-surface'
+                            : 'min-w-0 flex-1 text-lg font-bold font-headline text-on-surface leading-tight'
+                        }
+                      >
+                        {session?.title || t('session.untitled')}
+                      </h1>
+                    </div>
                     <div
                       className={
-                        showWorkspacePanel
+                        showRightPanel
                           ? 'mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap text-[10px] font-medium text-outline'
                           : 'flex items-center gap-2 text-[10px] text-outline font-medium mt-1'
                       }
@@ -389,7 +542,9 @@ export function ActiveSession() {
                       {totalTokens > 0 && (
                         <>
                           <span className="text-[var(--color-outline)]">·</span>
-                          <span>{totalTokens.toLocaleString()} t</span>
+                          <span title={t('common.tokens', { count: totalTokens.toLocaleString() })}>
+                            {t('common.tokens', { count: formatTokenCount(totalTokens) })}
+                          </span>
                         </>
                       )}
                       {lastUpdated && (
@@ -398,10 +553,10 @@ export function ActiveSession() {
                           <span className="truncate">{t('session.lastUpdated', { time: lastUpdated })}</span>
                         </>
                       )}
-                      {!showWorkspacePanel && session?.messageCount !== undefined && session.messageCount > 0 && (
+                      {!showRightPanel && visibleMessageCount > 0 && (
                         <>
                           <span className="text-[var(--color-outline)]">·</span>
-                          <span>{t('session.messages', { count: session.messageCount })}</span>
+                          <span>{t('session.messages', { count: visibleMessageCount })}</span>
                         </>
                       )}
                     </div>
@@ -413,11 +568,27 @@ export function ActiveSession() {
                         </span>
                       </div>
                     )}
+                    <ActiveGoalStrip
+                      goal={activeGoal}
+                      isRunning={isActive}
+                      compact={showRightPanel}
+                    />
                   </div>
                 </div>
               )}
 
-              <MessageList compact={showWorkspacePanel} />
+              {isHistoryLoading ? (
+                <div role="status" className="flex flex-1 items-center justify-center p-8 text-sm text-[var(--color-text-secondary)]">
+                  <span className="material-symbols-outlined mr-2 animate-spin text-[18px]">progress_activity</span>
+                  {t('common.loading')}
+                </div>
+              ) : historyError ? (
+                <div role="alert" className="flex flex-1 items-center justify-center p-8 text-sm text-[var(--color-error)]">
+                  {historyError}
+                </div>
+              ) : (
+                <MessageList compact={showRightPanel} />
+              )}
             </>
           )}
 
@@ -425,26 +596,51 @@ export function ActiveSession() {
 
           <TeamStatusBar />
 
+          {!isMemberSession && (
+            <BackgroundTasksBar
+              key={activeTabId}
+              tasks={backgroundTasks}
+              compact={showRightPanel}
+              dismissedFinishedTaskKeys={dismissedBackgroundTaskKeys}
+              onClearFinished={(taskKeys) => {
+                if (!activeTabId || taskKeys.length === 0) return
+                setDismissedBackgroundTaskKeysBySession((current) => ({
+                  ...current,
+                  [activeTabId]: new Set([
+                    ...(current[activeTabId] ?? EMPTY_DISMISSED_BACKGROUND_TASK_KEYS),
+                    ...taskKeys,
+                  ]),
+                }))
+              }}
+            />
+          )}
+
           <ChatInput
-            variant={isEmpty && !isMemberSession && !showWorkspacePanel ? 'hero' : 'default'}
-            compact={showWorkspacePanel}
+            variant={isEmpty && !isMemberSession && !showRightPanel ? 'hero' : 'default'}
+            compact={showRightPanel}
           />
 
-          {showTerminalPanel && activeTabId ? (
+          {terminalPanelRuntimeId && activeTabId ? (
             <div
               data-testid="session-terminal-panel"
-              className="flex shrink-0 flex-col border-t border-[var(--color-border)] bg-[var(--color-surface-container-lowest)]"
-              style={{ height: terminalPanelHeight }}
+              className={[
+                'flex min-h-0 shrink-0 flex-col border-t border-[var(--color-border)] bg-[var(--color-surface-container-lowest)]',
+                showTerminalPanel ? '' : 'hidden',
+              ].join(' ')}
+              style={{ height: showTerminalPanel ? terminalPanelHeight : 0 }}
             >
-              <TerminalResizeHandle />
+              {showTerminalPanel && <TerminalResizeHandle />}
               <TerminalSettings
-                active
+                active={showTerminalPanel}
                 docked
                 cwd={getSessionTerminalCwd(session)}
+                runtimeId={terminalPanelRuntimeId}
+                preserveOnUnmount
                 testId={`session-terminal-host-${activeTabId}`}
                 onOpenInTab={() => {
                   useTerminalPanelStore.getState().closePanel(activeTabId)
-                  useTabStore.getState().openTerminalTab(getSessionTerminalCwd(session))
+                  useTabStore.getState().openTerminalTab(getSessionTerminalCwd(session), terminalPanelRuntimeId)
+                  useTerminalPanelStore.getState().detachRuntime(activeTabId)
                 }}
                 onClose={() => useTerminalPanelStore.getState().closePanel(activeTabId)}
               />
@@ -452,10 +648,17 @@ export function ActiveSession() {
           ) : null}
         </div>
 
-        {showWorkspacePanel ? (
+        {showWorkbench ? (
           <>
-            <WorkspaceResizeHandle />
-            <WorkspacePanel sessionId={activeTabId} />
+            <WorkspaceResizeHandle panelRef={workbenchPanelRef} />
+            <aside
+              ref={workbenchPanelRef}
+              data-testid="workbench-panel"
+              className="flex h-full shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]"
+              style={{ width: rightPanelWidth, maxWidth: '62%', minWidth: 'min(420px, 54%)' }}
+            >
+              <WorkbenchPanel sessionId={activeTabId} />
+            </aside>
           </>
         ) : null}
       </div>

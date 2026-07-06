@@ -2,8 +2,8 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     io::{Error as IoError, ErrorKind, Read, Write},
-    net::{SocketAddr, TcpStream},
-    path::PathBuf,
+    net::{SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     str,
     sync::{
@@ -217,21 +217,173 @@ mod macos_notifications {
     }
 }
 
+mod webview_panel;
+
 const SERVER_STARTUP_LOG_LIMIT: usize = 80;
+const SERVER_BIND_HOST: &str = "0.0.0.0";
+const SERVER_CONTROL_HOST: &str = "127.0.0.1";
+const CLAUDE_CODE_POWERSHELL_PATH_ENV: &str = "CLAUDE_CODE_POWERSHELL_PATH";
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "tray_show";
 const TRAY_QUIT_ID: &str = "tray_quit";
 const WINDOW_STATE_FILE: &str = "window-state.json";
+const TERMINAL_CONFIG_FILE: &str = "terminal-config.json";
+const APP_MODE_FILE: &str = "app-mode.json";
+const SERVER_STATE_FILE: &str = "desktop-server-state.json";
 const MIN_WINDOW_WIDTH: u32 = 960;
 const MIN_WINDOW_HEIGHT: u32 = 640;
 const MIN_VISIBLE_PIXELS: i64 = 64;
+// Keep this above the server's CLI shutdown wait. The server gives each CLI
+// session enough time to run gracefulShutdown cleanup before it escalates.
+const SIDECAR_GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_millis(8_000);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AppMode {
+    #[serde(alias = "Default")]
+    Default,
+    #[serde(alias = "Portable")]
+    Portable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppModeConfig {
+    #[serde(default = "default_app_mode")]
+    mode: AppMode,
+    #[serde(default)]
+    portable_dir: Option<String>,
+}
+
+fn default_app_mode() -> AppMode {
+    AppMode::Default
+}
+
+impl Default for AppModeConfig {
+    fn default() -> Self {
+        Self {
+            mode: AppMode::Default,
+            portable_dir: None,
+        }
+    }
+}
+
+/// Write the persisted app-mode.json to the given config directory.
+fn write_app_mode_config(config_dir: &Path, config: &AppModeConfig) {
+    let path = config_dir.join(APP_MODE_FILE);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("[desktop] failed to create dir for app-mode.json: {e}");
+            return;
+        }
+    }
+    let data = match serde_json::to_string_pretty(config) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[desktop] failed to serialize app-mode.json: {e}");
+            return;
+        }
+    };
+    if let Err(e) = fs::write(&path, data) {
+        eprintln!("[desktop] failed to write app-mode.json: {e}");
+    }
+}
+
+/// Check if a directory contains portable config/data files.
+fn dir_has_portable_data(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    [
+        "settings.json",
+        ".claude.json",
+        ".mcp.json",
+        WINDOW_STATE_FILE,
+        TERMINAL_CONFIG_FILE,
+    ]
+        .iter()
+        .any(|f| dir.join(f).is_file())
+        || dir.join("Cache").is_dir()
+        || dir.join("EBWebView").is_dir()
+        || dir.join("projects").is_dir()
+        || dir.join("skills").is_dir()
+        || dir.join("plugins").is_dir()
+        || dir.join("cowork_plugins").is_dir()
+        || dir.join("cc-haha").is_dir()
+}
+
+/// Resolve the default portable config directory: exe_dir/CLAUDE_CONFIG_DIR.
+fn get_default_portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    dir.push("CLAUDE_CONFIG_DIR");
+    Some(dir)
+}
+
+#[derive(Serialize, Deserialize)]
+struct TerminalConfig {
+    #[serde(default)]
+    bash_path: Option<String>,
+}
+
+impl TerminalConfig {
+    fn load(app: &AppHandle) -> Self {
+        let path = match terminal_config_path(app) {
+            Some(p) => p,
+            None => return Self::default(),
+        };
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, app: &AppHandle) -> Result<(), String> {
+        let Some(path) = terminal_config_path(app) else {
+            return Err("terminal config path is unavailable".to_string());
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return Err(format!("create terminal config directory: {err}"));
+            }
+        }
+        let data = match serde_json::to_string_pretty(self) {
+            Ok(data) => data,
+            Err(err) => {
+                return Err(format!("serialize terminal config: {err}"));
+            }
+        };
+        if let Err(err) = fs::write(&path, data) {
+            return Err(format!("write terminal config: {err}"));
+        }
+        Ok(())
+    }
+}
+
+fn terminal_config_path(app: &AppHandle) -> Option<PathBuf> {
+    // honour CLAUDE_CONFIG_DIR for portable installs
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .map(|dir| PathBuf::from(&dir).join(TERMINAL_CONFIG_FILE))
+        .or_else(|| match app.path().app_config_dir() {
+            Ok(dir) => Some(dir.join(TERMINAL_CONFIG_FILE)),
+            Err(err) => {
+                eprintln!("[desktop] failed to resolve app config dir: {err}");
+                None
+            }
+        })
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self { bash_path: None }
+    }
+}
 
 #[derive(Default)]
 struct ServerState(Mutex<ServerStatus>);
 
 struct ServerRuntime {
     url: String,
-    access_token: String,
     child: CommandChild,
 }
 
@@ -253,6 +405,15 @@ struct StoredWindowState {
     width: u32,
     height: u32,
     maximized: bool,
+}
+
+/// 上一次 server sidecar 实际监听的端口。重启时优先复用同一端口，
+/// 这样手机书签 / 二维码 / 反向代理的 upstream 不会因为重启而失效
+/// （issue #767）。端口被占用时才回退到随机端口。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct StoredServerState {
+    #[serde(rename = "lastPort")]
+    last_port: u16,
 }
 
 /// 与 ServerState 平级的 adapter 子进程状态。
@@ -296,6 +457,25 @@ struct TerminalExitPayload {
     signal: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTerminalSettingsFile {
+    desktop_terminal: Option<DesktopTerminalConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTerminalConfig {
+    startup_shell: Option<String>,
+    custom_shell_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalHostPlatform {
+    Windows,
+    Posix,
+}
+
 #[tauri::command]
 fn get_server_url(state: State<'_, ServerState>) -> Result<String, String> {
     let guard = state
@@ -305,23 +485,6 @@ fn get_server_url(state: State<'_, ServerState>) -> Result<String, String> {
 
     if let Some(runtime) = guard.runtime.as_ref() {
         return Ok(runtime.url.clone());
-    }
-
-    Err(guard
-        .startup_error
-        .clone()
-        .unwrap_or_else(|| "desktop server did not start".to_string()))
-}
-
-#[tauri::command]
-fn get_server_access_token(state: State<'_, ServerState>) -> Result<String, String> {
-    let guard = state
-        .0
-        .lock()
-        .map_err(|_| "desktop server state is unavailable".to_string())?;
-
-    if let Some(runtime) = guard.runtime.as_ref() {
-        return Ok(runtime.access_token.clone());
     }
 
     Err(guard
@@ -364,9 +527,141 @@ fn prepare_for_update_install(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn prepare_for_app_mode_restart(app: AppHandle) -> Result<(), String> {
+    mark_app_quitting(&app);
+    stop_server_sidecar(&app);
+    stop_adapters_sidecar(&app);
+
+    #[cfg(target_os = "windows")]
+    {
+        kill_windows_sidecars();
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    Ok(())
+}
+
+#[tauri::command]
 fn cancel_update_install(app: AppHandle) -> Result<(), String> {
     clear_app_quitting(&app);
     Ok(())
+}
+
+/// Returns the current app mode and portable directory info.
+#[tauri::command]
+fn get_app_mode(app: AppHandle) -> serde_json::Value {
+    let env_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok().map(PathBuf::from);
+    let active_config_dir = env_config_dir
+        .clone()
+        .or_else(|| app.path().app_config_dir().ok());
+    let config_dir_source = if env_config_dir.is_some() {
+        if std::env::var_os("CC_HAHA_APP_PORTABLE_DIR").is_some() {
+            "portable"
+        } else {
+            "environment"
+        }
+    } else {
+        "system"
+    };
+    let config_dir = env_config_dir.clone().or_else(get_default_portable_dir);
+
+    serde_json::json!({
+        "mode": if env_config_dir.is_some() { "portable" } else { "default" },
+        "portableDir": config_dir.as_ref().and_then(|p| p.to_str()),
+        "defaultPortableDir": get_default_portable_dir().as_ref().and_then(|p| p.to_str()),
+        "activeConfigDir": active_config_dir.as_ref().and_then(|p| p.to_str()),
+        "configDirSource": config_dir_source,
+    })
+}
+
+/// Sets the app mode. Persists to app-mode.json in the current active config dir.
+/// Requires restart to take effect.
+#[tauri::command]
+fn set_app_mode(
+    app: tauri::AppHandle,
+    mode: String,
+    portable_dir: Option<String>,
+) -> Result<(), String> {
+    // 确定当前正在使用的配置目录
+    let active_config_dir = if let Ok(cd) = std::env::var("CLAUDE_CONFIG_DIR") {
+        std::path::PathBuf::from(&cd)
+    } else {
+        app.path()
+            .app_config_dir()
+            .map_err(|e| format!("resolve app config dir: {e}"))?
+    };
+
+    let (app_mode, portable_dir, target_portable_dir) = if mode == "portable" {
+        let selected_dir = portable_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(get_default_portable_dir)
+            .ok_or_else(|| "portable config directory is unavailable".to_string())?;
+
+        if selected_dir.exists() && !selected_dir.is_dir() {
+            return Err(format!(
+                "portable config path is not a directory: {}",
+                selected_dir.display()
+            ));
+        }
+
+        fs::create_dir_all(&selected_dir)
+            .map_err(|e| format!("create portable config directory: {e}"))?;
+
+        let persisted_portable_dir = if get_default_portable_dir().as_ref() == Some(&selected_dir) {
+            None
+        } else {
+            Some(selected_dir.to_string_lossy().to_string())
+        };
+
+        (
+            AppMode::Portable,
+            persisted_portable_dir,
+            Some(selected_dir),
+        )
+    } else {
+        (AppMode::Default, None, None)
+    };
+
+    let config = AppModeConfig {
+        mode: app_mode,
+        portable_dir: portable_dir.clone(),
+    };
+
+    // 写入当前活跃的配置目录
+    write_app_mode_config(&active_config_dir, &config);
+
+    if let Some(dir) = target_portable_dir.as_ref() {
+        if dir != &active_config_dir {
+            write_app_mode_config(dir, &config);
+        }
+    }
+
+    // 修复：同时始终将模式状态写入系统默认配置目录，
+    // 以防止应用层切换模式后，main.rs在下一次启动时读取到旧的系统全局状态
+    if let Ok(sys_dir) = app.path().app_config_dir() {
+        if sys_dir != active_config_dir {
+            write_app_mode_config(&sys_dir, &config);
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks if the default portable directory has existing data files.
+#[tauri::command]
+fn detect_portable_dir() -> serde_json::Value {
+    let default_portable = get_default_portable_dir();
+    let has_data = default_portable
+        .as_ref()
+        .map(|d| dir_has_portable_data(d))
+        .unwrap_or(false);
+    serde_json::json!({
+        "defaultPortableDir": default_portable.as_ref().and_then(|p| p.to_str()),
+        "hasData": has_data,
+    })
 }
 
 fn set_app_quitting(app: &AppHandle, next: bool) {
@@ -438,12 +733,84 @@ fn is_window_state_visible_on_any_monitor(
 }
 
 fn window_state_path(app: &AppHandle) -> Option<PathBuf> {
-    match app.path().app_config_dir() {
+    // honour CLAUDE_CONFIG_DIR so portable installs keep window-state.json
+    // and terminal-config.json alongside the config dir instead of
+    // %APPDATA%\com.claude-code-haha.desktop\.
+    resolve_portable_state_path().or_else(|| match app.path().app_config_dir() {
         Ok(dir) => Some(dir.join(WINDOW_STATE_FILE)),
         Err(err) => {
             eprintln!("[desktop] failed to resolve app config dir: {err}");
             None
         }
+    })
+}
+
+fn resolve_portable_state_path() -> Option<PathBuf> {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .map(|dir| PathBuf::from(&dir).join(WINDOW_STATE_FILE))
+}
+
+fn server_state_path() -> Option<PathBuf> {
+    // Lives next to cc-haha/settings.json (CLAUDE_CONFIG_DIR or ~/.claude) so
+    // the Tauri and Electron shells share the same sticky port across builds.
+    claude_config_dir().map(|dir| dir.join(SERVER_STATE_FILE))
+}
+
+fn read_stored_server_state() -> Option<StoredServerState> {
+    let path = server_state_path()?;
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == ErrorKind::NotFound => return None,
+        Err(err) => {
+            eprintln!(
+                "[desktop] failed to read server state {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_str::<StoredServerState>(&data) {
+        Ok(state) => Some(state),
+        Err(err) => {
+            eprintln!(
+                "[desktop] failed to parse server state {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn write_stored_server_state(state: &StoredServerState) {
+    let Some(path) = server_state_path() else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!(
+                "[desktop] failed to create server state directory {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+
+    let data = match serde_json::to_string_pretty(state) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("[desktop] failed to serialize server state: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = fs::write(&path, data) {
+        eprintln!(
+            "[desktop] failed to write server state {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -628,7 +995,7 @@ fn terminal_spawn(
     cwd: Option<String>,
 ) -> Result<TerminalSpawnResult, String> {
     let cwd_path = resolve_terminal_cwd(cwd)?;
-    let shell = default_shell();
+    let shell = resolved_terminal_shell(&app)?;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -829,6 +1196,19 @@ fn terminal_kill(state: State<'_, TerminalState>, session_id: u32) -> Result<(),
 }
 
 #[tauri::command]
+fn get_terminal_bash_path(app: AppHandle) -> Option<String> {
+    let config = TerminalConfig::load(&app);
+    config.bash_path
+}
+
+#[tauri::command]
+fn set_terminal_bash_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
+    let mut config = TerminalConfig::load(&app);
+    config.bash_path = normalize_terminal_bash_path(path)?;
+    config.save(&app)
+}
+
+#[tauri::command]
 async fn macos_notification_permission_state() -> Result<String, String> {
     run_notification_bridge(macos_notifications::permission_state).await
 }
@@ -851,6 +1231,14 @@ async fn macos_send_notification(
 #[tauri::command]
 fn open_windows_notification_settings() -> Result<bool, String> {
     open_windows_notification_settings_impl()
+}
+
+#[tauri::command]
+fn set_app_zoom(window: tauri::WebviewWindow, zoom_factor: f64) -> Result<(), String> {
+    let clamped = zoom_factor.clamp(0.5, 2.0);
+    window
+        .set_zoom(clamped)
+        .map_err(|err| format!("set app zoom: {err}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -1023,9 +1411,13 @@ fn resolve_terminal_cwd(cwd: Option<String>) -> Result<PathBuf, String> {
         }
     }) {
         Some(path) => path,
-        None => home_dir().unwrap_or(
-            std::env::current_dir().map_err(|err| format!("resolve current directory: {err}"))?,
-        ),
+        None => std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .unwrap_or(
+                std::env::current_dir()
+                    .map_err(|err| format!("resolve current directory: {err}"))?,
+            ),
     };
 
     if path.is_dir() {
@@ -1041,7 +1433,163 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn default_shell() -> String {
+fn claude_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|path| path.join(".claude")))
+}
+
+fn desktop_terminal_settings_path() -> Option<PathBuf> {
+    claude_config_dir().map(|path| path.join("settings.json"))
+}
+
+/// 解析 cc-haha/settings.json 里的 h5Access.fixedPort。范围必须与
+/// 服务端 h5AccessService 的 MIN/MAX_FIXED_PORT 一致（1024..=65535）。
+fn parse_h5_fixed_port(contents: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
+    let port = value.get("h5Access")?.get("fixedPort")?.as_u64()?;
+    if (1024..=65535).contains(&port) {
+        u16::try_from(port).ok()
+    } else {
+        None
+    }
+}
+
+fn read_h5_fixed_port() -> Option<u16> {
+    let path = claude_config_dir()?.join("cc-haha").join("settings.json");
+    let contents = fs::read_to_string(path).ok()?;
+    parse_h5_fixed_port(&contents)
+}
+
+fn read_desktop_terminal_config() -> Option<DesktopTerminalConfig> {
+    let path = desktop_terminal_settings_path()?;
+    let contents = fs::read_to_string(path).ok()?;
+    let settings = serde_json::from_str::<DesktopTerminalSettingsFile>(&contents).ok()?;
+    settings.desktop_terminal
+}
+
+fn resolved_terminal_shell(app: &AppHandle) -> Result<String, String> {
+    let terminal_config = TerminalConfig::load(app);
+    let system_default = default_shell(terminal_config.bash_path.as_deref());
+    let platform = current_terminal_host_platform();
+    let configured = read_desktop_terminal_config();
+    let override_shell =
+        resolve_desktop_terminal_shell(platform, configured.as_ref(), &system_default)?;
+    Ok(override_shell.unwrap_or(system_default))
+}
+
+fn read_agent_powershell_path_override() -> Option<String> {
+    let configured = read_desktop_terminal_config();
+    resolve_agent_powershell_path_override(current_terminal_host_platform(), configured.as_ref())
+}
+
+fn current_terminal_host_platform() -> TerminalHostPlatform {
+    #[cfg(target_os = "windows")]
+    {
+        TerminalHostPlatform::Windows
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        TerminalHostPlatform::Posix
+    }
+}
+
+fn resolve_desktop_terminal_shell(
+    platform: TerminalHostPlatform,
+    config: Option<&DesktopTerminalConfig>,
+    _system_default: &str,
+) -> Result<Option<String>, String> {
+    if platform != TerminalHostPlatform::Windows {
+        return Ok(None);
+    }
+
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let Some(startup_shell) = config.startup_shell.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+
+    match startup_shell {
+        "" | "system" => Ok(None),
+        "pwsh" => Ok(Some("pwsh.exe".to_string())),
+        "powershell" => Ok(Some("powershell.exe".to_string())),
+        "cmd" => Ok(Some("cmd.exe".to_string())),
+        "custom" => {
+            let path = config
+                .custom_shell_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "custom terminal shell path is empty".to_string())?;
+            Ok(Some(path.to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_powershell_executable_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let file_name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lowercase = file_name.to_ascii_lowercase();
+    let base = lowercase.strip_suffix(".exe").unwrap_or(&lowercase);
+    matches!(base, "pwsh" | "powershell")
+}
+
+fn resolve_agent_powershell_path_override(
+    platform: TerminalHostPlatform,
+    config: Option<&DesktopTerminalConfig>,
+) -> Option<String> {
+    if platform != TerminalHostPlatform::Windows {
+        return None;
+    }
+
+    let startup_shell = config?.startup_shell.as_deref()?.trim();
+    match startup_shell {
+        "pwsh" => Some("pwsh.exe".to_string()),
+        "powershell" => Some("powershell.exe".to_string()),
+        "custom" => {
+            let custom_path = config?.custom_shell_path.as_deref()?.trim();
+            if is_powershell_executable_path(custom_path) {
+                Some(custom_path.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn normalize_terminal_bash_path(path: Option<String>) -> Result<Option<String>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let bash_path = PathBuf::from(trimmed);
+    if !bash_path.is_file() {
+        return Err(format!("terminal bash path does not exist: {trimmed}"));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn default_shell(_custom_bash: Option<&str>) -> String {
+    // On Windows, use configured bash path if set and valid
+    #[cfg(target_os = "windows")]
+    if let Some(bash_path) = _custom_bash {
+        let trimmed = bash_path.trim();
+        if !trimmed.is_empty() && PathBuf::from(trimmed).is_file() {
+            return trimmed.to_string();
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
@@ -1056,6 +1604,34 @@ fn default_shell() -> String {
             }
         })
     }
+}
+
+fn reserve_local_port(bind_host: &str) -> Result<u16, String> {
+    let listener = TcpListener::bind(format!("{bind_host}:0"))
+        .map_err(|err| format!("bind local port: {err}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|err| format!("read local port: {err}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+/// 按优先级尝试给定端口（h5Access.fixedPort > 上次使用的端口），
+/// 全部被占用时回退到 OS 随机分配。保证 app 总能启动。
+fn reserve_local_port_with_preference(bind_host: &str, preferred: &[u16]) -> Result<u16, String> {
+    for &port in preferred {
+        match TcpListener::bind(format!("{bind_host}:{port}")) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(port);
+            }
+            Err(err) => {
+                eprintln!("[desktop] preferred server port {port} unavailable: {err}");
+            }
+        }
+    }
+    reserve_local_port(bind_host)
 }
 
 fn wait_for_server(url_host: &str, port: u16) -> Result<(), String> {
@@ -1123,97 +1699,87 @@ fn resolve_app_root(_app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn env_string(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn select_h5_dist_dir(resource_dir: Option<&Path>, app_root: &Path) -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = resource_dir {
+        candidates.push(resource_dir.join("_up_").join("dist"));
+        candidates.push(resource_dir.join("dist"));
+    }
+    candidates.push(app_root.join("../Resources/_up_/dist"));
+    candidates.push(app_root.join("../Resources/dist"));
+
+    candidates
+        .iter()
+        .find(|candidate| candidate.join("index.html").is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            resource_dir
+                .map(|dir| dir.join("_up_").join("dist"))
+                .unwrap_or_else(|| app_root.join("../Resources/_up_/dist"))
+        })
 }
 
-fn resolve_server_bind_host() -> String {
-    env_string("CC_HAHA_DESKTOP_SERVER_HOST")
-        .or_else(|| env_string("SERVER_HOST"))
-        .unwrap_or_else(|| "0.0.0.0".to_string())
-}
-
-fn resolve_server_local_host(bind_host: &str) -> String {
-    if bind_host == "0.0.0.0" || bind_host == "::" {
-        "127.0.0.1".to_string()
-    } else {
-        bind_host.to_string()
-    }
-}
-
-fn resolve_server_port() -> Result<u16, String> {
-    if let Some(raw) = env_string("CC_HAHA_DESKTOP_SERVER_PORT").or_else(|| env_string("SERVER_PORT")) {
-        return raw
-            .parse::<u16>()
-            .map_err(|err| format!("parse desktop server port {raw:?}: {err}"));
-    }
-
-    Ok(3456)
-}
-
-fn resolve_server_access_token() -> String {
-    env_string("CC_HAHA_SERVER_ACCESS_TOKEN")
-        .or_else(|| env_string("SERVER_ACCESS_TOKEN"))
-        .unwrap_or_else(|| "cc-haha-123456".to_string())
-}
-
-fn resolve_shared_config_dir() -> Result<PathBuf, String> {
-    if let Some(raw) = env_string("CC_HAHA_SHARED_CONFIG_DIR") {
-        return Ok(PathBuf::from(raw));
-    }
-
-    let exe = std::env::current_exe().map_err(|err| format!("resolve current exe path: {err}"))?;
-    let mut current = exe.parent();
-    while let Some(dir) = current {
-        if dir.file_name().and_then(|name| name.to_str()) == Some("desktop") {
-            if let Some(repo_root) = dir.parent() {
-                return Ok(repo_root.join(".runtime").join("android-claude-config"));
-            }
-        }
-        current = dir.parent();
-    }
-
-    if let Some(raw) = env_string("CLAUDE_CONFIG_DIR") {
-        return Ok(PathBuf::from(raw));
-    }
-
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .ok_or_else(|| "USERPROFILE/HOME is not set".to_string())?;
-    Ok(PathBuf::from(home).join(".claude"))
+fn resolve_h5_dist_dir(app: &AppHandle, app_root: &Path) -> PathBuf {
+    let resource_dir = app.path().resource_dir().ok();
+    select_h5_dist_dir(resource_dir.as_deref(), app_root)
 }
 
 fn start_server_sidecar(app: &AppHandle) -> Result<ServerRuntime, String> {
-    let bind_host = resolve_server_bind_host();
-    let local_host = resolve_server_local_host(&bind_host);
-    let port = resolve_server_port()?;
-    let url = format!("http://{local_host}:{port}");
-    let access_token = resolve_server_access_token();
-    let config_dir = resolve_shared_config_dir()?;
-    let config_dir_arg = config_dir.to_string_lossy().to_string();
+    let bind_host = SERVER_BIND_HOST;
+    let control_host = SERVER_CONTROL_HOST;
+    let mut preferred_ports: Vec<u16> = Vec::new();
+    if let Some(port) = read_h5_fixed_port() {
+        preferred_ports.push(port);
+    }
+    if let Some(state) = read_stored_server_state() {
+        if !preferred_ports.contains(&state.last_port) {
+            preferred_ports.push(state.last_port);
+        }
+    }
+    let port = reserve_local_port_with_preference(bind_host, &preferred_ports)?;
+    let url = format!("http://{control_host}:{port}");
     let app_root = resolve_app_root(app)?;
     let app_root_arg = app_root.to_string_lossy().to_string();
+    let h5_dist_dir = resolve_h5_dist_dir(app, &app_root)
+        .to_string_lossy()
+        .to_string();
 
     // 单一合并 sidecar：第一个参数选 server / cli / adapters 模式。
     let mut sidecar = app
         .shell()
         .sidecar("claude-sidecar")
         .map_err(|err| format!("resolve sidecar: {err}"))?;
-    for (key, value) in terminal_environment(&default_shell()) {
+    for (key, value) in terminal_environment(&default_shell(None)) {
         sidecar = sidecar.env(key, value);
     }
-    sidecar = sidecar
-        .env("SERVER_ACCESS_TOKEN", &access_token)
-        .env("CLAUDE_CONFIG_DIR", &config_dir_arg);
+    if let Some(powershell_path) = read_agent_powershell_path_override() {
+        sidecar = sidecar.env(CLAUDE_CODE_POWERSHELL_PATH_ENV, powershell_path);
+    }
+    // Pass through CLAUDE_CONFIG_DIR so the sidecar (Node.js) uses the same
+    // portable config directory. Also set XDG_CACHE_HOME to redirect the
+    // env-paths cache from %LOCALAPPDATA%\claude-cli-nodejs\ to alongside
+    // the portable config dir.
+    if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let cache_dir = PathBuf::from(&config_dir).join("Cache");
+        if let Err(e) = fs::create_dir_all(&cache_dir) {
+            eprintln!("[desktop] failed to create Cache dir: {e}");
+        }
+        sidecar = sidecar
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .env("XDG_CACHE_HOME", cache_dir.to_string_lossy().to_string())
+            .env("CLAUDE_H5_AUTO_PUBLIC_URL", "1")
+            .env("CLAUDE_H5_DIST_DIR", h5_dist_dir);
+    } else {
+        sidecar = sidecar
+            .env("CLAUDE_H5_AUTO_PUBLIC_URL", "1")
+            .env("CLAUDE_H5_DIST_DIR", h5_dist_dir);
+    }
     let sidecar = sidecar.args([
         "server",
         "--app-root",
         &app_root_arg,
         "--host",
-        &bind_host,
+        bind_host,
         "--port",
         &port.to_string(),
     ]);
@@ -1253,12 +1819,14 @@ fn start_server_sidecar(app: &AppHandle) -> Result<ServerRuntime, String> {
         }
     });
 
-    if let Err(err) = wait_for_server(&local_host, port) {
-        let _ = child.kill();
+    if let Err(err) = wait_for_server(control_host, port) {
+        kill_sidecar_child(child);
         return Err(format_server_startup_error(&err, &startup_logs));
     }
 
-    Ok(ServerRuntime { url, access_token, child })
+    write_stored_server_state(&StoredServerState { last_port: port });
+
+    Ok(ServerRuntime { url, child })
 }
 
 fn stop_server_sidecar(app: &AppHandle) {
@@ -1271,7 +1839,7 @@ fn stop_server_sidecar(app: &AppHandle) {
     };
 
     if let Some(runtime) = guard.runtime.take() {
-        let _ = runtime.child.kill();
+        kill_sidecar_child(runtime.child);
     }
 }
 
@@ -1284,8 +1852,8 @@ fn start_adapters_sidecars(app: &AppHandle) -> Result<Vec<CommandChild>, String>
     let app_root = resolve_app_root(app)?;
     let app_root_arg = app_root.to_string_lossy().to_string();
 
-    // adapter 内部的 WsBridge 默认连 ws://127.0.0.1:3456。这里把桌面端
-    // 实际启动的共享 server URL 通过
+    // adapter 内部的 WsBridge 默认连 ws://127.0.0.1:3456，但桌面端的 server
+    // 用的是 reserve_local_port() 拿到的动态端口。这里把实际端口通过
     // ADAPTER_SERVER_URL env var 传过去 —— adapters/common/config.ts 的
     // loadConfig() 会读它。
     //
@@ -1317,20 +1885,24 @@ fn start_adapters_sidecars(app: &AppHandle) -> Result<Vec<CommandChild>, String>
         ("telegram", "--telegram"),
         ("wechat", "--wechat"),
         ("dingtalk", "--dingtalk"),
+        ("whatsapp", "--whatsapp"),
     ] {
         let mut sidecar = app
             .shell()
             .sidecar("claude-sidecar")
             .map_err(|err| format!("resolve {label} adapter sidecar: {err}"))?;
-        for (key, value) in terminal_environment(&default_shell()) {
+        for (key, value) in terminal_environment(&default_shell(None)) {
             sidecar = sidecar.env(key, value);
         }
-        let sidecar = sidecar.env("ADAPTER_SERVER_URL", &server_ws_url).args([
-            "adapters",
-            "--app-root",
-            &app_root_arg,
-            flag,
-        ]);
+        // Pass through CLAUDE_CONFIG_DIR for portable installs
+        let mut sidecar_final = sidecar.env("ADAPTER_SERVER_URL", &server_ws_url);
+        if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+            let cache_dir = PathBuf::from(&config_dir).join("Cache");
+            sidecar_final = sidecar_final
+                .env("CLAUDE_CONFIG_DIR", &config_dir)
+                .env("XDG_CACHE_HOME", cache_dir.to_string_lossy().to_string());
+        }
+        let sidecar = sidecar_final.args(["adapters", "--app-root", &app_root_arg, flag]);
 
         let (mut rx, child) = sidecar
             .spawn()
@@ -1395,8 +1967,71 @@ fn stop_adapters_sidecar(app: &AppHandle) {
         return;
     };
     for child in guard.drain(..) {
+        kill_sidecar_child(child);
+    }
+}
+
+fn kill_sidecar_child(child: CommandChild) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = child.pid().to_string();
+        if StdCommand::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        terminate_unix_sidecar_child(child);
+    }
+
+    #[cfg(not(unix))]
+    {
         let _ = child.kill();
     }
+}
+
+#[cfg(unix)]
+fn terminate_unix_sidecar_child(child: CommandChild) {
+    let pid = child.pid();
+    let pid_text = pid.to_string();
+
+    // tauri-plugin-shell's CommandChild::kill() maps to SIGKILL on Unix.
+    // Give bundled sidecars a SIGTERM window first so the server can stop
+    // CLI sessions it spawned before the native app exits.
+    let _ = StdCommand::new("kill")
+        .args(["-TERM", &pid_text])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let deadline = Instant::now() + SIDECAR_GRACEFUL_TERMINATION_TIMEOUT;
+    while Instant::now() < deadline {
+        if !is_unix_process_running(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn is_unix_process_running(pid: u32) -> bool {
+    StdCommand::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1450,11 +2085,15 @@ fn kill_windows_sidecars() {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_terminal_output, default_utf8_locale, ensure_utf8_locale,
-        has_meaningful_intersection, is_persistable_window_state, parse_env_block,
-        run_notification_bridge, StoredWindowState,
+        decode_terminal_output, default_utf8_locale, dir_has_portable_data, ensure_utf8_locale,
+        has_meaningful_intersection, is_persistable_window_state, normalize_terminal_bash_path,
+        parse_env_block, parse_h5_fixed_port, reserve_local_port_with_preference,
+        resolve_agent_powershell_path_override, resolve_desktop_terminal_shell,
+        resolve_terminal_cwd, run_notification_bridge, select_h5_dist_dir, DesktopTerminalConfig,
+        StoredServerState, StoredWindowState, TerminalHostPlatform, SERVER_BIND_HOST,
+        SERVER_CONTROL_HOST,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fs, net::TcpListener};
 
     #[test]
     fn window_state_rejects_too_small_sizes() {
@@ -1553,6 +2192,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_bash_path_normalizer_clears_blank_values() {
+        assert_eq!(
+            normalize_terminal_bash_path(Some("   ".to_string())).expect("blank path clears"),
+            None
+        );
+        assert_eq!(
+            normalize_terminal_bash_path(None).expect("missing path clears"),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_bash_path_normalizer_rejects_missing_files() {
+        let missing =
+            std::env::temp_dir().join(format!("cchh-missing-bash-{}", std::process::id()));
+
+        let error = normalize_terminal_bash_path(Some(missing.to_string_lossy().to_string()))
+            .expect_err("missing path should be rejected");
+
+        assert!(error.contains("terminal bash path does not exist"));
+    }
+
+    #[test]
+    fn terminal_bash_path_normalizer_accepts_existing_files() {
+        let path = std::env::temp_dir().join(format!("cchh-bash-path-test-{}", std::process::id()));
+        fs::write(&path, "").expect("write bash path fixture");
+
+        assert_eq!(
+            normalize_terminal_bash_path(Some(format!("  {}  ", path.display())))
+                .expect("existing file is accepted"),
+            Some(path.to_string_lossy().to_string())
+        );
+
+        fs::remove_file(path).expect("remove bash path fixture");
+    }
+
+    #[test]
     fn terminal_environment_forces_utf8_locale_when_shell_uses_c_locale() {
         let mut env = HashMap::from([
             ("LANG".to_string(), "C".to_string()),
@@ -1592,6 +2268,218 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cwd_defaults_to_portable_config_dir_when_present() {
+        let original = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let dir = std::env::temp_dir().join(format!(
+            "cchh-terminal-portable-cwd-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create portable config dir");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+
+        let cwd = resolve_terminal_cwd(None).expect("portable cwd should resolve");
+
+        assert_eq!(cwd, dir);
+
+        if let Some(value) = original {
+            std::env::set_var("CLAUDE_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
+        fs::remove_dir_all(cwd).expect("remove portable config dir");
+    }
+
+    #[test]
+    fn portable_data_detection_includes_cli_state_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "cchh-portable-data-detect-{}",
+            std::process::id()
+        ));
+        let skills = root.join("skills");
+        fs::create_dir_all(&skills).expect("create skills dir");
+
+        assert!(dir_has_portable_data(&root));
+
+        fs::remove_dir_all(root).expect("remove portable data fixture");
+    }
+
+    #[test]
+    fn desktop_terminal_shell_resolution_keeps_system_default_without_preference() {
+        assert_eq!(
+            resolve_desktop_terminal_shell(TerminalHostPlatform::Windows, None, "powershell.exe",)
+                .expect("resolution should succeed"),
+            None
+        );
+    }
+
+    #[test]
+    fn desktop_terminal_shell_resolution_supports_windows_pwsh_and_custom_path() {
+        let pwsh = DesktopTerminalConfig {
+            startup_shell: Some("pwsh".to_string()),
+            custom_shell_path: None,
+        };
+        assert_eq!(
+            resolve_desktop_terminal_shell(
+                TerminalHostPlatform::Windows,
+                Some(&pwsh),
+                "powershell.exe",
+            )
+            .expect("pwsh resolution should succeed"),
+            Some("pwsh.exe".to_string())
+        );
+
+        let custom = DesktopTerminalConfig {
+            startup_shell: Some("custom".to_string()),
+            custom_shell_path: Some("/tmp/custom-shell".to_string()),
+        };
+        assert_eq!(
+            resolve_desktop_terminal_shell(
+                TerminalHostPlatform::Windows,
+                Some(&custom),
+                "powershell.exe",
+            )
+            .expect("custom resolution should succeed"),
+            Some("/tmp/custom-shell".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_powershell_override_uses_windows_power_shell_preferences() {
+        let pwsh = DesktopTerminalConfig {
+            startup_shell: Some("pwsh".to_string()),
+            custom_shell_path: None,
+        };
+        assert_eq!(
+            resolve_agent_powershell_path_override(TerminalHostPlatform::Windows, Some(&pwsh)),
+            Some("pwsh.exe".to_string())
+        );
+
+        let powershell = DesktopTerminalConfig {
+            startup_shell: Some("powershell".to_string()),
+            custom_shell_path: None,
+        };
+        assert_eq!(
+            resolve_agent_powershell_path_override(
+                TerminalHostPlatform::Windows,
+                Some(&powershell),
+            ),
+            Some("powershell.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_powershell_override_accepts_only_custom_power_shell_paths() {
+        let custom_pwsh = DesktopTerminalConfig {
+            startup_shell: Some("custom".to_string()),
+            custom_shell_path: Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()),
+        };
+        assert_eq!(
+            resolve_agent_powershell_path_override(
+                TerminalHostPlatform::Windows,
+                Some(&custom_pwsh),
+            ),
+            Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string())
+        );
+
+        let custom_bash = DesktopTerminalConfig {
+            startup_shell: Some("custom".to_string()),
+            custom_shell_path: Some(r"C:\Program Files\Git\bin\bash.exe".to_string()),
+        };
+        assert_eq!(
+            resolve_agent_powershell_path_override(
+                TerminalHostPlatform::Windows,
+                Some(&custom_bash),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn server_sidecar_binds_lan_but_reports_loopback_control_url() {
+        assert_eq!(SERVER_BIND_HOST, "0.0.0.0");
+        assert_eq!(SERVER_CONTROL_HOST, "127.0.0.1");
+    }
+
+    #[test]
+    fn h5_fixed_port_parses_only_valid_in_range_values() {
+        assert_eq!(
+            parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":28670}}"#),
+            Some(28670)
+        );
+        // Out of range, wrong type, missing, or null all fall back to None.
+        assert_eq!(parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":80}}"#), None);
+        assert_eq!(
+            parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":70000}}"#),
+            None
+        );
+        assert_eq!(
+            parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":"3456"}}"#),
+            None
+        );
+        assert_eq!(
+            parse_h5_fixed_port(r#"{"h5Access":{"fixedPort":null}}"#),
+            None
+        );
+        assert_eq!(parse_h5_fixed_port(r#"{"h5Access":{}}"#), None);
+        assert_eq!(parse_h5_fixed_port("{}"), None);
+        assert_eq!(parse_h5_fixed_port("not json"), None);
+    }
+
+    #[test]
+    fn preferred_port_is_used_when_free_and_skipped_when_taken() {
+        // Find a port that is currently free, then verify preference picks it.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let free_port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+
+        let reserved = reserve_local_port_with_preference("127.0.0.1", &[free_port])
+            .expect("reserve preferred");
+        assert_eq!(reserved, free_port);
+
+        // Occupy a port and verify preference falls back to a random one.
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy bind");
+        let occupied_port = occupied.local_addr().expect("occupied addr").port();
+
+        let fallback = reserve_local_port_with_preference("127.0.0.1", &[occupied_port])
+            .expect("reserve fallback");
+        assert_ne!(fallback, occupied_port);
+        drop(occupied);
+
+        // Empty preference list behaves like the plain random reservation.
+        assert!(reserve_local_port_with_preference("127.0.0.1", &[]).is_ok());
+    }
+
+    #[test]
+    fn stored_server_state_round_trips_camel_case_json() {
+        let state = StoredServerState { last_port: 28670 };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert_eq!(json, r#"{"lastPort":28670}"#);
+        assert_eq!(
+            serde_json::from_str::<StoredServerState>(&json).expect("parse"),
+            state
+        );
+    }
+
+    #[test]
+    fn h5_dist_dir_prefers_tauri_parent_resource_mapping() {
+        let root = std::env::temp_dir().join(format!("cchh-h5-dist-test-{}", std::process::id()));
+        let resource_dir = root.join("Contents").join("Resources");
+        let app_root = root.join("Contents").join("MacOS");
+        let mapped_dist = resource_dir.join("_up_").join("dist");
+
+        fs::create_dir_all(&mapped_dist).expect("create mapped dist dir");
+        fs::create_dir_all(&app_root).expect("create app root dir");
+        fs::write(mapped_dist.join("index.html"), "").expect("write h5 shell");
+
+        assert_eq!(
+            select_h5_dist_dir(Some(&resource_dir), &app_root),
+            mapped_dist
+        );
+
+        fs::remove_dir_all(root).expect("remove temp app tree");
+    }
+
+    #[test]
     fn notification_bridge_runs_off_the_calling_thread() {
         let caller_thread = std::thread::current().id();
         let ran_on_worker = tauri::async_runtime::block_on(run_notification_bridge(move || {
@@ -1614,6 +2502,7 @@ pub fn run() {
         .manage(AdapterState::default())
         .manage(TerminalState::default())
         .manage(AppExitState::default())
+        .manage(webview_panel::PreviewState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
@@ -1621,18 +2510,31 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_server_url,
-            get_server_access_token,
             restart_adapters_sidecar,
             prepare_for_update_install,
+            prepare_for_app_mode_restart,
             cancel_update_install,
             terminal_spawn,
             terminal_write,
             terminal_resize,
             terminal_kill,
+            get_terminal_bash_path,
+            set_terminal_bash_path,
             macos_notification_permission_state,
             macos_request_notification_permission,
             macos_send_notification,
-            open_windows_notification_settings
+            open_windows_notification_settings,
+            get_app_mode,
+            set_app_mode,
+            detect_portable_dir,
+            set_app_zoom,
+            webview_panel::preview_open,
+            webview_panel::preview_navigate,
+            webview_panel::preview_set_bounds,
+            webview_panel::preview_set_visible,
+            webview_panel::preview_close,
+            webview_panel::preview_message,
+            webview_panel::preview_eval
         ]);
 
     // macOS: native menu bar (traffic-light overlay style)
@@ -1721,7 +2623,7 @@ pub fn run() {
 
             // server 起来之后再起 adapter sidecar —— start_adapters_sidecar
             // 内部会从 ServerState 读 server URL 注入 ADAPTER_SERVER_URL env，
-            // 让 adapter 连上桌面端启动的共享 server。
+            // 让 adapter 连上动态端口。
             spawn_and_track_adapters_sidecar(&app.handle());
 
             Ok(())

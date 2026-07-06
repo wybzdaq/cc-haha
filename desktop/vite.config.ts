@@ -6,8 +6,12 @@ import path from 'path'
 const host = process.env.TAURI_DEV_HOST
 
 export default defineConfig({
+  base: './',
   plugins: [react(), tailwindcss()],
   build: {
+    // Vite 8 defaults to baseline-widely-available (safari16.4+), which
+    // requires macOS 13+. Tauri on macOS 12 uses Safari 15 WebView.
+    target: ['es2021', 'safari15'],
     chunkSizeWarningLimit: 2200,
     rollupOptions: {
       onwarn(warning, warn) {

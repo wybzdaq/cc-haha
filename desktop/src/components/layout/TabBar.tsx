@@ -1,21 +1,37 @@
-import { forwardRef, useRef, useState, useEffect, useCallback } from 'react'
+import { forwardRef, useMemo, useRef, useState, useEffect, useCallback } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import {
   SCHEDULED_TAB_ID,
   SETTINGS_TAB_ID,
   TERMINAL_TAB_PREFIX,
+  TRACE_LIST_TAB_ID,
+  TRACE_TAB_PREFIX,
+  WORKBENCH_TAB_PREFIX,
   useTabStore,
   type Tab,
 } from '../../stores/tabStore'
 import { useChatStore } from '../../stores/chatStore'
+import { useSessionStore } from '../../stores/sessionStore'
+import { isPlaceholderSessionTitle } from '../../lib/sessionTitle'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useTerminalPanelStore } from '../../stores/terminalPanelStore'
 import { useTranslation } from '../../i18n'
+import { getDesktopHost } from '../../lib/desktopHost'
+import { hasRunningBackgroundTasks } from '../../lib/backgroundTasks'
 import { WindowControls, showWindowControls } from './WindowControls'
+import { OpenProjectMenu } from './OpenProjectMenu'
 import { Folder, FolderOpen, SquareTerminal } from 'lucide-react'
+import { ActionDialog } from '../shared/ActionDialog'
 
 const TAB_WIDTH = 180
 const DRAG_START_THRESHOLD = 4
-const isTauri = typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+const desktopHost = getDesktopHost()
+const isDesktopRuntime = desktopHost.isDesktop
+
+type PendingCloseRequest = {
+  tabs: Tab[]
+  runningSessionIds: string[]
+}
 
 function isSessionTab(tab: Tab | null) {
   if (!tab) return false
@@ -29,7 +45,10 @@ function isSessionTabId(tabId: string | null) {
   if (!tabId) return false
   return tabId !== SETTINGS_TAB_ID &&
     tabId !== SCHEDULED_TAB_ID &&
-    !tabId.startsWith(TERMINAL_TAB_PREFIX)
+    tabId !== TRACE_LIST_TAB_ID &&
+    !tabId.startsWith(TERMINAL_TAB_PREFIX) &&
+    !tabId.startsWith(TRACE_TAB_PREFIX) &&
+    !tabId.startsWith(WORKBENCH_TAB_PREFIX)
 }
 
 export function TabBar() {
@@ -37,12 +56,36 @@ export function TabBar() {
   const activeTabId = useTabStore((s) => s.activeTabId)
   const setActiveTab = useTabStore((s) => s.setActiveTab)
   const closeTab = useTabStore((s) => s.closeTab)
+  const sessionTabIds = useMemo(
+    () => tabs.filter((tab) => isSessionTab(tab)).map((tab) => tab.sessionId),
+    [tabs],
+  )
+  const activeChatSessionIds = useChatStore(useShallow((s) =>
+    sessionTabIds.filter((sessionId) => {
+      const sessionState = s.sessions[sessionId]
+      return !!sessionState &&
+        (sessionState.chatState !== 'idle' || hasRunningBackgroundTasks(sessionState.backgroundAgentTasks))
+    })
+  ))
   const disconnectSession = useChatStore((s) => s.disconnectSession)
   const activeTab = tabs.find((tab) => tab.sessionId === activeTabId) ?? null
   const isActiveSessionTab = isSessionTab(activeTab) || isSessionTabId(activeTabId)
-  const isWorkspacePanelOpen = useWorkspacePanelStore((state) =>
+  const activeSession = useSessionStore((state) =>
+    activeTabId ? state.sessions.find((session) => session.id === activeTabId) : undefined,
+  )
+  const openProjectPath = isActiveSessionTab && activeSession?.workDirExists !== false
+    ? activeSession?.workDir ?? null
+    : null
+  // The right-side panel is now a single unified "workbench" with a per-session
+  // mode (file ↔ browser). The folder/browser toolbar buttons reflect whether
+  // the panel is open in their respective mode.
+  const isWorkbenchOpen = useWorkspacePanelStore((state) =>
     activeTabId && isActiveSessionTab ? state.isPanelOpen(activeTabId) : false,
   )
+  const workbenchMode = useWorkspacePanelStore((state) =>
+    activeTabId && isActiveSessionTab ? state.getMode(activeTabId) : 'workspace',
+  )
+  const isWorkspacePanelOpen = isWorkbenchOpen && workbenchMode === 'workspace'
   const isTerminalPanelOpen = useTerminalPanelStore((state) =>
     activeTabId && isActiveSessionTab ? state.isPanelOpen(activeTabId) : false,
   )
@@ -52,7 +95,7 @@ export function TabBar() {
   const [canScrollLeft, setCanScrollLeft] = useState(false)
   const [canScrollRight, setCanScrollRight] = useState(false)
   const [contextMenu, setContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null)
-  const [closingTabId, setClosingTabId] = useState<string | null>(null)
+  const [pendingCloseRequest, setPendingCloseRequest] = useState<PendingCloseRequest | null>(null)
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null)
   const [draggingSessionId, setDraggingSessionId] = useState<string | null>(null)
   const [dragOffsetX, setDragOffsetX] = useState(0)
@@ -60,18 +103,17 @@ export function TabBar() {
   const pendingDragRef = useRef<{ index: number; startX: number; startY: number } | null>(null)
   const suppressClickRef = useRef(false)
   const tabRefs = useRef(new Map<string, HTMLDivElement | null>())
-  const startDraggingRef = useRef<(() => Promise<void>) | null>(null)
   const t = useTranslation()
-
-  useEffect(() => {
-    if (!isTauri) return
-    import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => {
-        const win = getCurrentWindow()
-        startDraggingRef.current = () => win.startDragging()
-      })
-      .catch(() => {})
-  }, [])
+  const runningSessionIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const tab of tabs) {
+      if (isSessionTab(tab) && tab.status === 'running') ids.add(tab.sessionId)
+    }
+    for (const sessionId of activeChatSessionIds) {
+      ids.add(sessionId)
+    }
+    return ids
+  }, [activeChatSessionIds, tabs])
 
   const updateScrollState = useCallback(() => {
     const el = scrollRef.current
@@ -129,25 +171,57 @@ export function TabBar() {
     closeTab(tab.sessionId)
   }, [closeTab])
 
+  const getRunningSessionIds = useCallback((targetTabs: Tab[]) => {
+    const chatSessions = useChatStore.getState().sessions
+    return targetTabs
+      .filter((tab) => isSessionTab(tab))
+      .filter((tab) => {
+        const sessionState = chatSessions[tab.sessionId]
+        return !!sessionState &&
+          (sessionState.chatState !== 'idle' || hasRunningBackgroundTasks(sessionState.backgroundAgentTasks))
+      })
+      .map((tab) => tab.sessionId)
+  }, [])
+
+  const closeTabsWithPolicy = useCallback((targetTabs: Tab[], runningSessionIds: string[], stopRunning: boolean) => {
+    const runningSessionSet = new Set(runningSessionIds)
+
+    for (const tab of targetTabs) {
+      if (isSessionTab(tab)) {
+        const isRunning = runningSessionSet.has(tab.sessionId)
+        if (isRunning && stopRunning) {
+          useChatStore.getState().stopGeneration(tab.sessionId)
+        }
+        if (!isRunning || stopRunning) {
+          // Auto-delete empty sessions (placeholder title, no messages sent)
+          const sessionEntry = useSessionStore.getState().sessions.find((s) => s.id === tab.sessionId)
+          const chatEntry = useChatStore.getState().sessions[tab.sessionId]
+          if (isPlaceholderSessionTitle(sessionEntry?.title) && (!chatEntry || chatEntry.messages.length === 0)) {
+            void useSessionStore.getState().deleteSession(tab.sessionId)
+          }
+          disconnectSession(tab.sessionId)
+        }
+      }
+      closeTabWithCleanup(tab)
+    }
+  }, [closeTabWithCleanup, disconnectSession])
+
+  const requestCloseTabs = useCallback((targetTabs: Tab[]) => {
+    if (targetTabs.length === 0) return
+    const runningSessionIds = getRunningSessionIds(targetTabs)
+
+    if (runningSessionIds.length > 0) {
+      setPendingCloseRequest({ tabs: targetTabs, runningSessionIds })
+      return
+    }
+
+    closeTabsWithPolicy(targetTabs, [], false)
+  }, [closeTabsWithPolicy, getRunningSessionIds])
+
   const handleClose = (sessionId: string) => {
-    // Special tabs can always be closed directly
     const tab = tabs.find((t) => t.sessionId === sessionId)
     if (!tab) return
-    if (!isSessionTab(tab)) {
-      closeTabWithCleanup(tab)
-      return
-    }
-
-    const sessionState = useChatStore.getState().sessions[sessionId]
-    const isRunning = sessionState && sessionState.chatState !== 'idle'
-
-    if (isRunning) {
-      setClosingTabId(sessionId)
-      return
-    }
-
-    disconnectSession(sessionId)
-    closeTabWithCleanup(tab)
+    requestCloseTabs([tab])
   }
 
   const handleContextMenu = (e: React.MouseEvent, sessionId: string) => {
@@ -158,38 +232,26 @@ export function TabBar() {
   const handleCloseOthers = (sessionId: string) => {
     setContextMenu(null)
     const otherTabs = tabs.filter((t) => t.sessionId !== sessionId)
-    for (const tab of otherTabs) {
-      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
-      closeTabWithCleanup(tab)
-    }
+    requestCloseTabs(otherTabs)
   }
 
   const handleCloseLeft = (sessionId: string) => {
     setContextMenu(null)
     const idx = tabs.findIndex((t) => t.sessionId === sessionId)
     const leftTabs = tabs.slice(0, idx)
-    for (const tab of leftTabs) {
-      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
-      closeTabWithCleanup(tab)
-    }
+    requestCloseTabs(leftTabs)
   }
 
   const handleCloseRight = (sessionId: string) => {
     setContextMenu(null)
     const idx = tabs.findIndex((t) => t.sessionId === sessionId)
     const rightTabs = tabs.slice(idx + 1)
-    for (const tab of rightTabs) {
-      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
-      closeTabWithCleanup(tab)
-    }
+    requestCloseTabs(rightTabs)
   }
 
   const handleCloseAll = () => {
     setContextMenu(null)
-    for (const tab of tabs) {
-      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
-      closeTabWithCleanup(tab)
-    }
+    requestCloseTabs(tabs)
   }
 
   const getTargetIndexFromClientX = useCallback((clientX: number) => {
@@ -276,40 +338,37 @@ export function TabBar() {
     setActiveTab(sessionId)
   }
 
-  const handleScrollRegionMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || event.target !== scrollRef.current) return
-    const startDragging = startDraggingRef.current
-    if (!startDragging) return
-    void startDragging().catch(() => {})
-  }, [])
-
   return (
     <div
       data-testid="tab-bar"
-      className="flex items-stretch bg-[var(--color-surface-container)] min-h-[37px] select-none border-b border-[var(--color-border)]"
+      data-desktop-drag-region={isDesktopRuntime ? true : undefined}
+      className="flex min-h-11 items-stretch bg-[var(--color-surface-container)] select-none border-b border-[var(--color-border)]"
     >
 
       {canScrollLeft && (
-        <button onClick={() => scroll('left')} className="flex-shrink-0 w-7 h-[37px] flex items-center justify-center text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]">
+        <button onClick={() => scroll('left')} className="flex h-11 w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
           <span className="material-symbols-outlined text-[16px]">chevron_left</span>
         </button>
       )}
 
       <div
         ref={scrollRef}
-        className="tab-bar-hit-area flex-1 flex items-stretch overflow-x-hidden"
+        data-testid="tab-bar-scroll-region"
+        data-desktop-drag-region={isDesktopRuntime ? true : undefined}
+        className="flex-1 flex items-stretch overflow-x-hidden"
         onDragOver={(e) => e.preventDefault()}
-        onMouseDown={handleScrollRegionMouseDown}
       >
         {tabs.map((tab, index) => (
           <TabItem
             key={tab.sessionId}
             ref={(node) => { tabRefs.current.set(tab.sessionId, node) }}
             tab={tab}
+            isRunning={runningSessionIds.has(tab.sessionId)}
             isActive={tab.sessionId === activeTabId}
             isDragOver={dragOverIndex === index}
             isDragging={tab.sessionId === draggingSessionId}
             dragOffsetX={tab.sessionId === draggingSessionId ? dragOffsetX : 0}
+            runningLabel={t('tabs.sessionRunning')}
             onClick={() => handleTabClick(tab.sessionId)}
             onClose={() => handleClose(tab.sessionId)}
             onContextMenu={(e) => handleContextMenu(e, tab.sessionId)}
@@ -319,6 +378,9 @@ export function TabBar() {
       </div>
 
       <div className="flex shrink-0 items-center gap-1 border-l border-[var(--color-border)]/70 px-2">
+        {isDesktopRuntime && isActiveSessionTab && (
+          <OpenProjectMenu path={openProjectPath} />
+        )}
         <ToolbarIconButton
           icon={<SquareTerminal size={17} strokeWidth={1.9} />}
           label={t('tabs.openTerminal')}
@@ -335,23 +397,31 @@ export function TabBar() {
           <ToolbarIconButton
             icon={isWorkspacePanelOpen ? <FolderOpen size={18} strokeWidth={1.9} /> : <Folder size={18} strokeWidth={1.9} />}
             label={t(isWorkspacePanelOpen ? 'tabs.hideWorkspace' : 'tabs.showWorkspace')}
-            onClick={() => useWorkspacePanelStore.getState().togglePanel(activeTabId)}
+            onClick={() => {
+              const workbench = useWorkspacePanelStore.getState()
+              if (workbench.isPanelOpen(activeTabId) && workbench.getMode(activeTabId) === 'workspace') {
+                workbench.closePanel(activeTabId)
+              } else {
+                workbench.setMode(activeTabId, 'workspace')
+                workbench.openPanel(activeTabId)
+              }
+            }}
             active={isWorkspacePanelOpen}
           />
         )}
       </div>
 
-      {isTauri && (
+      {isDesktopRuntime && (
         <div
           data-testid="tab-bar-drag-gutter"
-          data-tauri-drag-region
+          data-desktop-drag-region
           aria-hidden="true"
-          className={`flex-shrink-0 min-h-[37px] ${showWindowControls ? 'w-3' : 'w-4'}`}
+          className={`min-h-11 flex-shrink-0 ${showWindowControls ? 'w-3' : 'w-4'}`}
         />
       )}
 
       {canScrollRight && (
-        <button onClick={() => scroll('right')} className="flex-shrink-0 w-7 h-[37px] flex items-center justify-center text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]">
+        <button onClick={() => scroll('right')} className="flex h-11 w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
           <span className="material-symbols-outlined text-[16px]">chevron_right</span>
         </button>
       )}
@@ -397,56 +467,60 @@ export function TabBar() {
         </div>
       )}
 
-      {closingTabId && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30">
-          <div className="bg-[var(--color-surface)] rounded-xl border border-[var(--color-border)] p-6 max-w-sm w-full mx-4" style={{ boxShadow: 'var(--shadow-dropdown)' }}>
-            <h3 className="text-sm font-semibold text-[var(--color-text-primary)] mb-2">{t('tabs.closeConfirmTitle')}</h3>
-            <p className="text-xs text-[var(--color-text-secondary)] mb-4">{t('tabs.closeConfirmMessage')}</p>
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setClosingTabId(null)} className="px-3 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]">
-                {t('common.cancel')}
-              </button>
-              <button
-                onClick={() => {
-                  const tab = tabs.find((item) => item.sessionId === closingTabId)
-                  if (tab) closeTabWithCleanup(tab)
-                  setClosingTabId(null)
-                }}
-                className="px-3 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]"
-              >
-                {t('tabs.closeConfirmKeep')}
-              </button>
-              <button
-                onClick={() => {
-                  useChatStore.getState().stopGeneration(closingTabId)
-                  disconnectSession(closingTabId)
-                  const tab = tabs.find((item) => item.sessionId === closingTabId)
-                  if (tab) closeTabWithCleanup(tab)
-                  setClosingTabId(null)
-                }}
-                className="px-3 py-1.5 text-xs rounded-lg bg-[var(--color-brand)] text-white hover:opacity-90"
-              >
-                {t('tabs.closeConfirmStop')}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ActionDialog
+        open={pendingCloseRequest !== null}
+        onClose={() => setPendingCloseRequest(null)}
+        title={pendingCloseRequest && pendingCloseRequest.runningSessionIds.length > 1
+          ? t('tabs.closeAllConfirmTitle')
+          : t('tabs.closeConfirmTitle')}
+        body={pendingCloseRequest && pendingCloseRequest.runningSessionIds.length > 1
+          ? t('tabs.closeAllConfirmMessage', { count: pendingCloseRequest.runningSessionIds.length })
+          : t('tabs.closeConfirmMessage')}
+        actions={[
+          {
+            label: t('common.cancel'),
+            onClick: () => setPendingCloseRequest(null),
+            variant: 'secondary',
+          },
+          {
+            label: t('tabs.closeConfirmKeep'),
+            onClick: () => {
+              if (!pendingCloseRequest) return
+              closeTabsWithPolicy(pendingCloseRequest.tabs, pendingCloseRequest.runningSessionIds, false)
+              setPendingCloseRequest(null)
+            },
+            variant: 'secondary',
+          },
+          {
+            label: pendingCloseRequest && pendingCloseRequest.runningSessionIds.length > 1
+              ? t('tabs.closeAllConfirmStop')
+              : t('tabs.closeConfirmStop'),
+            onClick: () => {
+              if (!pendingCloseRequest) return
+              closeTabsWithPolicy(pendingCloseRequest.tabs, pendingCloseRequest.runningSessionIds, true)
+              setPendingCloseRequest(null)
+            },
+            variant: 'danger',
+          },
+        ]}
+      />
     </div>
   )
 }
 
 const TabItem = forwardRef<HTMLDivElement, {
   tab: Tab
+  isRunning: boolean
   isActive: boolean
   isDragOver: boolean
   isDragging: boolean
   dragOffsetX: number
+  runningLabel: string
   onClick: () => void
   onClose: () => void
   onContextMenu: (e: React.MouseEvent) => void
   onMouseDown: (event: React.MouseEvent) => void
-}>(({ tab, isActive, isDragOver, isDragging, dragOffsetX, onClick, onClose, onContextMenu, onMouseDown }, ref) => {
+}>(({ tab, isRunning, isActive, isDragOver, isDragging, dragOffsetX, runningLabel, onClick, onClose, onContextMenu, onMouseDown }, ref) => {
   return (
     <div
       ref={ref}
@@ -455,7 +529,7 @@ const TabItem = forwardRef<HTMLDivElement, {
       onMouseDown={onMouseDown}
       onContextMenu={onContextMenu}
       className={`
-        tab-bar-hit-area group flex-shrink-0 flex items-center gap-1.5 px-3 min-h-[37px] relative
+        tab-bar-interactive group relative flex min-h-11 flex-shrink-0 items-center gap-1.5 px-3
         ${isDragging ? 'z-20 cursor-grabbing' : 'cursor-grab'}
         transition-[background-color,box-shadow,opacity,transform] duration-150 ease-out
         ${isActive
@@ -471,8 +545,12 @@ const TabItem = forwardRef<HTMLDivElement, {
         transform: isDragging ? `translateX(${dragOffsetX}px) scale(1.02)` : undefined,
       }}
     >
-      {tab.type === 'session' && tab.status === 'running' && (
-        <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-success)] animate-pulse flex-shrink-0" />
+      {tab.type === 'session' && isRunning && (
+        <span
+          className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-[var(--color-success)] animate-pulse"
+          aria-label={runningLabel}
+          title={runningLabel}
+        />
       )}
       {tab.type === 'session' && tab.status === 'error' && (
         <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-error)] flex-shrink-0" />
@@ -485,6 +563,9 @@ const TabItem = forwardRef<HTMLDivElement, {
       )}
       {tab.type === 'terminal' && (
         <span className="material-symbols-outlined text-[14px] flex-shrink-0 text-[var(--color-text-tertiary)]">terminal</span>
+      )}
+      {tab.type === 'workbench' && (
+        <span className="material-symbols-outlined text-[14px] flex-shrink-0 text-[var(--color-text-tertiary)]">view_sidebar</span>
       )}
 
       <span className={`flex-1 truncate text-xs ${isActive ? 'text-[var(--color-text-primary)] font-medium' : 'text-[var(--color-text-secondary)]'}`}>

@@ -11,18 +11,20 @@ import type {
 import type { ProviderPreset } from '../types/providerPreset'
 
 type ProvidersResponse = { providers: SavedProvider[]; activeId: string | null }
+type ProvidersListResponse = ProvidersResponse & { providerOrder?: string[] }
+type ProvidersReorderResponse = { providers: SavedProvider[]; providerOrder?: string[] }
 type ProviderResponse = { provider: SavedProvider }
 type PresetsResponse = { presets: ProviderPreset[] }
 type TestResultResponse = { result: ProviderTestResult }
 type AuthStatusResponse = {
   hasAuth: boolean
-  source: 'cc-haha-provider' | 'original-settings' | 'env' | 'none'
+  source: 'cc-haha-provider' | 'openai-oauth' | 'original-settings' | 'env' | 'none'
   activeProvider?: string
 }
 
 export const providersApi = {
   list() {
-    return api.get<ProvidersResponse>('/api/providers')
+    return api.get<ProvidersListResponse>('/api/providers')
   },
 
   presets() {
@@ -59,6 +61,10 @@ export const providersApi = {
 
   activateOfficial() {
     return api.post<{ ok: true }>('/api/providers/official')
+  },
+
+  reorder(orderedIds: string[]) {
+    return api.put<ProvidersReorderResponse>('/api/providers/reorder', { orderedIds })
   },
 
   test(id: string, overrides?: { baseUrl?: string; modelId?: string; apiFormat?: string; authStrategy?: string }) {

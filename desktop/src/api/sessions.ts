@@ -1,6 +1,8 @@
 import { api } from './client'
 import type { AgentTaskNotification } from '../types/chat'
 import type { SessionListItem, MessageEntry } from '../types/session'
+import type { PermissionMode } from '../types/settings'
+import type { TraceCallRecord, TraceSession } from '../types/trace'
 
 type SessionsResponse = { sessions: SessionListItem[]; total: number }
 type MessagesResponse = {
@@ -8,6 +10,15 @@ type MessagesResponse = {
   taskNotifications?: AgentTaskNotification[]
 }
 type CreateSessionResponse = { sessionId: string; workDir?: string }
+export type BatchDeleteSessionsResponse = {
+  ok: boolean
+  successes: string[]
+  failures: Array<{
+    sessionId: string
+    message: string
+    code?: string
+  }>
+}
 export type SessionGitWorktreeInfo = {
   enabled: boolean
   path: string | null
@@ -30,6 +41,18 @@ export type CreateSessionRepositoryOptions = {
 export type CreateSessionRequest = {
   workDir?: string
   repository?: CreateSessionRepositoryOptions
+  permissionMode?: PermissionMode
+}
+export type BranchSessionRequest = {
+  targetMessageId: string
+  title?: string
+}
+export type BranchSessionResponse = {
+  sessionId: string
+  title: string
+  workDir: string | null
+  sourceSessionId: string
+  targetMessageId: string
 }
 export type RepositoryBranchInfo = {
   name: string
@@ -298,6 +321,14 @@ export const sessionsApi = {
     return api.get<MessagesResponse>(`/api/sessions/${sessionId}/messages`)
   },
 
+  getTrace(sessionId: string) {
+    return api.get<TraceSession>(`/api/sessions/${sessionId}/trace`)
+  },
+
+  getTraceCall(sessionId: string, callId: string) {
+    return api.get<{ call: TraceCallRecord }>(`/api/sessions/${sessionId}/trace/calls/${callId}`)
+  },
+
   create(input?: string | CreateSessionRequest) {
     const body = typeof input === 'string'
       ? (input ? { workDir: input } : {})
@@ -305,8 +336,16 @@ export const sessionsApi = {
     return api.post<CreateSessionResponse>('/api/sessions', body)
   },
 
+  branch(sessionId: string, body: BranchSessionRequest) {
+    return api.post<BranchSessionResponse>(`/api/sessions/${sessionId}/branch`, body)
+  },
+
   delete(sessionId: string) {
     return api.delete<{ ok: true }>(`/api/sessions/${sessionId}`)
+  },
+
+  batchDelete(sessionIds: string[]) {
+    return api.post<BatchDeleteSessionsResponse>('/api/sessions/batch-delete', { sessionIds })
   },
 
   rename(sessionId: string, title: string) {
@@ -328,7 +367,7 @@ export const sessionsApi = {
   },
 
   getSlashCommands(sessionId: string) {
-    return api.get<{ commands: Array<{ name: string; description: string }> }>(`/api/sessions/${sessionId}/slash-commands`)
+    return api.get<{ commands: Array<{ name: string; description: string; argumentHint?: string }> }>(`/api/sessions/${sessionId}/slash-commands`)
   },
 
   getInspection(sessionId: string, options?: { includeContext?: boolean; timeout?: number; contextOnly?: boolean }) {

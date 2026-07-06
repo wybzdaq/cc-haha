@@ -23,6 +23,7 @@ import {
   logEvent,
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
 } from 'src/services/analytics/index.js'
+import { BUSINESS_ERROR_CODES } from './constants/businessErrors.js'
 import { ImageSizeError } from './utils/imageValidation.js'
 import { ImageResizeError } from './utils/imageResizer.js'
 import { findToolByName, type ToolUseContext } from './Tool.js'
@@ -93,6 +94,7 @@ import { executePostSamplingHooks } from './utils/hooks/postSamplingHooks.js'
 import { executeStopFailureHooks } from './utils/hooks.js'
 import type { QuerySource } from './constants/querySource.js'
 import { createDumpPromptsFetch } from './services/api/dumpPrompts.js'
+import { shouldCaptureApiTrace } from './services/api/traceCapture.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
@@ -105,6 +107,7 @@ import type { Terminal, Continue } from './query/transitions.js'
 import { feature } from 'bun:bundle'
 import {
   getCurrentTurnTokenBudget,
+  getSessionId,
   getTurnOutputTokens,
   incrementBudgetContinuationCount,
 } from './bootstrap/state.js'
@@ -585,8 +588,11 @@ async function* queryLoop(
     // instead of all request bodies from the session (~500MB for long sessions).
     // Note: agentId is effectively constant during a query() call - it only changes
     // between queries (e.g., /clear command or session resume).
-    const dumpPromptsFetch = config.gates.isAnt
-      ? createDumpPromptsFetch(toolUseContext.agentId ?? config.sessionId)
+    const dumpPromptsFetch = config.gates.isAnt || shouldCaptureApiTrace()
+      ? createDumpPromptsFetch(toolUseContext.agentId ?? config.sessionId, {
+          traceSessionId: config.sessionId,
+          querySource,
+        })
       : undefined
 
     // Block if we've hit the hard blocking limit (only applies when auto-compact is OFF)
@@ -642,6 +648,7 @@ async function* queryLoop(
         yield createAssistantAPIErrorMessage({
           content: PROMPT_TOO_LONG_ERROR_MESSAGE,
           error: 'invalid_request',
+          businessErrorCode: BUSINESS_ERROR_CODES.PROMPT_TOO_LONG,
         })
         return { reason: 'blocking_limit' }
       }
@@ -973,6 +980,7 @@ async function* queryLoop(
       ) {
         yield createAssistantAPIErrorMessage({
           content: error.message,
+          businessErrorCode: BUSINESS_ERROR_CODES.IMAGE_TOO_LARGE,
         })
         return { reason: 'image_error' }
       }

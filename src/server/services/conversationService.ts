@@ -10,21 +10,71 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { ProviderService } from './providerService.js'
+import {
+  OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
+  OPENAI_OAUTH_PROVIDER_ENV_KEY,
+} from './openaiOfficialProvider.js'
 import { sessionService } from './sessionService.js'
 import { diagnosticsService } from './diagnosticsService.js'
 import {
+  isMaterializedWorktreeLaunch,
   prepareSessionWorkspace,
+  shouldCreateWorktreeForSessionLaunch,
   type PreparedSessionWorkspace,
 } from './repositoryLaunchService.js'
 import {
   buildClaudeCliArgs,
   resolveClaudeCliLauncher,
 } from '../../utils/desktopBundledCli.js'
+import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
+import { findCanonicalGitRoot } from '../../utils/git.js'
+import { sanitizePath } from '../../utils/path.js'
+import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
+import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
+import { buildNetworkEnvironment, loadNetworkSettings } from './networkSettings.js'
+import { readTraceCaptureSettings } from './traceCaptureService.js'
+import { logError } from '../../utils/log.js'
+import {
+  createImageMetadataText,
+  maybeResizeAndDownsampleImageBuffer,
+} from '../../utils/imageResizer.js'
 
 const MAX_CAPTURED_PROCESS_LINES = 80
 const MAX_CAPTURED_SDK_MESSAGES = 40
 const MAX_CAPTURED_SDK_SUMMARY = 20
 const CONTROL_READY_POLL_MS = 50
+const AUTO_MEMORY_DIRNAME = 'memory'
+export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
+
+/**
+ * Severity for a CLI subprocess exit, by exit code.
+ *
+ * Reaching handleProcessExit already means the process left outside the clean
+ * stop path, but the exit code still tells crash from teardown:
+ *  - 0            clean exit
+ *  - null         terminated by a signal with no numeric code
+ *  - 143 (SIGTERM), 137 (SIGKILL): killed — shutdown / user stop / OS reclaim
+ * None of these are a crash the user needs flagged in red. Any other non-zero
+ * code is a genuine "it died mid-chat" failure and stays an error.
+ */
+export function cliExitSeverity(code: number | null): 'info' | 'error' {
+  if (code === 0 || code === null || code === 143 || code === 137) return 'info'
+  return 'error'
+}
+
+export function buildConversationCliSpawnOptions(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+) {
+  return {
+    cwd,
+    env,
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    windowsHide: true,
+  } as const
+}
 
 type AttachmentRef = {
   type: 'file' | 'image'
@@ -32,6 +82,15 @@ type AttachmentRef = {
   path?: string
   data?: string
   mimeType?: string
+  isDirectory?: boolean
+}
+
+type UserContentBlock = Record<string, unknown>
+
+type MaterializedAttachments = {
+  pathPrefix: string
+  imageBlocks: UserContentBlock[]
+  imageMetadataTexts: string[]
 }
 
 type SessionProcess = {
@@ -49,14 +108,26 @@ type SessionProcess = {
   outputDrain: Promise<void>
   sdkMessages: any[]
   initMessage: any | null
+  usesOfficialOAuth: boolean
+  officialOAuthToken: string | null
   pendingPermissionRequests: Map<
     string,
     {
       toolName: string
+      toolUseId?: string
+      description?: string
       input: Record<string, unknown>
       permissionSuggestions?: unknown[]
     }
   >
+}
+
+export type PendingPermissionRequest = {
+  requestId: string
+  toolName: string
+  toolUseId?: string
+  input: Record<string, unknown>
+  description?: string
 }
 
 type SessionStartOptions = {
@@ -65,6 +136,7 @@ type SessionStartOptions = {
   effort?: string
   thinking?: 'enabled' | 'adaptive' | 'disabled'
   providerId?: string | null
+  resumeInterruptedTurn?: boolean
 }
 
 export class ConversationStartupError extends Error {
@@ -146,6 +218,10 @@ export class ConversationService {
     const shouldResume = !!launchInfo && launchInfo.transcriptMessageCount > 0
     const shouldReplacePlaceholder =
       !!launchInfo && launchInfo.transcriptMessageCount === 0
+    const shouldCreateWorktree =
+      !!launchInfo && shouldCreateWorktreeForSessionLaunch(launchInfo)
+    const hasMaterializedWorktree =
+      !!launchInfo && isMaterializedWorktreeLaunch(launchInfo)
 
     if (this.deletedSessions.has(sessionId)) {
       throw new ConversationStartupError(
@@ -167,9 +243,9 @@ export class ConversationService {
 
     let launchWorkDir = workDir
     let launchRepository = launchInfo?.repository
-    if (!shouldResume && launchRepository?.worktree) {
+    if (shouldCreateWorktree && launchRepository?.worktree) {
       launchWorkDir = launchRepository.requestedWorkDir || launchRepository.repoRoot || workDir
-    } else if (!shouldResume && launchRepository) {
+    } else if (!shouldResume && launchRepository && !hasMaterializedWorktree) {
       const preparedWorkspace = await prepareSessionWorkspace(
         workDir,
         {
@@ -180,6 +256,13 @@ export class ConversationService {
       )
       launchWorkDir = preparedWorkspace.workDir
       launchRepository = preparedWorkspace.repository
+    }
+
+    if (!shouldCreateWorktree && launchRepository?.worktree) {
+      launchRepository = {
+        ...launchRepository,
+        worktree: false,
+      }
     }
 
     if (!fs.existsSync(launchWorkDir) || !fs.statSync(launchWorkDir).isDirectory()) {
@@ -212,16 +295,11 @@ export class ConversationService {
     // chdir 后落到正确目录。
     //
     const childEnv = await this.buildChildEnv(launchWorkDir, sdkUrl, options)
+    const usesOfficialOAuth = this.shouldMarkManagedOAuth(options?.providerId)
 
     let proc: ReturnType<typeof Bun.spawn>
     try {
-      proc = Bun.spawn(args, {
-        cwd: launchWorkDir,
-        env: childEnv,
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      })
+      proc = Bun.spawn(args, buildConversationCliSpawnOptions(launchWorkDir, childEnv))
     } catch (spawnErr) {
       void diagnosticsService.recordEvent({
         type: 'cli_spawn_failed',
@@ -259,6 +337,8 @@ export class ConversationService {
       outputDrain: Promise.resolve(),
       sdkMessages: [],
       initMessage: null,
+      usesOfficialOAuth,
+      officialOAuthToken: childEnv.CLAUDE_CODE_OAUTH_TOKEN ?? null,
       pendingPermissionRequests: new Map(),
     }
     this.sessions.set(sessionId, session)
@@ -318,11 +398,21 @@ export class ConversationService {
 
     session.startupPending = false
 
-    if (shouldReplacePlaceholder || !launchInfo) {
+    const shouldPersistRuntimeMetadata =
+      options?.providerId !== undefined ||
+      !!options?.model ||
+      !!options?.effort
+    if (shouldReplacePlaceholder || !launchInfo || shouldPersistRuntimeMetadata) {
       await sessionService.appendSessionMetadata(sessionId, {
         workDir: launchWorkDir,
         customTitle: launchInfo?.customTitle ?? null,
         repository: launchRepository,
+        permissionMode: options?.permissionMode || launchInfo?.permissionMode,
+        ...(options?.providerId !== undefined
+          ? { runtimeProviderId: options.providerId }
+          : {}),
+        ...(options?.model ? { runtimeModelId: options.model } : {}),
+        ...(options?.effort ? { effortLevel: options.effort } : {}),
       })
     }
 
@@ -357,16 +447,21 @@ export class ConversationService {
     return this.sessions.get(sessionId)?.initMessage ?? null
   }
 
-  sendMessage(
+  async sendMessage(
     sessionId: string,
     content: string,
     attachments?: AttachmentRef[],
-  ): boolean {
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId)
+    if (session) {
+      await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
+    }
+    const userContent = await this.buildUserContent(content, sessionId, attachments)
     return this.sendSdkMessage(sessionId, {
       type: 'user',
       message: {
         role: 'user',
-        content: this.buildUserContent(content, sessionId, attachments),
+        content: userContent,
       },
       parent_tool_use_id: null,
       session_id: '',
@@ -379,6 +474,8 @@ export class ConversationService {
     allowed: boolean,
     rule?: string,
     updatedInput?: Record<string, unknown>,
+    denyMessage?: string,
+    permissionUpdates?: unknown[],
   ): boolean {
     const session = this.sessions.get(sessionId)
     const pendingRequest = session?.pendingPermissionRequests.get(requestId)
@@ -395,7 +492,9 @@ export class ConversationService {
           ? {
               behavior: 'allow',
               updatedInput: updatedInput ?? {},
-              ...(rule === 'always' && pendingRequest
+              ...(Array.isArray(permissionUpdates) && permissionUpdates.length > 0
+                ? { updatedPermissions: permissionUpdates }
+                : rule === 'always' && pendingRequest
                 ? {
                     updatedPermissions: [
                       ...normalizeSessionPermissionUpdates(
@@ -406,13 +505,13 @@ export class ConversationService {
                   }
                 : {}),
             }
-          : { behavior: 'deny', message: 'User denied via UI' },
+          : { behavior: 'deny', message: denyMessage || 'User denied via UI' },
       },
     })
   }
 
   setPermissionMode(sessionId: string, mode: string): boolean {
-    return this.sendSdkMessage(sessionId, {
+    const sent = this.sendSdkMessage(sessionId, {
       type: 'control_request',
       request_id: crypto.randomUUID(),
       request: {
@@ -420,6 +519,39 @@ export class ConversationService {
         mode,
       },
     })
+    if (sent) {
+      const session = this.sessions.get(sessionId)
+      if (session) session.permissionMode = mode
+    }
+    return sent
+  }
+
+  recordSessionPermissionMode(sessionId: string, mode: string): boolean {
+    const session = this.sessions.get(sessionId)
+    if (!session) return false
+    session.permissionMode = mode
+    return true
+  }
+
+  setMaxThinkingTokens(sessionId: string, maxThinkingTokens: number | null): boolean {
+    return this.sendSdkMessage(sessionId, {
+      type: 'control_request',
+      request_id: crypto.randomUUID(),
+      request: {
+        subtype: 'set_max_thinking_tokens',
+        max_thinking_tokens: maxThinkingTokens,
+      },
+    })
+  }
+
+  setMaxThinkingTokensForActiveSessions(maxThinkingTokens: number | null): number {
+    let sent = 0
+    for (const sessionId of this.getActiveSessions()) {
+      if (this.setMaxThinkingTokens(sessionId, maxThinkingTokens)) {
+        sent += 1
+      }
+    }
+    return sent
   }
 
   sendInterrupt(sessionId: string): boolean {
@@ -531,6 +663,19 @@ export class ConversationService {
     return session?.permissionMode || 'default'
   }
 
+  getPendingPermissionRequests(sessionId: string): PendingPermissionRequest[] {
+    const session = this.sessions.get(sessionId)
+    if (!session) return []
+
+    return Array.from(session.pendingPermissionRequests.entries()).map(([requestId, request]) => ({
+      requestId,
+      toolName: request.toolName,
+      ...(request.toolUseId ? { toolUseId: request.toolUseId } : {}),
+      input: request.input,
+      ...(request.description ? { description: request.description } : {}),
+    }))
+  }
+
   authorizeSdkConnection(
     sessionId: string,
     token: string | null | undefined,
@@ -602,14 +747,34 @@ export class ConversationService {
               typeof msg.request.tool_name === 'string'
                 ? msg.request.tool_name
                 : 'Unknown',
+            toolUseId:
+              typeof msg.request.tool_use_id === 'string' && msg.request.tool_use_id.trim()
+                ? msg.request.tool_use_id
+                : undefined,
             input:
               msg.request.input && typeof msg.request.input === 'object'
                 ? (msg.request.input as Record<string, unknown>)
                 : {},
+            description:
+              typeof msg.request.description === 'string' && msg.request.description.trim()
+                ? msg.request.description
+                : undefined,
             permissionSuggestions: Array.isArray(msg.request.permission_suggestions)
               ? msg.request.permission_suggestions
               : undefined,
           })
+        }
+        if (
+          (msg?.type === 'control_cancel_request' || msg?.type === 'control_response') &&
+          typeof msg.request_id === 'string'
+        ) {
+          session.pendingPermissionRequests.delete(msg.request_id)
+        }
+        if (
+          msg?.type === 'control_response' &&
+          typeof msg.response?.request_id === 'string'
+        ) {
+          session.pendingPermissionRequests.delete(msg.response.request_id)
         }
         for (const cb of session.outputCallbacks) {
           cb(msg)
@@ -624,24 +789,78 @@ export class ConversationService {
 
   stopSession(sessionId: string): void {
     const session = this.sessions.get(sessionId)
-    if (session) {
-      session.proc.kill()
-      this.sessions.delete(sessionId)
-    }
+    if (!session) return
+
+    this.sessions.delete(sessionId)
+    this.killProcess(sessionId, session)
   }
 
-  async stopSessionAndWait(sessionId: string, timeoutMs = 2_000): Promise<void> {
+  async stopSessionAndWait(
+    sessionId: string,
+    timeoutMs = DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+  ): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
     this.sessions.delete(sessionId)
-    session.proc.kill()
+    await this.stopProcessAndWait(sessionId, session, timeoutMs)
+  }
 
-    await Promise.race([
-      session.proc.exited.catch(() => undefined),
-      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  stopAllSessions(): void {
+    for (const sessionId of this.getActiveSessions()) {
+      this.stopSession(sessionId)
+    }
+  }
+
+  async stopAllSessionsAndWait(
+    timeoutMs = DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+  ): Promise<void> {
+    const activeSessions = Array.from(this.sessions.entries())
+    if (activeSessions.length === 0) return
+
+    this.sessions.clear()
+    await Promise.all(
+      activeSessions.map(([sessionId, session]) =>
+        this.stopProcessAndWait(sessionId, session, timeoutMs),
+      ),
+    )
+  }
+
+  private async stopProcessAndWait(
+    sessionId: string,
+    session: SessionProcess,
+    timeoutMs: number,
+  ): Promise<void> {
+    this.killProcess(sessionId, session, 'SIGTERM')
+
+    const exited = await Promise.race([
+      session.proc.exited.then(() => true, () => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
     ])
+    if (!exited) {
+      this.killProcess(sessionId, session, 'SIGKILL')
+      await Promise.race([
+        session.proc.exited.catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 500)),
+      ])
+    }
     await this.waitForProcessOutputDrain(session, timeoutMs)
+  }
+
+  private killProcess(
+    sessionId: string,
+    session: SessionProcess,
+    signal?: NodeJS.Signals,
+  ): void {
+    try {
+      session.proc.kill(signal)
+    } catch (error) {
+      console.warn(
+        `[ConversationService] Failed to kill CLI subprocess for ${sessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    }
   }
 
   markSessionDeleted(sessionId: string): void {
@@ -649,8 +868,20 @@ export class ConversationService {
     this.stopSession(sessionId)
   }
 
+  markSessionsDeleted(sessionIds: string[]): void {
+    for (const sessionId of sessionIds) {
+      this.markSessionDeleted(sessionId)
+    }
+  }
+
   unmarkSessionDeleted(sessionId: string): void {
     this.deletedSessions.delete(sessionId)
+  }
+
+  unmarkSessionsDeleted(sessionIds: string[]): void {
+    for (const sessionId of sessionIds) {
+      this.unmarkSessionDeleted(sessionId)
+    }
   }
 
   getActiveSessions(): string[] {
@@ -748,7 +979,7 @@ export class ConversationService {
       const exitError = this.buildRuntimeExitMessage(sessionId, code)
       void diagnosticsService.recordEvent({
         type: 'cli_runtime_exit',
-        severity: 'error',
+        severity: cliExitSeverity(code),
         sessionId,
         summary: exitError,
         details: {
@@ -824,6 +1055,7 @@ export class ConversationService {
       'ANTHROPIC_API_KEY',
       'ANTHROPIC_BASE_URL',
       'ANTHROPIC_AUTH_TOKEN',
+      'ENABLE_TOOL_SEARCH',
       'ANTHROPIC_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
@@ -832,12 +1064,22 @@ export class ConversationService {
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
       'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
       'CC_HAHA_SEND_DISABLED_THINKING',
+      'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
       'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      'CLAUDE_CODE_ATTRIBUTION_HEADER',
       'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
+      OPENAI_OAUTH_PROVIDER_ENV_KEY,
+      OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
     ] as const
 
-    const cleanEnv = { ...process.env }
+    const cleanEnv = await getProcessEnvWithTerminalShellEnvironment()
     delete cleanEnv.CLAUDE_CODE_OAUTH_TOKEN
+    if (options?.resumeInterruptedTurn === false) {
+      delete cleanEnv.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+    }
+    delete cleanEnv.CC_HAHA_TRACE_PROVIDER_ID
+    delete cleanEnv.CC_HAHA_TRACE_PROVIDER_NAME
+    delete cleanEnv.CC_HAHA_TRACE_PROVIDER_FORMAT
     if (this.shouldStripInheritedProviderEnv(options?.providerId)) {
       for (const key of PROVIDER_ENV_KEYS) {
         delete cleanEnv[key]
@@ -854,13 +1096,23 @@ export class ConversationService {
       }
     }
 
-    const explicitProviderEnv =
+    const explicitProvider =
       typeof options?.providerId === 'string'
-        ? await this.providerService.getProviderRuntimeEnv(options.providerId)
+        ? await this.providerService.getProvider(options.providerId)
         : null
+    const explicitProviderEnv = explicitProvider
+      ? await this.providerService.getProviderRuntimeEnv(explicitProvider.id)
+      : null
+    const networkEnv = buildNetworkEnvironment(await loadNetworkSettings(), cleanEnv)
+    const traceCaptureEnabled = (await readTraceCaptureSettings()).enabled
     if (explicitProviderEnv && options?.model?.trim()) {
       explicitProviderEnv.ANTHROPIC_MODEL = options.model.trim()
     }
+    const attributionHeaderEnv = attributionHeaderEnvForModel(
+      options?.model?.trim() ||
+        explicitProviderEnv?.ANTHROPIC_MODEL ||
+        cleanEnv.ANTHROPIC_MODEL,
+    )
 
     const cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
     try {
@@ -873,11 +1125,52 @@ export class ConversationService {
       ...cleanEnv,
       CLAUDE_CODE_ENABLE_TASKS: '1',
       CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: '1',
+      // Desktop must fail stuck provider streams instead of leaving the UI running forever.
+      CLAUDE_ENABLE_STREAM_WATCHDOG: cleanEnv.CLAUDE_ENABLE_STREAM_WATCHDOG || '1',
+      // Third-party providers can stay silent for minutes mid-stream (thinking
+      // phases emit no SSE bytes, and many gateways never send pings), so the
+      // CLI's 90s idle default kills healthy streams (#766). 240s still frees
+      // a truly dead connection without shooting slow ones.
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: cleanEnv.CLAUDE_STREAM_IDLE_TIMEOUT_MS || '240000',
+      // Overall wall-clock cap for one streaming response, NOT reset by chunks.
+      // The 240s idle timer above is reset by every SSE event, so an upstream
+      // that trickles content deltas (e.g. a huge tool_use input_json_delta)
+      // just under 240s apart keeps it alive forever and the request hangs with
+      // no completion (#766: "卡住" with slowly growing tokens). This independent
+      // cap frees such a stream after a fixed duration regardless of trickle.
+      CLAUDE_STREAM_MAX_DURATION_MS: cleanEnv.CLAUDE_STREAM_MAX_DURATION_MS || '600000',
+      // Time-to-first-token budget: how long to wait for the FIRST streamed
+      // chunk after response headers arrive. The idle timer above is the wrong
+      // knob for slow prefill — it kills healthy local/3P models that take
+      // minutes to emit their first token (#826). Tie this to the user's
+      // request-timeout setting (API_TIMEOUT_MS, from networkEnv) so raising
+      // "请求超时" actually extends how long we wait for the first token. The
+      // CLI switches to the shorter idle budget once tokens start flowing.
+      CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS:
+        cleanEnv.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS || networkEnv.API_TIMEOUT_MS,
+      // When a stream does get aborted, retry as streaming instead of falling
+      // back to non-streaming: a non-streaming request must wait for the FULL
+      // generation before the first response byte, so slow providers can never
+      // finish inside API_TIMEOUT_MS — the fallback loops 5-minute aborts
+      // forever while the UI shows "running" (#766). It can also double-run
+      // tools (upstream inc-4258).
+      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: cleanEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK || '1',
       CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath,
+      CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: this.resolveDesktopAutoMemoryPath(workDir),
       CALLER_DIR: workDir,
       PWD: workDir,
       ...(sdkUrl
         ? { CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop' }
+        : {}),
+      ...(sdkUrl && traceCaptureEnabled
+        ? { CC_HAHA_TRACE_API_CALLS: '1' }
+        : {}),
+      ...(sdkUrl && traceCaptureEnabled && explicitProvider
+        ? {
+            CC_HAHA_TRACE_PROVIDER_ID: explicitProvider.id,
+            CC_HAHA_TRACE_PROVIDER_NAME: explicitProvider.name,
+            CC_HAHA_TRACE_PROVIDER_FORMAT: explicitProvider.apiFormat ?? 'anthropic',
+          }
         : {}),
       ...(desktopServerUrl
         ? { CC_HAHA_DESKTOP_SERVER_URL: desktopServerUrl }
@@ -901,10 +1194,26 @@ export class ConversationService {
       // 否则 CLI 会忽略 provider 的 AUTH_TOKEN、错误地走 OAuth 打到第三方
       // endpoint。详见 src/utils/auth.ts isManagedOAuthContext()。
       ...(explicitProviderEnv ?? {}),
+      ...networkEnv,
       ...(this.shouldMarkManagedOAuth(options?.providerId)
         ? await this.buildOfficialOAuthEnv()
         : {}),
+      ...attributionHeaderEnv,
     }
+  }
+
+  private resolveDesktopAutoMemoryPath(workDir: string): string {
+    const memoryProjectRoot = fs.existsSync(workDir)
+      ? findCanonicalGitRoot(workDir) ?? workDir
+      : workDir
+    return (
+      path.join(
+        getClaudeConfigHomeDir(),
+        'projects',
+        sanitizePath(memoryProjectRoot),
+        AUTO_MEMORY_DIRNAME,
+      ) + path.sep
+    ).normalize('NFC')
   }
 
   /**
@@ -935,6 +1244,33 @@ export class ConversationService {
     return env
   }
 
+  private async refreshOfficialOAuthTokenBeforeTurn(
+    sessionId: string,
+    session: SessionProcess,
+  ): Promise<void> {
+    if (!session.usesOfficialOAuth) return
+
+    let token: string | null = null
+    try {
+      const { hahaOAuthService } = await import('./hahaOAuthService.js')
+      token = await hahaOAuthService.ensureFreshAccessToken()
+    } catch (err) {
+      console.error(
+        '[conversationService] refresh official OAuth token before turn failed:',
+        err instanceof Error ? err.message : err,
+      )
+      return
+    }
+
+    if (!token || token === session.officialOAuthToken) return
+
+    session.officialOAuthToken = token
+    this.sendSdkMessage(sessionId, {
+      type: 'update_environment_variables',
+      variables: { CLAUDE_CODE_OAUTH_TOKEN: token },
+    })
+  }
+
   private shouldStripInheritedProviderEnv(providerId?: string | null): boolean {
     if (providerId !== undefined) {
       return true
@@ -958,6 +1294,7 @@ export class ConversationService {
         'ANTHROPIC_API_KEY',
         'ANTHROPIC_BASE_URL',
         'ANTHROPIC_AUTH_TOKEN',
+        'ENABLE_TOOL_SEARCH',
         'ANTHROPIC_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
@@ -967,7 +1304,10 @@ export class ConversationService {
         'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
         'CC_HAHA_SEND_DISABLED_THINKING',
         'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        'CLAUDE_CODE_ATTRIBUTION_HEADER',
         'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
+        OPENAI_OAUTH_PROVIDER_ENV_KEY,
+        OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
       ].some((key) => typeof env[key] === 'string' && env[key]!.trim().length > 0)
     } catch {
       return false
@@ -998,6 +1338,9 @@ export class ConversationService {
       const raw = fs.readFileSync(settingsPath, 'utf-8')
       const parsed = JSON.parse(raw) as { env?: Record<string, string> }
       const env = parsed.env ?? {}
+      if (env[OPENAI_OAUTH_PROVIDER_ENV_KEY] === '1') {
+        return false
+      }
       const hasProviderEnv = [
         'ANTHROPIC_API_KEY',
         'ANTHROPIC_AUTH_TOKEN',
@@ -1283,26 +1626,43 @@ export class ConversationService {
     })
   }
 
-  private buildUserContent(
+  private async buildUserContent(
     content: string,
     sessionId: string,
     attachments?: AttachmentRef[],
-  ): Array<Record<string, unknown>> {
-    const prefix = this.materializeAttachments(sessionId, attachments)
+  ): Promise<UserContentBlock[]> {
+    const materialized = await this.materializeAttachments(sessionId, attachments)
     const trimmed = content.trim()
-    const text = prefix
-      ? `${prefix}${trimmed || 'Please analyze the attached files.'}`.trim()
+    const text = materialized.pathPrefix
+      ? `${materialized.pathPrefix}${trimmed || 'Please analyze the attached files.'}`.trim()
       : trimmed
 
-    return [{ type: 'text', text }]
+    const blocks: UserContentBlock[] = text
+      ? [{ type: 'text', text }]
+      : materialized.imageBlocks.length > 0
+        ? [{ type: 'text', text: 'Please analyze the attached image.' }]
+        : []
+
+    blocks.push(...materialized.imageBlocks)
+    for (const metadataText of materialized.imageMetadataTexts) {
+      blocks.push({ type: 'text', text: metadataText })
+    }
+
+    return blocks.length > 0 ? blocks : [{ type: 'text', text: '' }]
   }
 
-  private materializeAttachments(
+  private async materializeAttachments(
     sessionId: string,
     attachments?: AttachmentRef[],
-  ): string {
+  ): Promise<MaterializedAttachments> {
+    const empty = (): MaterializedAttachments => ({
+      pathPrefix: '',
+      imageBlocks: [],
+      imageMetadataTexts: [],
+    })
+
     if (!attachments || attachments.length === 0) {
-      return ''
+      return empty()
     }
 
     const uploadDir = path.join(
@@ -1310,10 +1670,20 @@ export class ConversationService {
       'uploads',
       sessionId,
     )
-    fs.mkdirSync(uploadDir, { recursive: true })
 
     const savedPaths: string[] = []
+    const imageBlocks: UserContentBlock[] = []
+    const imageMetadataTexts: string[] = []
     for (const attachment of attachments) {
+      if (this.shouldInlineImageAttachment(attachment)) {
+        const image = await this.materializeImageAttachment(attachment, uploadDir)
+        if (image) {
+          imageBlocks.push(image.block)
+          if (image.metadataText) imageMetadataTexts.push(image.metadataText)
+          continue
+        }
+      }
+
       if (attachment.path) {
         savedPaths.push(attachment.path)
         continue
@@ -1321,37 +1691,155 @@ export class ConversationService {
 
       if (!attachment.data) continue
 
-      const payload = this.parseAttachmentData(attachment.data)
-      if (!payload) continue
+      const parsed = this.parseAttachmentData(attachment.data)
+      if (!parsed) continue
 
-      const ext = this.getAttachmentExtension(attachment)
+      const ext = this.getAttachmentExtension({
+        ...attachment,
+        mimeType: attachment.mimeType ?? parsed.mimeType,
+      })
       const fileName = this.sanitizeAttachmentName(attachment.name, attachment.type, ext)
-      const outPath = path.join(uploadDir, `${crypto.randomUUID()}-${fileName}`)
-      fs.writeFileSync(outPath, payload)
+      const outPath = this.writeUploadAttachment(uploadDir, fileName, parsed.payload)
       savedPaths.push(outPath)
     }
 
-    if (savedPaths.length === 0) {
-      return ''
+    return {
+      pathPrefix: savedPaths.length > 0
+        ? savedPaths.map((filePath) => `@"${filePath}"`).join(' ') + ' '
+        : '',
+      imageBlocks,
+      imageMetadataTexts,
     }
-
-    return savedPaths.map((filePath) => `@"${filePath}"`).join(' ') + ' '
   }
 
-  private parseAttachmentData(data: string): Buffer | null {
-    const match = data.match(/^data:.*?;base64,(.*)$/)
-    const encoded = match ? match[1] : data
+  private parseAttachmentData(data: string): { payload: Buffer; mimeType?: string } | null {
+    const match = data.match(/^data:([^;,]+)?;base64,(.*)$/)
+    const encoded = match ? match[2] : data
 
     try {
-      return Buffer.from(encoded, 'base64')
+      return {
+        payload: Buffer.from(encoded ?? '', 'base64'),
+        mimeType: match?.[1],
+      }
     } catch {
       return null
     }
   }
 
+  private async materializeImageAttachment(
+    attachment: AttachmentRef,
+    uploadDir: string,
+  ): Promise<{ block: UserContentBlock; metadataText?: string } | null> {
+    const source = this.readImageAttachmentPayload(attachment)
+    if (!source) {
+      return null
+    }
+
+    try {
+      const resized = await maybeResizeAndDownsampleImageBuffer(
+        source.payload,
+        source.payload.length,
+        source.ext,
+      )
+      const normalizedExt = this.normalizeImageExtension(resized.mediaType)
+      const storedName = this.replaceFileExtension(
+        this.sanitizeAttachmentName(attachment.name, attachment.type, normalizedExt),
+        normalizedExt,
+      )
+      const sourcePath = source.sourcePath ?? this.writeUploadAttachment(
+        uploadDir,
+        storedName,
+        resized.buffer,
+      )
+      const metadataText = resized.dimensions
+        ? createImageMetadataText(resized.dimensions, sourcePath)
+        : sourcePath
+          ? `[Image source: ${sourcePath}]`
+          : undefined
+
+      return {
+        block: {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: `image/${normalizedExt}`,
+            data: resized.buffer.toString('base64'),
+          },
+        },
+        metadataText: metadataText ?? undefined,
+      }
+    } catch (error) {
+      logError(error)
+      console.warn(
+        `[ConversationService] Failed to inline image attachment ${attachment.name ?? '<unnamed>'}; falling back to file path`,
+      )
+      return null
+    }
+  }
+
+  private readImageAttachmentPayload(
+    attachment: AttachmentRef,
+  ): { payload: Buffer; ext: string; sourcePath?: string } | null {
+    if (attachment.data) {
+      const parsed = this.parseAttachmentData(attachment.data)
+      if (!parsed) return null
+      return {
+        payload: parsed.payload,
+        ext: this.getAttachmentExtension({
+          ...attachment,
+          mimeType: attachment.mimeType ?? parsed.mimeType,
+        }),
+      }
+    }
+
+    if (!attachment.path || attachment.isDirectory) {
+      return null
+    }
+
+    try {
+      return {
+        payload: fs.readFileSync(attachment.path),
+        ext: this.getAttachmentExtension(attachment),
+        sourcePath: attachment.path,
+      }
+    } catch (error) {
+      logError(error)
+      return null
+    }
+  }
+
+  private shouldInlineImageAttachment(attachment: AttachmentRef): boolean {
+    if (attachment.isDirectory) return false
+    if (attachment.type === 'image') return true
+    if (attachment.mimeType?.startsWith('image/')) return true
+    const candidate = attachment.path ?? attachment.name ?? ''
+    return /\.(png|jpe?g|gif|webp)$/i.test(candidate)
+  }
+
+  private writeUploadAttachment(uploadDir: string, fileName: string, payload: Buffer): string {
+    fs.mkdirSync(uploadDir, { recursive: true })
+    const outPath = path.join(uploadDir, `${crypto.randomUUID()}-${fileName}`)
+    fs.writeFileSync(outPath, payload)
+    return outPath
+  }
+
+  private normalizeImageExtension(ext: string): string {
+    const clean = ext.split('/').pop()?.split('+')[0]?.toLowerCase() || 'png'
+    return clean === 'jpg' ? 'jpeg' : clean
+  }
+
+  private replaceFileExtension(fileName: string, ext: string): string {
+    const cleanExt = this.normalizeImageExtension(ext)
+    const base = fileName.replace(/\.[a-z0-9]+$/i, '')
+    return `${base}.${cleanExt}`
+  }
+
   private getAttachmentExtension(attachment: AttachmentRef): string {
     const byName = attachment.name?.match(/\.([a-z0-9]+)$/i)?.[1]
     if (byName) return byName
+
+    const byPath = attachment.path?.match(/\.([a-z0-9]+)$/i)?.[1]
+    if (byPath) return byPath
 
     const byMime = attachment.mimeType?.split('/')[1]?.split('+')[0]
     if (byMime) return byMime

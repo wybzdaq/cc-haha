@@ -7,6 +7,8 @@ const {
   runtimeStoreState,
   setSessionRuntimeMock,
   setSelectionMock,
+  settingsSetModelMock,
+  settingsFetchAllMock,
 } = vi.hoisted(() => ({
   providersApiMock: {
     list: vi.fn(),
@@ -17,6 +19,7 @@ const {
     create: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),
+    reorder: vi.fn(),
     activate: vi.fn(),
     activateOfficial: vi.fn(),
     test: vi.fn(),
@@ -32,6 +35,8 @@ const {
   },
   setSessionRuntimeMock: vi.fn(),
   setSelectionMock: vi.fn(),
+  settingsSetModelMock: vi.fn(),
+  settingsFetchAllMock: vi.fn(),
 }))
 
 vi.mock('../api/providers', () => ({
@@ -59,8 +64,8 @@ vi.mock('./sessionRuntimeStore', () => ({
 vi.mock('./settingsStore', () => ({
   useSettingsStore: {
     getState: () => ({
-      setModel: vi.fn(),
-      fetchAll: vi.fn(),
+      setModel: settingsSetModelMock,
+      fetchAll: settingsFetchAllMock,
     }),
   },
 }))
@@ -110,6 +115,7 @@ describe('providerStore runtime refresh', () => {
       providerId: provider.id,
       modelId: 'model-main',
     })
+    expect(settingsSetModelMock).not.toHaveBeenCalled()
   })
 
   it('keeps an explicit provider model selection when the model still exists', async () => {
@@ -146,5 +152,137 @@ describe('providerStore runtime refresh', () => {
 
     expect(setSelectionMock).not.toHaveBeenCalled()
     expect(setSessionRuntimeMock).not.toHaveBeenCalled()
+  })
+
+  it('sets the OpenAI default model when activating built-in ChatGPT Official', async () => {
+    providersApiMock.activate.mockResolvedValue({ ok: true })
+    providersApiMock.list.mockResolvedValue({
+      providers: [],
+      activeId: 'openai-official',
+    })
+
+    const { useProviderStore } = await import('./providerStore')
+    await useProviderStore.getState().activateProvider('openai-official')
+
+    expect(settingsSetModelMock).toHaveBeenCalledWith('gpt-5.3-codex')
+    expect(settingsFetchAllMock).toHaveBeenCalled()
+  })
+
+  it('sets the provider main model when activating a saved provider', async () => {
+    const provider = makeProvider()
+    providersApiMock.activate.mockResolvedValue({ ok: true })
+    providersApiMock.list.mockResolvedValue({
+      providers: [provider],
+      activeId: provider.id,
+    })
+
+    const { useProviderStore } = await import('./providerStore')
+    await useProviderStore.getState().activateProvider(provider.id)
+
+    expect(settingsSetModelMock).toHaveBeenCalledWith('model-main')
+    expect(settingsFetchAllMock).toHaveBeenCalled()
+  })
+
+  it('sets the provider main model when updating the active saved provider', async () => {
+    const provider = makeProvider({ models: { main: 'model-flash', haiku: 'model-flash', sonnet: 'model-pro', opus: 'model-pro' } })
+    providersApiMock.update.mockResolvedValue({ provider })
+    providersApiMock.list.mockResolvedValue({
+      providers: [provider],
+      activeId: provider.id,
+    })
+
+    const { useProviderStore } = await import('./providerStore')
+    await useProviderStore.getState().updateProvider(provider.id, { models: provider.models })
+
+    expect(settingsSetModelMock).toHaveBeenCalledWith('model-flash')
+    expect(settingsFetchAllMock).toHaveBeenCalled()
+  })
+})
+
+describe('providerStore reorderProviders', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    chatStoreState.sessions = {}
+    runtimeStoreState.selections = {}
+    providersApiMock.list.mockResolvedValue({ providers: [], activeId: null })
+  })
+
+  it('optimistically applies the new order before the request resolves', async () => {
+    const a = makeProvider({ id: 'a', name: 'A' })
+    const b = makeProvider({ id: 'b', name: 'B' })
+    const c = makeProvider({ id: 'c', name: 'C' })
+
+    let resolveReorder: (value: { providers: SavedProvider[]; providerOrder?: string[] }) => void = () => {}
+    providersApiMock.reorder.mockReturnValue(
+      new Promise((resolve) => {
+        resolveReorder = resolve
+      }),
+    )
+
+    const { useProviderStore } = await import('./providerStore')
+    useProviderStore.setState({ providers: [a, b, c], activeId: null })
+
+    const promise = useProviderStore.getState().reorderProviders(['c', 'a', 'b'])
+
+    // Optimistic update is visible immediately, before the API resolves.
+    expect(useProviderStore.getState().providers.map((p) => p.id)).toEqual(['c', 'a', 'b'])
+
+    resolveReorder({ providers: [c, a, b] })
+    await promise
+
+    expect(providersApiMock.reorder).toHaveBeenCalledWith(['c', 'a', 'b'])
+    expect(useProviderStore.getState().providers.map((p) => p.id)).toEqual(['c', 'a', 'b'])
+  })
+
+  it('optimistically applies full display order including built-in providers', async () => {
+    const a = makeProvider({ id: 'a', name: 'A' })
+    const b = makeProvider({ id: 'b', name: 'B' })
+    providersApiMock.reorder.mockResolvedValue({
+      providers: [b, a],
+      providerOrder: ['openai-official', 'b', 'claude-official', 'a'],
+    })
+
+    const { useProviderStore } = await import('./providerStore')
+    useProviderStore.setState({
+      providers: [a, b],
+      providerOrder: ['a', 'b', 'claude-official', 'openai-official'],
+      activeId: null,
+    })
+
+    await useProviderStore.getState().reorderProviders(['openai-official', 'b', 'claude-official', 'a'])
+
+    expect(providersApiMock.reorder).toHaveBeenCalledWith(['openai-official', 'b', 'claude-official', 'a'])
+    expect(useProviderStore.getState().providerOrder).toEqual(['openai-official', 'b', 'claude-official', 'a'])
+    expect(useProviderStore.getState().providers.map((p) => p.id)).toEqual(['b', 'a'])
+  })
+
+  it('rolls back to the previous order when the request fails', async () => {
+    const a = makeProvider({ id: 'a', name: 'A' })
+    const b = makeProvider({ id: 'b', name: 'B' })
+    providersApiMock.reorder.mockRejectedValue(new Error('network down'))
+
+    const { useProviderStore } = await import('./providerStore')
+    useProviderStore.setState({ providers: [a, b], activeId: null })
+
+    await useProviderStore.getState().reorderProviders(['b', 'a'])
+
+    // Rolls back to the pre-drag order and surfaces the error.
+    expect(useProviderStore.getState().providers.map((p) => p.id)).toEqual(['a', 'b'])
+    expect(useProviderStore.getState().error).toBe('network down')
+  })
+
+  it('refetches instead of reordering when the id set is stale', async () => {
+    const a = makeProvider({ id: 'a', name: 'A' })
+    const b = makeProvider({ id: 'b', name: 'B' })
+    providersApiMock.list.mockResolvedValue({ providers: [a, b], activeId: null })
+
+    const { useProviderStore } = await import('./providerStore')
+    useProviderStore.setState({ providers: [a, b], activeId: null })
+
+    // Only one id supplied — the list changed under us, so don't persist a bad order.
+    await useProviderStore.getState().reorderProviders(['a'])
+
+    expect(providersApiMock.reorder).not.toHaveBeenCalled()
+    expect(providersApiMock.list).toHaveBeenCalled()
   })
 })

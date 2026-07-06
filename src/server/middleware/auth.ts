@@ -1,31 +1,15 @@
 /**
  * Authentication middleware
  *
- * 支持两种访问模式：
- * 1. 本地桌面应用：绑定 localhost，无需认证
- * 2. 公网/局域网访问：需要 SERVER_ACCESS_TOKEN 或 ANTHROPIC_API_KEY 认证
+ * 本地桌面应用场景下，使用 Anthropic API Key 做简单鉴权。
+ * 验证请求头中的 Authorization: Bearer <key> 与 .env 中的 ANTHROPIC_API_KEY 是否匹配。
  */
 
-// 获取有效的访问 token
-function getValidAccessToken(): string | null {
-  // 优先使用专用的访问 token
-  const serverToken = process.env.SERVER_ACCESS_TOKEN
-  if (serverToken && serverToken.trim().length > 0) {
-    return serverToken
-  }
-  
-  // 降级使用 Anthropic API Key
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (apiKey && apiKey.trim().length > 0) {
-    return apiKey
-  }
-  
-  return null
-}
+import { H5AccessService } from '../services/h5AccessService.js'
 
-export function validateAuth(req: Request): { valid: boolean; error?: string } {
-  const authHeader = req.headers.get('Authorization')
+type AuthResult = { valid: boolean; error?: string }
 
+function parseBearerToken(authHeader: string | null): AuthResult & { token?: string } {
   if (!authHeader) {
     return { valid: false, error: 'Missing Authorization header' }
   }
@@ -36,14 +20,22 @@ export function validateAuth(req: Request): { valid: boolean; error?: string } {
     return { valid: false, error: 'Invalid Authorization format. Use: Bearer <token>' }
   }
 
-  const validToken = getValidAccessToken()
-  
-  if (!validToken) {
-    return { valid: false, error: 'Server not configured for authenticated access. Set SERVER_ACCESS_TOKEN or ANTHROPIC_API_KEY in environment.' }
+  return { valid: true, token }
+}
+
+export function validateAuth(req: Request): AuthResult {
+  const parsedAuth = parseBearerToken(req.headers.get('Authorization'))
+  if (!parsedAuth.valid || !parsedAuth.token) {
+    return parsedAuth
   }
 
-  if (token !== validToken) {
-    return { valid: false, error: 'Invalid access token' }
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) {
+    return { valid: false, error: 'Server ANTHROPIC_API_KEY not configured' }
+  }
+
+  if (parsedAuth.token !== apiKey) {
+    return { valid: false, error: 'Invalid API key' }
   }
 
   return { valid: true }
@@ -52,18 +44,53 @@ export function validateAuth(req: Request): { valid: boolean; error?: string } {
 /**
  * Helper to check auth and return 401 if invalid
  */
-export function requireAuth(req: Request): Response | null {
-  const { valid, error } = validateAuth(req)
+export async function validateRequestAuth(
+  req: Request,
+  tokenOverride?: string | null,
+): Promise<AuthResult> {
+  const anthropicAuth = validateAuth(req)
+  if (anthropicAuth.valid) {
+    return anthropicAuth
+  }
+
+  const parsedAuth = parseBearerToken(req.headers.get('Authorization'))
+  const h5Token = tokenOverride ?? parsedAuth.token
+  if (h5Token) {
+    const h5AccessService = new H5AccessService()
+    if (await h5AccessService.validateToken(h5Token)) {
+      return { valid: true }
+    }
+    return { valid: false, error: 'Invalid H5 access token' }
+  }
+
+  return anthropicAuth
+}
+
+export async function requireAuth(req: Request, tokenOverride?: string | null): Promise<Response | null> {
+  const { valid, error } = await validateRequestAuth(req, tokenOverride)
   if (!valid) {
     return Response.json({ error: 'Unauthorized', message: error }, { status: 401 })
   }
   return null
 }
 
-/**
- * Check if we need to skip auth for health check endpoint
- */
-export function shouldSkipAuth(url: URL): boolean {
-  // Health check should always be accessible for monitoring
-  return url.pathname === '/health'
+export async function requireH5Token(req: Request, tokenOverride?: string | null): Promise<Response | null> {
+  const parsedAuth = parseBearerToken(req.headers.get('Authorization'))
+  const h5Token = tokenOverride ?? parsedAuth.token
+  if (!h5Token) {
+    return Response.json(
+      { error: 'Unauthorized', message: 'Missing H5 access token' },
+      { status: 401 },
+    )
+  }
+
+  const h5AccessService = new H5AccessService()
+  if (!await h5AccessService.validateToken(h5Token)) {
+    return Response.json(
+      { error: 'Unauthorized', message: 'Invalid H5 access token' },
+      { status: 401 },
+    )
+  }
+
+  return null
 }

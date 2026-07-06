@@ -27,8 +27,9 @@ import type { PluginError } from '../../types/plugin.js'
 import { logForDebugging } from '../debug.js'
 import { errorMessage } from '../errors.js'
 import { logError } from '../log.js'
+import { resetSettingsCache } from '../settings/settingsCache.js'
 import { clearAllCaches } from './cacheUtils.js'
-import { getPluginCommands } from './loadPluginCommands.js'
+import { getPluginCommands, getPluginSkills } from './loadPluginCommands.js'
 import { loadPluginHooks } from './loadPluginHooks.js'
 import { loadPluginLspServers } from './lspPluginIntegration.js'
 import { loadPluginMcpServers } from './mcpPluginIntegration.js'
@@ -48,12 +49,14 @@ export type RefreshActivePluginsResult = {
    * is called unconditionally so the manager picks these up (no-op if
    * manager was never initialized). */
   lsp_count: number
+  skill_count: number
   error_count: number
   /** The refreshed agent definitions, for callers (e.g. print.ts) that also
    * maintain a local mutable reference outside AppState. */
   agentDefinitions: AgentDefinitionsResult
   /** The refreshed plugin commands, same rationale as agentDefinitions. */
   pluginCommands: Command[]
+  pluginSkills: Command[]
 }
 
 /**
@@ -72,7 +75,11 @@ export type RefreshActivePluginsResult = {
 export async function refreshActivePlugins(
   setAppState: SetAppState,
 ): Promise<RefreshActivePluginsResult> {
-  logForDebugging('refreshActivePlugins: clearing all plugin caches')
+  logForDebugging('refreshActivePlugins: clearing settings and plugin caches')
+  // Desktop plugin toggles are written by the server process while the active
+  // CLI keeps its own settings cache. /reload-plugins is the explicit handoff
+  // point, so re-read settings before resolving enabledPlugins.
+  resetSettingsCache()
   clearAllCaches()
   // Orphan exclusions are session-frozen by default, but /reload-plugins is
   // an explicit "disk changed, re-read it" signal — recompute them too.
@@ -86,10 +93,12 @@ export async function refreshActivePlugins(
   // the plugin, returning plugin-cache-miss. loadAllPlugins warms the
   // cache-only memoize on completion, so the awaits below are ~free.
   const pluginResult = await loadAllPlugins()
-  const [pluginCommands, agentDefinitions] = await Promise.all([
+  const [pluginCommands, pluginSkills, agentDefinitions] = await Promise.all([
     getPluginCommands(),
+    getPluginSkills(),
     getAgentDefinitionsWithOverrides(getOriginalCwd()),
   ])
+  const activePluginCommands = [...pluginCommands, ...pluginSkills]
 
   const { enabled, disabled, errors } = pluginResult
 
@@ -126,7 +135,7 @@ export async function refreshActivePlugins(
       ...prev.plugins,
       enabled,
       disabled,
-      commands: pluginCommands,
+      commands: activePluginCommands,
       errors: mergePluginErrors(prev.plugins.errors, errors),
       needsRefresh: false,
     },
@@ -180,13 +189,15 @@ export async function refreshActivePlugins(
     enabled_count: enabled.length,
     disabled_count: disabled.length,
     command_count: pluginCommands.length,
+    skill_count: pluginSkills.length,
     agent_count: agentDefinitions.allAgents.length,
     hook_count,
     mcp_count,
     lsp_count,
     error_count: errors.length + (hook_load_failed ? 1 : 0),
     agentDefinitions,
-    pluginCommands,
+    pluginCommands: activePluginCommands,
+    pluginSkills,
   }
 }
 

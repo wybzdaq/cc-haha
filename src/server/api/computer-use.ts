@@ -8,16 +8,18 @@
 
 import { homedir } from 'os'
 import { join } from 'path'
-import { access, readFile, mkdir, writeFile } from 'fs/promises'
+import { access, readFile, mkdir, writeFile, rm } from 'fs/promises'
 import { createHash } from 'crypto'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import type { CuPermissionRequest } from '../../vendor/computer-use-mcp/types.js'
 import { computerUseApprovalService } from '../services/computerUseApprovalService.js'
-import { detectPythonRuntime } from './computer-use-python.js'
+import { detectPythonRuntime, isPythonVersionAtLeast } from './computer-use-python.js'
+import { buildPipInstallAttempts } from '../../utils/computerUse/pipInstall.js'
 import {
   DEFAULT_DESKTOP_GRANT_FLAGS,
   loadStoredComputerUseConfig,
+  normalizePythonPath,
   saveStoredComputerUseConfig,
 } from '../../utils/computerUse/preauthorizedConfig.js'
 // Embed helper scripts at compile time so they're available in bundled mode
@@ -37,6 +39,11 @@ const claudeHome = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
 const runtimeStateRoot = join(claudeHome, '.runtime')
 const venvRoot = join(runtimeStateRoot, 'venv')
 const installStampPath = join(runtimeStateRoot, 'requirements.sha256')
+// 记录上次创建 venv 时所用的 config.pythonPath 原值。读取该文件来判断当前
+// venv 是否仍与最新的自定义路径配置一致。
+const baseInterpreterMarkerPath = join(runtimeStateRoot, 'venv-base-interpreter.txt')
+const MIN_PYTHON_MAJOR = 3
+const MIN_PYTHON_MINOR = 9
 
 const isWindows = process.platform === 'win32'
 const REQUIREMENTS_CONTENT = isWindows ? REQUIREMENTS_WIN32 : REQUIREMENTS_DARWIN
@@ -49,10 +56,6 @@ function getPythonCommandEnv(): Record<string, string> | undefined {
     PYTHONUTF8: '1',
   } as Record<string, string>
 }
-
-// 清华大学 PyPI 镜像，国内安装速度更快
-const PIP_INDEX_URL = 'https://pypi.tuna.tsinghua.edu.cn/simple/'
-const PIP_TRUSTED_HOST = 'pypi.tuna.tsinghua.edu.cn'
 
 // Paths that resolve correctly in both dev and bundled modes
 function getRequirementsPath(): string {
@@ -76,6 +79,32 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+/**
+ * 判断现有 venv 是否与当前 config.pythonPath 配置一致。
+ *
+ * 通过 marker 文件记录上次 setup 时所用的解释器路径——这比解析 pyvenv.cfg
+ * 可靠得多：当用户自定义 Python 自身在一个 venv 里时（conda/pyenv/手工 venv
+ * 都是这种情况），Python 的 venv 模块会跳过外层 venv 直接指向 base 解释器，
+ * 导致 pyvenv.cfg 的 home 字段记录的是 base 而非用户提供的那个路径。
+ *
+ * 兼容性：marker 缺失时——
+ * - 若用户也没设置自定义路径（current === ''），视为老用户的合法 venv，
+ *   返回 true 不打扰。
+ * - 若用户设置了自定义路径（current !== ''），说明这是 marker 引入前建立
+ *   的旧 venv，绝非由当前自定义路径建立，返回 false 触发重建。
+ */
+async function venvBaseInterpreterMatches(
+  currentCustomPath: string | null | undefined,
+): Promise<boolean> {
+  const current = (currentCustomPath ?? '').trim()
+  try {
+    const recorded = (await readFile(baseInterpreterMarkerPath, 'utf8')).trim()
+    return recorded === current
+  } catch {
+    return current === ''
+  }
+}
+
 async function runCommand(
   cmd: string,
   args: string[],
@@ -95,6 +124,20 @@ async function runCommand(
   } catch {
     return { ok: false, stdout: '', stderr: `Failed to run ${cmd}`, code: -1 }
   }
+}
+
+export async function runPipInstallWithFallback(
+  pythonCmd: string,
+  baseArgs: string[],
+  run: typeof runCommand = runCommand,
+): Promise<{ ok: boolean; stdout: string; stderr: string; code: number }> {
+  let firstFailure: { ok: boolean; stdout: string; stderr: string; code: number } | null = null
+  for (const args of buildPipInstallAttempts(baseArgs)) {
+    const result = await run(pythonCmd, args)
+    if (result.ok) return result
+    firstFailure ??= result
+  }
+  return firstFailure ?? { ok: false, stdout: '', stderr: 'pip install failed', code: -1 }
 }
 
 /**
@@ -122,6 +165,8 @@ type EnvStatus = {
     installed: boolean
     version: string | null
     path: string | null
+    source: 'custom' | 'system' | 'venv' | null
+    error: string | null
   }
   venv: {
     created: boolean
@@ -146,14 +191,31 @@ async function checkStatus(): Promise<EnvStatus> {
     ? join(venvRoot, 'Scripts', 'python.exe')
     : join(venvRoot, 'bin', 'python3')
   const venvCreated = await pathExists(venvPython)
+  const config = await loadConfig()
 
-  const pythonRuntime = await detectPythonRuntime(platform, runCommand, venvCreated ? venvPython : undefined)
+  const pythonRuntime = await detectPythonRuntime(
+    platform,
+    runCommand,
+    venvCreated ? venvPython : undefined,
+    config.pythonPath,
+  )
+
+  // 校验现有 venv 是否与当前 config.pythonPath 配置一致：
+  // - 老用户从未设过自定义路径 → marker 不存在 + current 为空 → 视为匹配，
+  //   原行为完全不变。
+  // - 配置变更（设置/切换/清空自定义路径）→ marker 与 current 不一致 →
+  //   effectiveVenvCreated 置为 false，UI 提示需要重新 setup。
+  let effectiveVenvCreated = venvCreated
+  if (venvCreated) {
+    const matches = await venvBaseInterpreterMatches(config.pythonPath)
+    if (!matches) effectiveVenvCreated = false
+  }
 
   // Check dependencies — use the state dir copy
   const reqPath = getRequirementsPath()
   const requirementsFound = await pathExists(reqPath)
   let depsInstalled = false
-  if (requirementsFound && venvCreated) {
+  if (requirementsFound && effectiveVenvCreated) {
     try {
       const requirements = await readFile(reqPath, 'utf8')
       const digest = createHash('sha256').update(requirements).digest('hex')
@@ -169,7 +231,7 @@ async function checkStatus(): Promise<EnvStatus> {
   // plain preflight can misreport child processes launched by the desktop app.
   let accessibility: boolean | null = null
   let screenRecording: boolean | null = null
-  if (supported && venvCreated && depsInstalled) {
+  if (supported && effectiveVenvCreated && depsInstalled) {
     try { await ensureRuntimeFiles() } catch {}
     const helperPath = getHelperPath()
     if (await pathExists(helperPath)) {
@@ -193,8 +255,10 @@ async function checkStatus(): Promise<EnvStatus> {
       installed: pythonRuntime.installed,
       version: pythonRuntime.version,
       path: pythonRuntime.path,
+      source: pythonRuntime.source,
+      error: pythonRuntime.error,
     },
-    venv: { created: venvCreated, path: venvRoot },
+    venv: { created: effectiveVenvCreated, path: venvRoot },
     dependencies: { installed: depsInstalled, requirementsFound: requirementsFound || true },
     permissions: { accessibility, screenRecording },
   }
@@ -205,35 +269,90 @@ type SetupResult = {
   steps: { name: string; ok: boolean; message: string }[]
 }
 
+export function getUnsupportedPythonVersionStep(
+  version: string | null,
+): SetupResult['steps'][number] | null {
+  if (isPythonVersionAtLeast(version, MIN_PYTHON_MAJOR, MIN_PYTHON_MINOR)) return null
+  return {
+    name: 'python_version',
+    ok: false,
+    message: `Computer Use 需要 Python >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}，当前版本为 ${version ?? 'unknown'}`,
+  }
+}
+
+export async function installSetupDependencies(
+  venvPython: string,
+  reqPath: string,
+  install: typeof runPipInstallWithFallback = runPipInstallWithFallback,
+): Promise<{ ok: boolean; stdout: string; stderr: string; code: number }> {
+  await install(venvPython, ['-m', 'pip', 'install', '--upgrade', 'pip'])
+  return install(venvPython, ['-m', 'pip', 'install', '-r', reqPath])
+}
+
 async function runSetup(): Promise<SetupResult> {
   const steps: SetupResult['steps'] = []
 
   const venvPython = isWindows
     ? join(venvRoot, 'Scripts', 'python.exe')
     : join(venvRoot, 'bin', 'python3')
-  const venvExists = await pathExists(venvPython)
+  let venvExists = await pathExists(venvPython)
+  const config = await loadConfig()
+
+  // 校验现有 venv 是否与当前 config.pythonPath 配置一致（marker 机制详见
+  // venvBaseInterpreterMatches 注释）。不一致则删除以便后续步骤重建。
+  // 老用户从未设过自定义路径时此分支不会触发，原行为完全保留。
+  if (venvExists && !(await venvBaseInterpreterMatches(config.pythonPath))) {
+    try {
+      await rm(venvRoot, { recursive: true, force: true })
+      // 同时清除 stamp，否则 Step 5 会因 digest 匹配而跳过依赖安装，
+      // 导致重建出的 venv 没有依赖。
+      await rm(installStampPath, { force: true })
+      await rm(baseInterpreterMarkerPath, { force: true })
+      venvExists = false
+      steps.push({
+        name: 'venv_rebuild',
+        ok: true,
+        message: '检测到自定义解释器变更，已移除旧虚拟环境以便重建',
+      })
+    } catch (err) {
+      steps.push({
+        name: 'venv_rebuild',
+        ok: false,
+        message: `移除旧虚拟环境失败: ${err}`,
+      })
+      return { success: false, steps }
+    }
+  }
 
   // Step 1: Check python
   const pythonRuntime = await detectPythonRuntime(
     process.platform,
     runCommand,
     venvExists ? venvPython : undefined,
+    config.pythonPath,
   )
   if (!pythonRuntime.installed) {
     steps.push({
       name: 'python_check',
       ok: false,
-      message: 'Python 3 未安装，请先安装 Python 3',
+      message: pythonRuntime.source === 'custom'
+        ? `自定义 Python 路径不可用: ${pythonRuntime.error ?? pythonRuntime.path}`
+        : 'Python 3 未安装，请先安装 Python 3',
     })
     return { success: false, steps }
   }
   steps.push({
     name: 'python_check',
     ok: true,
-    message: pythonRuntime.source === 'venv'
-      ? `Python ${pythonRuntime.version}（使用现有虚拟环境）`
-      : `Python ${pythonRuntime.version}`,
+    message: pythonRuntime.source === 'custom'
+      ? `Python ${pythonRuntime.version}（使用自定义解释器）`
+      : pythonRuntime.source === 'venv'
+        ? `Python ${pythonRuntime.version}（使用现有虚拟环境）`
+        : `Python ${pythonRuntime.version}`,
   })
+
+  const unsupportedVersionStep = getUnsupportedPythonVersionStep(pythonRuntime.version)
+  if (unsupportedVersionStep) return { success: false, steps: [...steps, unsupportedVersionStep] }
 
   // Step 2: Extract runtime files to ~/.claude/.runtime/
   try {
@@ -269,6 +388,17 @@ async function runSetup(): Promise<SetupResult> {
         name: 'venv',
         ok: false,
         message: `创建虚拟环境失败: ${venvResult.stderr}`,
+      })
+      return { success: false, steps }
+    }
+    // 记录本次创建 venv 时所用的自定义路径配置，供后续 checkStatus 比对。
+    try {
+      await writeFile(baseInterpreterMarkerPath, config.pythonPath ?? '', 'utf8')
+    } catch (err) {
+      steps.push({
+        name: 'venv',
+        ok: false,
+        message: `写入虚拟环境标记文件失败: ${err}`,
       })
       return { success: false, steps }
     }
@@ -309,18 +439,7 @@ async function runSetup(): Promise<SetupResult> {
   } catch {}
 
   if (installedDigest !== digest) {
-    // Upgrade pip first (using China mirror)
-    await runCommand(venvPython, [
-      '-m', 'pip', 'install', '--upgrade', 'pip',
-      '-i', PIP_INDEX_URL, '--trusted-host', PIP_TRUSTED_HOST,
-    ])
-
-    // Install deps (using China mirror)
-    const installResult = await runCommand(venvPython, [
-      '-m', 'pip', 'install',
-      '-r', reqPath,
-      '-i', PIP_INDEX_URL, '--trusted-host', PIP_TRUSTED_HOST,
-    ])
+    const installResult = await installSetupDependencies(venvPython, reqPath)
     if (!installResult.ok) {
       steps.push({
         name: 'deps',
@@ -356,6 +475,7 @@ type ComputerUseConfig = {
     clipboardWrite: boolean
     systemKeyCombos: boolean
   }
+  pythonPath: string | null
 }
 
 type RequestAccessBody = {
@@ -367,6 +487,7 @@ const DEFAULT_CONFIG: ComputerUseConfig = {
   enabled: true,
   authorizedApps: [],
   grantFlags: DEFAULT_DESKTOP_GRANT_FLAGS,
+  pythonPath: null,
 }
 
 async function loadConfig(): Promise<ComputerUseConfig> {
@@ -439,6 +560,7 @@ export async function handleComputerUseApi(
       if (body.enabled !== undefined) config.enabled = body.enabled
       if (body.authorizedApps) config.authorizedApps = body.authorizedApps
       if (body.grantFlags) config.grantFlags = { ...config.grantFlags, ...body.grantFlags }
+      if ('pythonPath' in body) config.pythonPath = normalizePythonPath(body.pythonPath)
       await saveConfig(config)
       return Response.json({ ok: true })
     } catch {

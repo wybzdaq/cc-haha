@@ -13,15 +13,19 @@ type Question = {
   question: string
   header?: string
   options?: QuestionOption[]
+  multiSelect?: boolean
 }
 
 type AskUserInput = {
   questions?: Question[]
   question?: string
+  header?: string
   options?: QuestionOption[]
+  multiSelect?: boolean
 }
 
 type Props = {
+  sessionId?: string | null
   toolUseId: string
   input: unknown
   result?: unknown
@@ -41,26 +45,42 @@ function parseInput(input: unknown): Question[] {
 
   // Shape 2: { question: "...", options: [...] }
   if (typeof obj.question === 'string') {
-    return [{ question: obj.question, options: obj.options }]
+    return [{
+      question: obj.question,
+      header: obj.header,
+      options: obj.options,
+      multiSelect: obj.multiSelect,
+    }]
   }
 
   return []
 }
 
-export function AskUserQuestion({ toolUseId, input, result }: Props) {
+type QuestionSelections = Record<number, string[]>
+type QuestionFreeTexts = Record<number, string>
+
+function getSelectedAnswer(question: Question, selected: string[] | undefined) {
+  if (!selected || selected.length === 0) return ''
+  return question.multiSelect ? selected.join(', ') : selected[0] ?? ''
+}
+
+export function AskUserQuestion({ sessionId, toolUseId, input, result }: Props) {
   const { respondToPermission } = useChatStore()
   const activeTabId = useTabStore((s) => s.activeTabId)
-  const pendingPermission = useChatStore((s) => activeTabId ? s.sessions[activeTabId]?.pendingPermission : undefined)
+  const targetSessionId = sessionId ?? activeTabId
+  const pendingPermission = useChatStore((s) => targetSessionId ? s.sessions[targetSessionId]?.pendingPermission : undefined)
   const t = useTranslation()
   const questions = parseInput(input)
   const inputObject = (input && typeof input === 'object') ? input as Record<string, unknown> : {}
   const [activeTab, setActiveTab] = useState(0)
-  const [selections, setSelections] = useState<Record<number, string>>({})
-  const [freeText, setFreeText] = useState('')
+  const [selections, setSelections] = useState<QuestionSelections>({})
+  const [freeTexts, setFreeTexts] = useState<QuestionFreeTexts>({})
   const [hasSubmitted, setHasSubmitted] = useState(false)
   const composingRef = useRef(false)
 
   if (questions.length === 0) return null
+  const safeActiveTab = Math.min(activeTab, questions.length - 1)
+  const activeQuestion = questions[safeActiveTab]
 
   const resultAnswers = useMemo(() => {
     if (!result || typeof result !== 'object') return {}
@@ -69,31 +89,78 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
       ? answers as Record<string, string>
       : {}
   }, [result])
+  const resultText = typeof result === 'string' && result.trim().length > 0 ? result.trim() : ''
+  const hasStructuredAnswers = Object.keys(resultAnswers).length > 0
+  const hasTerminalResult = hasStructuredAnswers || resultText.length > 0
 
   const pendingRequest = pendingPermission?.toolUseId === toolUseId ? pendingPermission : null
   const answeredText = useMemo(() => {
-    if (Object.keys(resultAnswers).length > 0) {
+    if (hasStructuredAnswers) {
       return questions
         .map((question) => resultAnswers[question.question])
         .filter((answer): answer is string => typeof answer === 'string' && answer.trim().length > 0)
         .join(', ')
     }
-    return freeText.trim() || Object.values(selections).join(', ')
-  }, [freeText, questions, resultAnswers, selections])
-  const submitted = Object.keys(resultAnswers).length > 0 || hasSubmitted
+    if (resultText) return resultText
+    return questions
+      .map((question, index) => freeTexts[index]?.trim() || getSelectedAnswer(question, selections[index]))
+      .filter(Boolean)
+      .join('; ')
+  }, [freeTexts, hasStructuredAnswers, questions, resultAnswers, resultText, selections])
+  const submitted = hasTerminalResult || hasSubmitted
+  const terminalWithoutAnswers = submitted && !hasStructuredAnswers && resultText.length > 0
 
   const handleSelect = (qIndex: number, label: string) => {
     if (submitted) return
     setSelections((prev) => {
-      // Toggle: deselect if already selected
-      if (prev[qIndex] === label) {
+      const question = questions[qIndex]
+      const selected = prev[qIndex] ?? []
+      if (question?.multiSelect) {
+        const nextSelected = selected.includes(label)
+          ? selected.filter((value) => value !== label)
+          : [...selected, label]
+        const next = { ...prev }
+        if (nextSelected.length > 0) {
+          next[qIndex] = nextSelected
+        } else {
+          delete next[qIndex]
+        }
+        return next
+      }
+      if (selected[0] === label) {
         const next = { ...prev }
         delete next[qIndex]
         return next
       }
-      return { ...prev, [qIndex]: label }
+      return { ...prev, [qIndex]: [label] }
     })
-    setFreeText('')
+    setFreeTexts((prev) => {
+      if (!prev[qIndex]) return prev
+      const next = { ...prev }
+      delete next[qIndex]
+      return next
+    })
+  }
+
+  const handleFreeTextChange = (qIndex: number, value: string) => {
+    if (submitted) return
+    setFreeTexts((prev) => {
+      const next = { ...prev }
+      if (value) {
+        next[qIndex] = value
+      } else {
+        delete next[qIndex]
+      }
+      return next
+    })
+    if (value.trim()) {
+      setSelections((prev) => {
+        if (!prev[qIndex]) return prev
+        const next = { ...prev }
+        delete next[qIndex]
+        return next
+      })
+    }
   }
 
   const handleSubmit = () => {
@@ -101,25 +168,27 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
 
     const parts: string[] = []
     for (let i = 0; i < questions.length; i++) {
-      const selected = selections[i]
-      if (selected) parts.push(selected)
+      const answer = freeTexts[i]?.trim() || getSelectedAnswer(questions[i]!, selections[i])
+      if (answer) parts.push(answer)
     }
-    const response = freeText.trim() || parts.join('; ') || ''
+    const response = parts.join('; ')
     if (!response) return
 
-    if (!activeTabId || !pendingRequest) return
+    if (!targetSessionId || !pendingRequest) return
 
     const answers = questions.reduce<Record<string, string>>((acc, question, index) => {
-      if (freeText.trim()) {
-        acc[question.question] = freeText.trim()
-      } else if (selections[index]) {
-        acc[question.question] = selections[index]!
+      const freeText = freeTexts[index]?.trim()
+      if (freeText) {
+        acc[question.question] = freeText
+      } else {
+        const selected = getSelectedAnswer(question, selections[index])
+        if (selected) acc[question.question] = selected
       }
       return acc
     }, {})
 
     setHasSubmitted(true)
-    respondToPermission(activeTabId, pendingRequest.requestId, true, {
+    respondToPermission(targetSessionId, pendingRequest.requestId, true, {
       updatedInput: {
         ...inputObject,
         answers,
@@ -128,9 +197,9 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
   }
 
   // All questions must be answered (via selection or free text) to enable submit
-  const allAnswered = freeText.trim().length > 0 || questions.every((_, i) => selections[i] !== undefined)
-  const safeActiveTab = Math.min(activeTab, questions.length - 1)
-  const activeQuestion = questions[safeActiveTab]
+  const allAnswered = questions.every((_, i) =>
+    Boolean(freeTexts[i]?.trim()) || (selections[i]?.length ?? 0) > 0,
+  )
 
   if (!activeQuestion) return null
 
@@ -157,7 +226,7 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
           </span>
           {submitted && (
             <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[var(--color-surface-container-high)] text-[var(--color-text-tertiary)]">
-              {t('question.answered')}
+              {t(terminalWithoutAnswers ? 'question.completed' : 'question.answered')}
             </span>
           )}
         </div>
@@ -168,7 +237,7 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
         <div className="flex px-4 border-b border-[var(--color-outline-variant)]/20 bg-[var(--color-surface-container-low)] overflow-x-auto">
           {questions.map((q, i) => {
             const isActive = safeActiveTab === i
-            const isAnswered = selections[i] !== undefined
+            const isAnswered = Boolean(freeTexts[i]?.trim()) || (selections[i]?.length ?? 0) > 0
             const tabLabel = q.header || `Q${i + 1}`
             return (
               <button
@@ -203,7 +272,8 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
         {activeQuestion.options && activeQuestion.options.length > 0 && (
           <div className="space-y-2 mb-3">
             {activeQuestion.options.map((opt, optIndex) => {
-              const isSelected = selections[activeTab] === opt.label
+              const isSelected = selections[safeActiveTab]?.includes(opt.label) ?? false
+              const isMultiSelect = activeQuestion.multiSelect === true
               return (
                 <button
                   key={optIndex}
@@ -216,12 +286,12 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
                   } ${submitted ? 'cursor-default' : ''}`}
                 >
                   <div className="flex items-start gap-3">
-                    {/* Check indicator */}
+                    {/* Selection indicator */}
                     <div className={`mt-0.5 flex-shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
                       isSelected
                         ? 'border-[var(--color-secondary)] bg-[var(--color-secondary)]'
                         : 'border-[var(--color-outline)]'
-                    }`}>
+                    } ${isMultiSelect ? 'rounded-[var(--radius-xs)]' : 'rounded-full'}`}>
                       {isSelected && (
                         <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                           <polyline points="20 6 9 17 4 12" />
@@ -255,21 +325,22 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
             <label className="text-xs text-[var(--color-text-tertiary)] mb-1.5 block">
               {t('question.customResponse')}
             </label>
-            <input
-              type="text"
-              value={freeText}
-              onChange={(e) => {
-                setFreeText(e.target.value)
-                if (e.target.value.trim()) setSelections({})
-              }}
+            <textarea
+              value={freeTexts[safeActiveTab] ?? ''}
+              onChange={(e) => handleFreeTextChange(safeActiveTab, e.target.value)}
               onCompositionStart={() => { composingRef.current = true }}
               onCompositionEnd={() => { composingRef.current = false }}
               onKeyDown={(e) => {
                 if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return
-                if (e.key === 'Enter' && allAnswered) handleSubmit()
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && allAnswered) {
+                  e.preventDefault()
+                  handleSubmit()
+                }
               }}
               placeholder={t('question.typePlaceholder')}
-              className="w-full px-3 py-2 text-sm bg-[var(--color-surface)] border border-[var(--color-outline-variant)]/40 rounded-[var(--radius-md)] text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] focus:outline-none focus:border-[var(--color-secondary)] focus:ring-1 focus:ring-[var(--color-secondary)]/30"
+              rows={3}
+              wrap="soft"
+              className="max-h-48 min-h-[84px] w-full resize-y rounded-[var(--radius-md)] border border-[var(--color-outline-variant)]/40 bg-[var(--color-surface)] px-3 py-2 text-sm leading-relaxed text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-secondary)]/30"
             />
           </div>
         )}
@@ -279,7 +350,7 @@ export function AskUserQuestion({ toolUseId, input, result }: Props) {
           <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
             <span className="material-symbols-outlined text-[14px] text-[var(--color-success)]">check_circle</span>
             <span>
-              {t('question.answeredPrefix')}<strong>{answeredText}</strong>
+              {t(terminalWithoutAnswers ? 'question.resultPrefix' : 'question.answeredPrefix')}<strong>{answeredText}</strong>
             </span>
           </div>
         )}

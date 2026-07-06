@@ -7,19 +7,22 @@
  *   GET    /api/sessions            — 列出会话
  *   GET    /api/sessions/:id        — 获取会话详情
  *   GET    /api/sessions/:id/messages — 获取会话消息
+ *   GET    /api/sessions/:id/trace — 获取会话级模型调用 trace（body preview 裁剪后的列表视图）
+ *   GET    /api/sessions/:id/trace/calls/:callId — 获取单次调用的完整 trace 记录
  *   GET    /api/sessions/:id/turn-checkpoints — 获取按轮次保留的 checkpoint 预览
  *   GET    /api/sessions/:id/turn-checkpoints/diff — 获取绑定到指定 checkpoint 的 diff
  *   POST   /api/sessions            — 创建新会话
+ *   POST   /api/sessions/batch-delete — 批量删除会话
  *   DELETE /api/sessions/:id        — 删除会话
  *   PATCH  /api/sessions/:id        — 重命名会话
  */
 
+import * as path from 'node:path'
 import { sessionService } from '../services/sessionService.js'
 import { conversationService } from '../services/conversationService.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import { closeSessionConnection, getSlashCommands } from '../ws/handler.js'
-import { getCommandName } from '../../commands.js'
-import { getSkillDirCommands } from '../../skills/loadSkillsDir.js'
+import { listSkillSlashCommands, type SkillSlashCommand } from './skills.js'
 import { WorkspaceService } from '../services/workspaceService.js'
 import {
   getRepositoryContext,
@@ -33,6 +36,15 @@ import {
   type RewindTargetSelector,
 } from '../services/sessionRewindService.js'
 import { SessionStore } from '../../../adapters/common/session-store.js'
+import {
+  createSessionBranch,
+  SessionBranchingError,
+} from '../../utils/sessionBranching.js'
+import { registerChangedFileAccessRoot, registerFilesystemAccessRoot } from '../services/filesystemAccessRoots.js'
+import { findGitRoot } from '../../utils/git.js'
+import { traceCaptureService, trimTraceCallPreviews } from '../services/traceCaptureService.js'
+
+const DEFAULT_GIT_INFO_COMMAND_TIMEOUT_MS = 3_000
 
 const workspaceService = new WorkspaceService(
   async (sessionId) => (
@@ -70,6 +82,17 @@ export async function handleSessionsApi(
       }
     }
 
+    // Special collection route: /api/sessions/batch-delete
+    if (sessionId === 'batch-delete') {
+      if (req.method !== 'POST') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      return await batchDeleteSessions(req)
+    }
+
     // Special collection route: /api/sessions/recent-projects
     if (sessionId === 'recent-projects' && req.method === 'GET') {
       return await getRecentProjects(url)
@@ -93,6 +116,18 @@ export async function handleSessionsApi(
       return await getSessionMessages(sessionId)
     }
 
+    if (subResource === 'trace') {
+      if (req.method !== 'GET') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      return segments[4] === 'calls'
+        ? await getSessionTraceCall(sessionId, segments[5])
+        : await getSessionTrace(sessionId)
+    }
+
     if (subResource === 'git-info') {
       if (req.method !== 'GET') {
         return Response.json(
@@ -111,6 +146,16 @@ export async function handleSessionsApi(
         )
       }
       return await rewindSession(req, sessionId)
+    }
+
+    if (subResource === 'branch') {
+      if (req.method !== 'POST') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      return await branchSession(req, sessionId)
     }
 
     if (subResource === 'turn-checkpoints') {
@@ -223,6 +268,54 @@ async function getSessionMessages(sessionId: string): Promise<Response> {
   return Response.json({ messages, taskNotifications })
 }
 
+async function getSessionTrace(sessionId: string): Promise<Response> {
+  const [trace, sessionMeta, messageSignature] = await Promise.all([
+    traceCaptureService.getSessionTrace(sessionId),
+    getSessionTraceMeta(sessionId),
+    sessionService.getSessionMessagesSignature(sessionId),
+  ])
+  return Response.json({
+    ...trace,
+    calls: trace.calls.map((call) => trimTraceCallPreviews(call)),
+    messageSignature,
+    session: sessionMeta
+      ? {
+          id: sessionId,
+          title: sessionMeta.title,
+          projectPath: sessionMeta.projectPath,
+          workDir: sessionMeta.workDir,
+        }
+      : null,
+  })
+}
+
+async function getSessionTraceMeta(sessionId: string): Promise<{
+  title: string
+  projectPath: string
+  workDir: string | null
+} | null> {
+  const found = await sessionService.findSessionFile(sessionId)
+  if (!found) return null
+  const meta = await sessionService.getSessionTitleAndMeta(found.filePath)
+  return {
+    title: meta.title,
+    projectPath: meta.projectPath,
+    workDir: meta.workDir,
+  }
+}
+
+async function getSessionTraceCall(sessionId: string, callId: string | undefined): Promise<Response> {
+  if (!callId || callId.trim().length === 0) {
+    throw ApiError.badRequest('callId is required')
+  }
+
+  const call = await traceCaptureService.getSessionTraceCall(sessionId, callId)
+  if (!call) {
+    throw ApiError.notFound(`Trace call not found: ${callId}`)
+  }
+  return Response.json({ call })
+}
+
 async function handleSessionWorkspaceRoute(
   sessionId: string,
   url: URL,
@@ -254,15 +347,19 @@ async function handleSessionWorkspaceRoute(
 }
 
 async function createSession(req: Request): Promise<Response> {
-  let body: { workDir?: string; repository?: CreateSessionRepositoryOptions }
+  let body: { workDir?: string; repository?: CreateSessionRepositoryOptions; permissionMode?: string }
   try {
-    body = (await req.json()) as { workDir?: string; repository?: CreateSessionRepositoryOptions }
+    body = (await req.json()) as { workDir?: string; repository?: CreateSessionRepositoryOptions; permissionMode?: string }
   } catch {
     throw ApiError.badRequest('Invalid JSON body')
   }
 
   if (body.workDir && typeof body.workDir !== 'string') {
     throw ApiError.badRequest('workDir must be a string')
+  }
+
+  if (body.permissionMode !== undefined && typeof body.permissionMode !== 'string') {
+    throw ApiError.badRequest('permissionMode must be a string')
   }
 
   if (body.repository !== undefined) {
@@ -277,7 +374,7 @@ async function createSession(req: Request): Promise<Response> {
     }
   }
 
-  const result = await sessionService.createSession(body.workDir, body.repository)
+  const result = await sessionService.createSession(body.workDir, body.repository, body.permissionMode)
   recentProjectsCache = null
   return Response.json(result, { status: 201 })
 }
@@ -288,7 +385,11 @@ async function getSessionRepositoryContext(url: URL): Promise<Response> {
     throw ApiError.badRequest('workDir query parameter is required')
   }
 
-  return Response.json(await getRepositoryContext(workDir))
+  const context = await getRepositoryContext(workDir)
+  registerFilesystemAccessRoot(workDir)
+  registerFilesystemAccessRoot(context.workDir)
+  registerFilesystemAccessRoot(context.repoRoot)
+  return Response.json(context)
 }
 
 async function requireSessionWorkspace(sessionId: string): Promise<string> {
@@ -356,7 +457,59 @@ async function deleteSession(sessionId: string): Promise<Response> {
   }
   closeSessionConnection(sessionId, 'session deleted')
   cleanupAdapterSessionMappings(sessionId)
+  recentProjectsCache = null
   return Response.json({ ok: true })
+}
+
+async function batchDeleteSessions(req: Request): Promise<Response> {
+  let body: { sessionIds?: unknown }
+  try {
+    body = (await req.json()) as { sessionIds?: unknown }
+  } catch {
+    throw ApiError.badRequest('Invalid JSON body')
+  }
+
+  const sessionIds = normalizeSessionIds(body.sessionIds)
+  conversationService.markSessionsDeleted(sessionIds)
+  const result = await sessionService.deleteSessions(sessionIds)
+
+  if (result.failures.length > 0) {
+    conversationService.unmarkSessionsDeleted(result.failures.map((failure) => failure.sessionId))
+  }
+
+  for (const sessionId of result.successes) {
+    closeSessionConnection(sessionId, 'session deleted')
+    cleanupAdapterSessionMappings(sessionId)
+  }
+  if (result.successes.length > 0) {
+    recentProjectsCache = null
+  }
+
+  return Response.json({
+    ok: result.failures.length === 0,
+    successes: result.successes,
+    failures: result.failures,
+  })
+}
+
+function normalizeSessionIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw ApiError.badRequest('sessionIds must be an array')
+  }
+
+  const sessionIds: string[] = []
+  for (const sessionId of value) {
+    if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      throw ApiError.badRequest('sessionIds must contain only non-empty strings')
+    }
+    sessionIds.push(sessionId.trim())
+  }
+
+  if (sessionIds.length === 0) {
+    throw ApiError.badRequest('sessionIds must include at least one session id')
+  }
+
+  return [...new Set(sessionIds)]
 }
 
 function cleanupAdapterSessionMappings(sessionId: string): void {
@@ -366,24 +519,44 @@ function cleanupAdapterSessionMappings(sessionId: string): void {
   }
 }
 
-async function getSessionSlashCommands(sessionId: string): Promise<Response> {
-  const cachedCommands = getSlashCommands(sessionId)
-  if (cachedCommands.length > 0) {
-    return Response.json({ commands: cachedCommands })
+function mergeSessionSlashCommands(
+  preferred: Array<{ name: string; description?: string; argumentHint?: string }>,
+  fallback: SkillSlashCommand[],
+): Array<{ name: string; description: string; argumentHint?: string }> {
+  const merged = new Map<string, { name: string; description: string; argumentHint?: string }>()
+
+  for (const command of preferred) {
+    if (!command.name) continue
+    merged.set(command.name, {
+      name: command.name,
+      description: command.description || '',
+      ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
+    })
   }
 
+  for (const command of fallback) {
+    if (!command.name || merged.has(command.name)) continue
+    merged.set(command.name, {
+      name: command.name,
+      description: command.description || '',
+      ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
+    })
+  }
+
+  return [...merged.values()]
+}
+
+async function getSessionSlashCommands(sessionId: string): Promise<Response> {
+  const cachedCommands = getSlashCommands(sessionId)
   const workDir = await sessionService.getSessionWorkDir(sessionId)
   if (!workDir) {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
 
-  const commands = await getSkillDirCommands(workDir)
-  const slashCommands = commands
-    .filter((command) => command.userInvocable !== false)
-    .map((command) => ({
-      name: getCommandName(command),
-      description: command.description || '',
-    }))
+  const skillCommands = await listSkillSlashCommands(workDir)
+  const slashCommands = cachedCommands.length > 0
+    ? mergeSessionSlashCommands(cachedCommands, skillCommands)
+    : skillCommands
 
   return Response.json({ commands: slashCommands })
 }
@@ -391,29 +564,38 @@ async function getSessionSlashCommands(sessionId: string): Promise<Response> {
 async function getSessionInspection(sessionId: string, url: URL): Promise<Response> {
   const includeContext = url.searchParams.get('includeContext') !== '0'
   const contextOnly = includeContext && url.searchParams.get('contextOnly') === '1'
+  let transcriptSnapshot: Awaited<ReturnType<typeof sessionService.getInspectionTranscriptSnapshot>> | undefined
+  const getTranscriptSnapshot = async () => {
+    if (transcriptSnapshot !== undefined) return transcriptSnapshot
+    transcriptSnapshot = await sessionService.getInspectionTranscriptSnapshot(sessionId).catch(() => null)
+    return transcriptSnapshot
+  }
+
+  const active = conversationService.hasSession(sessionId)
   const workDir =
     conversationService.getSessionWorkDir(sessionId) ||
-    await sessionService.getSessionWorkDir(sessionId)
+    (await getTranscriptSnapshot())?.launchInfo.workDir
 
   if (!workDir) {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
 
-  const active = conversationService.hasSession(sessionId)
+  const launchInfo = !active ? (await getTranscriptSnapshot())?.launchInfo ?? null : null
+  const permissionMode = active
+    ? conversationService.getSessionPermissionMode(sessionId)
+    : launchInfo?.permissionMode ?? 'default'
   const initMessage = conversationService.getSessionInitMessage(sessionId) ??
     [...conversationService.getRecentSdkMessages(sessionId)]
     .reverse()
     .find((message) => message?.type === 'system' && message.subtype === 'init')
-  const transcriptMetadata = await sessionService.getTranscriptMetadata(sessionId)
+  const transcriptMetadata = !active || !initMessage
+    ? (await getTranscriptSnapshot())?.metadata ?? null
+    : null
   const cachedSlashCommands = getSlashCommands(sessionId)
+  const skillSlashCommands = await listSkillSlashCommands(workDir)
   const fallbackSlashCommands = cachedSlashCommands.length > 0
-    ? cachedSlashCommands
-    : (await getSkillDirCommands(workDir))
-      .filter((command) => command.userInvocable !== false)
-      .map((command) => ({
-        name: getCommandName(command),
-        description: command.description || '',
-      }))
+    ? mergeSessionSlashCommands(cachedSlashCommands, skillSlashCommands)
+    : skillSlashCommands
   const slashCommandCount = Array.isArray(initMessage?.slash_commands)
     ? initMessage.slash_commands.length
     : fallbackSlashCommands.length
@@ -423,7 +605,7 @@ async function getSessionInspection(sessionId: string, url: URL): Promise<Respon
     status: {
       sessionId,
       workDir,
-      permissionMode: conversationService.getSessionPermissionMode(sessionId),
+      permissionMode,
       version: typeof initMessage?.claude_code_version === 'string' ? initMessage.claude_code_version : transcriptMetadata?.version,
       cwd: typeof initMessage?.cwd === 'string' ? initMessage.cwd : transcriptMetadata?.cwd ?? workDir,
       model: typeof initMessage?.model === 'string' ? initMessage.model : transcriptMetadata?.model,
@@ -436,13 +618,14 @@ async function getSessionInspection(sessionId: string, url: URL): Promise<Respon
     },
     errors: {},
   }
-  const transcriptUsage = await sessionService.getTranscriptUsage(sessionId)
-  const transcriptContextEstimate = await sessionService.getTranscriptContextEstimate(sessionId)
-  if (transcriptContextEstimate) {
-    response.contextEstimate = transcriptContextEstimate
-  }
 
   if (!active) {
+    const snapshot = await getTranscriptSnapshot()
+    const transcriptUsage = snapshot?.usage ?? null
+    const transcriptContextEstimate = snapshot?.contextEstimate ?? null
+    if (transcriptContextEstimate) {
+      response.contextEstimate = transcriptContextEstimate
+    }
     if (transcriptUsage) {
       response.usage = transcriptUsage
     }
@@ -464,6 +647,12 @@ async function getSessionInspection(sessionId: string, url: URL): Promise<Respon
     } catch (error) {
       errors.context = error instanceof Error ? error.message : String(error)
     }
+    if (!response.context) {
+      const transcriptContextEstimate = (await getTranscriptSnapshot())?.contextEstimate ?? null
+      if (transcriptContextEstimate) {
+        response.contextEstimate = transcriptContextEstimate
+      }
+    }
   } else {
     const basicControlTimeoutMs = includeContext ? 10_000 : 4_000
     const [usageResult, contextResult, mcpResult] = await Promise.allSettled([
@@ -479,11 +668,13 @@ async function getSessionInspection(sessionId: string, url: URL): Promise<Respon
     ])
 
     if (usageResult.status === 'fulfilled') {
+      const transcriptUsage = (await getTranscriptSnapshot())?.usage ?? null
       response.usage = chooseRicherUsage(
         { ...usageResult.value, source: 'current_process' },
         transcriptUsage,
       )
     } else {
+      const transcriptUsage = (await getTranscriptSnapshot())?.usage ?? null
       if (transcriptUsage) {
         response.usage = transcriptUsage
       } else {
@@ -498,6 +689,10 @@ async function getSessionInspection(sessionId: string, url: URL): Promise<Respon
       response.context = contextResult.value
     } else {
       errors.context = contextResult.reason instanceof Error ? contextResult.reason.message : String(contextResult.reason)
+      const transcriptContextEstimate = (await getTranscriptSnapshot())?.contextEstimate ?? null
+      if (transcriptContextEstimate) {
+        response.contextEstimate = transcriptContextEstimate
+      }
     }
 
     if (mcpResult.status === 'fulfilled' && response.status && typeof response.status === 'object') {
@@ -533,11 +728,77 @@ function chooseRicherUsage(
     : currentUsage
 }
 
+function sameResolvedPath(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left || !right) return false
+  return path.resolve(left) === path.resolve(right)
+}
+
+function getGitInfoCommandTimeoutMs(): number {
+  const raw = process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS
+  if (!raw) return DEFAULT_GIT_INFO_COMMAND_TIMEOUT_MS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_GIT_INFO_COMMAND_TIMEOUT_MS
+}
+
+async function runGitInfoCommand(workDir: string, args: string[]): Promise<string | null> {
+  let proc: Bun.Subprocess<'ignore', 'pipe', 'ignore'> | null = null
+  let timeout: ReturnType<typeof setTimeout> | null = null
+
+  try {
+    proc = Bun.spawn(['git', ...args], {
+      cwd: workDir,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'ignore',
+    })
+
+    const output = new Response(proc.stdout).text()
+      .then(async (text) => (await proc!.exited) === 0 ? text.trim() : null)
+      .catch(() => null)
+
+    const timedOut = new Promise<null>((resolve) => {
+      timeout = setTimeout(() => {
+        try {
+          proc?.kill()
+        } catch {
+          // Process may already have exited.
+        }
+        resolve(null)
+      }, getGitInfoCommandTimeoutMs())
+    })
+
+    return await Promise.race([output, timedOut])
+  } catch {
+    return null
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
+function repoNameFromRemote(remote: string | null): string {
+  if (!remote) return ''
+  const match = remote.match(/\/([^/]+?)(?:\.git)?$/) || remote.match(/:([^/]+\/[^/]+?)(?:\.git)?$/)
+  return match ? match[1]! : ''
+}
+
+function ownerRepoNameFromRemote(remote: string | null): string | null {
+  if (!remote) return null
+  const match = remote.match(/:([^/]+\/[^/]+?)(?:\.git)?$/) || remote.match(/\/([^/]+\/[^/]+?)(?:\.git)?$/)
+  return match ? match[1]! : null
+}
+
+function repoNameFromWorkDir(workDir: string): string {
+  return path.basename(workDir) || workDir.split(/[\\/]/).filter(Boolean).at(-1) || ''
+}
+
 async function getGitInfo(sessionId: string): Promise<Response> {
   const workDir = conversationService.getSessionWorkDir(sessionId) || await sessionService.getSessionWorkDir(sessionId)
   if (!workDir) {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
+  registerFilesystemAccessRoot(workDir)
   const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
   const repository = launchInfo?.repository
   const worktreeSession = launchInfo?.worktreeSession
@@ -556,43 +817,41 @@ async function getGitInfo(sessionId: string): Promise<Response> {
       }
     : null
 
+  // Fast check: if workDir is not inside a git repo, skip spawning git commands.
+  // findGitRoot uses fs.stat traversal with LRU cache (<5ms), avoiding 3 slow git
+  // spawns on non-git directories (each can take seconds as git searches upward).
+  const gitRoot = findGitRoot(workDir)
+  if (!gitRoot) {
+    const dirName = repoNameFromWorkDir(workDir)
+    return Response.json({
+      branch: sessionBranch,
+      repoName: dirName,
+      workDir,
+      changedFiles: 0,
+      worktree,
+    })
+  }
+
   try {
     // Get branch name
-    const branchProc = Bun.spawn(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd: workDir,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-    const branchText = await new Response(branchProc.stdout).text()
-    const branch = sessionBranch || branchText.trim()
+    const gitBranch = await runGitInfoCommand(workDir, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    const materializedWorktree = !!worktree && (
+      sameResolvedPath(workDir, worktree.path) ||
+      sameResolvedPath(workDir, worktree.plannedPath)
+    )
+    const branch = sessionBranch || (
+      materializedWorktree
+        ? (worktree.branch || gitBranch)
+        : gitBranch
+    )
 
     // Get repo name from remote or directory
-    let repoName = ''
-    try {
-      const remoteProc = Bun.spawn(['git', 'remote', 'get-url', 'origin'], {
-        cwd: workDir,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      })
-      const remoteText = await new Response(remoteProc.stdout).text()
-      const remote = remoteText.trim()
-      // Extract repo name from URL: git@github.com:user/repo.git or https://...repo.git
-      const match = remote.match(/\/([^/]+?)(?:\.git)?$/) || remote.match(/:([^/]+\/[^/]+?)(?:\.git)?$/)
-      repoName = match ? match[1]! : ''
-    } catch {
-      // No remote, use directory name
-      const parts = workDir.split('/')
-      repoName = parts[parts.length - 1] || ''
-    }
+    const remote = await runGitInfoCommand(workDir, ['remote', 'get-url', 'origin'])
+    const repoName = repoNameFromRemote(remote) || repoNameFromWorkDir(workDir)
 
     // Get short status
-    const statusProc = Bun.spawn(['git', 'status', '--porcelain'], {
-      cwd: workDir,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-    const statusText = await new Response(statusProc.stdout).text()
-    const changedFiles = statusText.trim().split('\n').filter(Boolean).length
+    const statusText = await runGitInfoCommand(workDir, ['-c', 'core.fsmonitor=false', 'status', '--porcelain'])
+    const changedFiles = statusText?.split('\n').filter(Boolean).length ?? 0
 
     return Response.json({
       branch,
@@ -635,8 +894,68 @@ async function rewindSession(req: Request, sessionId: string): Promise<Response>
   return Response.json(result)
 }
 
+async function branchSession(req: Request, sessionId: string): Promise<Response> {
+  let body: { targetMessageId?: unknown; title?: unknown }
+  try {
+    body = (await req.json()) as { targetMessageId?: unknown; title?: unknown }
+  } catch {
+    throw ApiError.badRequest('Invalid JSON body')
+  }
+
+  if (typeof body.targetMessageId !== 'string' || body.targetMessageId.trim().length === 0) {
+    throw ApiError.badRequest('targetMessageId (string) is required in request body')
+  }
+
+  if (body.title !== undefined && typeof body.title !== 'string') {
+    throw ApiError.badRequest('title must be a string')
+  }
+
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId)
+  if (!launchInfo) {
+    throw ApiError.notFound(`Session not found: ${sessionId}`)
+  }
+
+  try {
+    const result = await createSessionBranch({
+      sourceSessionId: sessionId,
+      sourceTranscriptPath: launchInfo.filePath,
+      targetMessageId: body.targetMessageId.trim(),
+      title: body.title?.trim() || undefined,
+      sourceWorkDir: launchInfo.workDir,
+      sourceRepository: launchInfo.repository,
+      sourceWorktreeSession: launchInfo.worktreeSession,
+    })
+
+    recentProjectsCache = null
+
+    return Response.json({
+      sessionId: result.sessionId,
+      title: result.title,
+      workDir: result.workDir ?? launchInfo.workDir,
+      sourceSessionId: sessionId,
+      targetMessageId: body.targetMessageId.trim(),
+    }, { status: 201 })
+  } catch (error) {
+    if (error instanceof SessionBranchingError) {
+      if (error.code === 'SOURCE_NOT_FOUND') {
+        throw ApiError.notFound(error.message)
+      }
+      throw ApiError.badRequest(error.message)
+    }
+    throw error
+  }
+}
+
 async function getTurnCheckpoints(sessionId: string): Promise<Response> {
   const checkpoints = await listSessionTurnCheckpoints(sessionId)
+  // Make this turn's real changed files previewable even when they live outside
+  // the session workdir (e.g. the user told the model to write to an absolute
+  // path on another drive). Writing them was authorized, so previewing is too.
+  for (const checkpoint of checkpoints) {
+    for (const filePath of checkpoint.code.filesChanged) {
+      registerChangedFileAccessRoot(filePath, checkpoint.workDir)
+    }
+  }
   return Response.json({ checkpoints })
 }
 
@@ -703,9 +1022,10 @@ const RECENT_PROJECTS_CACHE_TTL = 30_000
 const DESKTOP_WORKTREE_MARKER = '/.claude/worktrees/'
 
 function projectNameForRecentPath(realPath: string, fallback: string): string {
-  const displayRoot = realPath.includes(DESKTOP_WORKTREE_MARKER)
-    ? realPath.slice(0, realPath.indexOf(DESKTOP_WORKTREE_MARKER))
-    : realPath
+  const normalizedRealPath = realPath.replace(/\\/g, '/')
+  const displayRoot = normalizedRealPath.includes(DESKTOP_WORKTREE_MARKER)
+    ? normalizedRealPath.slice(0, normalizedRealPath.indexOf(DESKTOP_WORKTREE_MARKER))
+    : normalizedRealPath
   return displayRoot.split('/').filter(Boolean).pop() || fallback
 }
 
@@ -715,30 +1035,31 @@ function isDesktopWorktreeBranchName(branch: string | null): boolean {
 
 async function getRecentProjects(url: URL): Promise<Response> {
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '10', 10) || 10, 1), 500)
+  const sessionScanLimit = Math.min(Math.max(limit * 8, 50), 200)
 
   // Return cached response if fresh
   if (recentProjectsCache && Date.now() - recentProjectsCache.timestamp < RECENT_PROJECTS_CACHE_TTL) {
     return Response.json({ projects: recentProjectsCache.projects.slice(0, limit) })
   }
 
-  const { sessions } = await sessionService.listSessions({ limit: 200 })
+  const { sessions } = await sessionService.listSessions({ limit: sessionScanLimit })
   const validSessions = sessions.filter((session) => session.workDirExists && session.workDir)
 
-  // First pass: resolve realPath for each session and group by realPath to dedup
+  // First pass: group by logical project root so worktrees stay under the same project.
+  // Optimization: prefer s.projectRoot (already resolved by listSessions) and only fall back
+  // to the expensive getSessionWorkDir (reads the full transcript) when projectRoot is absent.
   const realPathMap = new Map<string, { projectPath: string; modifiedAt: string; sessionCount: number; sessionId: string }>()
+  const fallbackSessionIds: string[] = []
   for (const s of validSessions) {
-    let realPath: string
-    try {
-      const workDir = await sessionService.getSessionWorkDir(s.id)
-      realPath = workDir || sessionService.desanitizePath(s.projectPath)
-    } catch {
-      realPath = sessionService.desanitizePath(s.projectPath)
+    const realPath = s.projectRoot || sessionService.desanitizePath(s.projectPath)
+    if (!s.projectRoot && s.id) {
+      fallbackSessionIds.push(s.id)
     }
 
     const existing = realPathMap.get(realPath)
     if (!existing || s.modifiedAt > existing.modifiedAt) {
       realPathMap.set(realPath, {
-        projectPath: s.projectPath,
+        projectPath: realPath,
         modifiedAt: s.modifiedAt,
         sessionCount: (existing?.sessionCount ?? 0) + 1,
         sessionId: s.id,
@@ -748,7 +1069,46 @@ async function getRecentProjects(url: URL): Promise<Response> {
     }
   }
 
+  // Resolve fallback sessions in parallel (only those missing projectRoot)
+  if (fallbackSessionIds.length > 0) {
+    const resolvedPaths = await Promise.all(
+      fallbackSessionIds.map(async (sessionId) => {
+        try {
+          const workDir = await sessionService.getSessionWorkDir(sessionId)
+          return { sessionId, workDir }
+        } catch {
+          return { sessionId, workDir: null as string | null }
+        }
+      }),
+    )
+    for (const { sessionId, workDir } of resolvedPaths) {
+      if (!workDir) continue
+      // Find the entry we already inserted with the desanitized projectPath
+      const session = validSessions.find((s) => s.id === sessionId)
+      const oldKey = session?.projectRoot || sessionService.desanitizePath(session?.projectPath || '')
+      const oldEntry = oldKey ? realPathMap.get(oldKey) : undefined
+      const newRealPath = workDir
+      if (oldKey && oldEntry && oldKey !== newRealPath) {
+        // Migrate entry to the resolved real path
+        realPathMap.delete(oldKey)
+        const existingNew = realPathMap.get(newRealPath)
+        if (!existingNew || oldEntry.modifiedAt > (existingNew?.modifiedAt ?? '')) {
+          realPathMap.set(newRealPath, {
+            projectPath: newRealPath,
+            modifiedAt: oldEntry.modifiedAt,
+            sessionCount: oldEntry.sessionCount + (existingNew?.sessionCount ?? 0),
+            sessionId: oldEntry.sessionId,
+          })
+        } else {
+          existingNew.sessionCount += oldEntry.sessionCount
+        }
+      }
+    }
+  }
+
   // Build project list with git info — parallelize git operations
+  // Optimization: use findGitRoot (fs.stat traversal + LRU cache, <5ms) to skip git spawns
+  // on non-git directories, avoiding slow git rev-parse on each (seconds per non-git dir).
   const entries = Array.from(realPathMap.entries())
   const projects = await Promise.all(
     entries.map(async ([realPath, info]) => {
@@ -757,37 +1117,20 @@ async function getRecentProjects(url: URL): Promise<Response> {
       let isGit = false
       let repoName: string | null = null
       let branch: string | null = null
-      try {
-        const proc = Bun.spawn(['git', 'rev-parse', '--is-inside-work-tree'], {
-          cwd: realPath, stdout: 'pipe', stderr: 'pipe',
-        })
-        const out = await new Response(proc.stdout).text()
-        isGit = out.trim() === 'true'
-
-        if (isGit) {
-          // Run branch + remote in parallel
+      const gitRoot = findGitRoot(realPath)
+      if (gitRoot) {
+        isGit = true
+        // Run branch + remote in parallel
+        try {
           const [branchResult, remoteResult] = await Promise.all([
-            (async () => {
-              const branchProc = Bun.spawn(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], {
-                cwd: realPath, stdout: 'pipe', stderr: 'pipe',
-              })
-              return (await new Response(branchProc.stdout).text()).trim() || null
-            })(),
-            (async () => {
-              try {
-                const remoteProc = Bun.spawn(['git', 'remote', 'get-url', 'origin'], {
-                  cwd: realPath, stdout: 'pipe', stderr: 'pipe',
-                })
-                const remote = (await new Response(remoteProc.stdout).text()).trim()
-                const match = remote.match(/:([^/]+\/[^/]+?)(?:\.git)?$/) || remote.match(/\/([^/]+\/[^/]+?)(?:\.git)?$/)
-                return match ? match[1]! : null
-              } catch { return null }
-            })(),
+            runGitInfoCommand(realPath, ['rev-parse', '--abbrev-ref', 'HEAD']),
+            runGitInfoCommand(realPath, ['remote', 'get-url', 'origin']),
           ])
           branch = isDesktopWorktreeBranchName(branchResult) ? null : branchResult
-          repoName = remoteResult
-        }
-      } catch { /* not a git repo or dir doesn't exist */ }
+          repoName = ownerRepoNameFromRemote(remoteResult)
+        } catch { /* git command failed */ }
+      }
+      
 
       return {
         projectPath: info.projectPath, realPath, projectName, isGit, repoName, branch,

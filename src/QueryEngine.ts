@@ -6,6 +6,7 @@ import {
   getSessionId,
   isSessionPersistenceDisabled,
 } from 'src/bootstrap/state.js'
+import { isGoalLocalCommandOutputContent } from './goals/goalState.js'
 import type {
   PermissionMode,
   SDKCompactBoundaryMessage,
@@ -21,6 +22,7 @@ import stripAnsi from 'strip-ansi'
 import type { Command } from './commands.js'
 import { getSlashCommandToolSkills } from './commands.js'
 import {
+  COMMAND_NAME_TAG,
   LOCAL_COMMAND_STDERR_TAG,
   LOCAL_COMMAND_STDOUT_TAG,
 } from './constants/xml.js'
@@ -67,6 +69,7 @@ import {
 import { loadAllPluginsCacheOnly } from './utils/plugins/pluginLoader.js'
 import {
   type ProcessUserInputContext,
+  type ProcessUserInputBaseResult,
   processUserInput,
 } from './utils/processUserInput/processUserInput.js'
 import { fetchSystemPromptParts } from './utils/queryContext.js'
@@ -413,7 +416,7 @@ export class QueryEngine {
       allowedTools,
       model: modelFromUserInput,
       resultText,
-    } = await processUserInput({
+    }: ProcessUserInputBaseResult = await processUserInput({
       input: prompt,
       mode: 'prompt',
       setToolJSX: () => {},
@@ -553,11 +556,25 @@ export class QueryEngine {
     // Record when system message is yielded for headless latency tracking
     headlessProfilerCheckpoint('system_message_yielded')
 
+    if (shouldQuery) {
+      for (const goalOutput of localGoalCommandOutputMessages(messagesFromUserInput)) {
+        yield goalOutput
+      }
+    }
+
     if (!shouldQuery) {
       // Return the results of local slash commands.
       // Use messagesFromUserInput (not replayableMessages) for command output
       // because selectableUserMessagesFilter excludes local-command-stdout tags.
+      let latestLocalCommandName: string | null = null
       for (const msg of messagesFromUserInput) {
+        if (msg.type === 'system' && msg.subtype === 'local_command') {
+          const commandName = readXmlTag(msg.content, COMMAND_NAME_TAG)
+          if (commandName) {
+            latestLocalCommandName = commandName.replace(/^\//, '')
+          }
+        }
+
         if (
           msg.type === 'user' &&
           typeof msg.message.content === 'string' &&
@@ -591,7 +608,12 @@ export class QueryEngine {
           (msg.content.includes(`<${LOCAL_COMMAND_STDOUT_TAG}>`) ||
             msg.content.includes(`<${LOCAL_COMMAND_STDERR_TAG}>`))
         ) {
-          yield localCommandOutputToSDKAssistantMessage(msg.content, msg.uuid)
+          if (latestLocalCommandName === 'goal') {
+            yield toSDKLocalCommandOutputMessage(msg)
+          } else {
+            yield localCommandOutputToSDKAssistantMessage(msg.content, msg.uuid)
+          }
+          latestLocalCommandName = null
         }
 
         if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
@@ -914,6 +936,16 @@ export class QueryEngine {
             break
           }
           this.mutableMessages.push(message)
+          if (
+            message.subtype === 'local_command' &&
+            isGoalLocalCommandOutputContent(message.content)
+          ) {
+            if (persistSession) {
+              messages.push(message)
+              await recordTranscript(messages)
+            }
+            yield toSDKLocalCommandOutputMessage(message)
+          }
           // Yield compact boundary messages to SDK
           if (
             message.subtype === 'compact_boundary' &&
@@ -949,6 +981,15 @@ export class QueryEngine {
               retry_delay_ms: message.retryInMs,
               error_status: message.error.status ?? null,
               error: categorizeRetryableAPIError(message.error),
+              session_id: getSessionId(),
+              uuid: message.uuid,
+            }
+          }
+          if (message.subtype === 'streaming_fallback') {
+            yield {
+              type: 'system',
+              subtype: 'streaming_fallback' as const,
+              cause: message.cause,
               session_id: getSessionId(),
               uuid: message.uuid,
             }
@@ -1174,6 +1215,46 @@ export class QueryEngine {
   setModel(model: string): void {
     this.config.userSpecifiedModel = model
   }
+}
+
+function* localGoalCommandOutputMessages(
+  messages: Message[],
+): Generator<SDKMessage, void, unknown> {
+  let latestLocalCommandName: string | null = null
+  for (const msg of messages) {
+    if (msg.type !== 'system' || msg.subtype !== 'local_command') continue
+
+    const commandName = readXmlTag(msg.content, COMMAND_NAME_TAG)
+    if (commandName) {
+      latestLocalCommandName = commandName.replace(/^\//, '')
+      continue
+    }
+
+    if (
+      latestLocalCommandName === 'goal' &&
+      (msg.content.includes(`<${LOCAL_COMMAND_STDOUT_TAG}>`) ||
+        msg.content.includes(`<${LOCAL_COMMAND_STDERR_TAG}>`))
+    ) {
+      yield toSDKLocalCommandOutputMessage(msg)
+      latestLocalCommandName = null
+    }
+  }
+}
+
+function toSDKLocalCommandOutputMessage(message: Message): SDKMessage {
+  return {
+    type: 'system',
+    subtype: 'local_command_output',
+    content: message.type === 'system' ? stripAnsi(message.content) : '',
+    uuid: message.uuid,
+    session_id: getSessionId(),
+  } as SDKMessage
+}
+
+function readXmlTag(text: string, tag: string): string | null {
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = text.match(new RegExp(`<${escaped}>([\\s\\S]*?)</${escaped}>`, 'i'))
+  return match?.[1]?.trim() ?? null
 }
 
 /**

@@ -8,7 +8,7 @@
  */
 
 import * as fs from 'fs/promises'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
@@ -21,6 +21,8 @@ import {
   buildClaudeCliArgs,
   resolveClaudeCliLauncher,
 } from '../../utils/desktopBundledCli.js'
+import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
+import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -37,6 +39,20 @@ export type TaskRun = {
   exitCode?: number
   durationMs?: number
   sessionId?: string // links to a session for rich output rendering
+}
+
+export function buildCronTaskSpawnOptions(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+) {
+  return {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    cwd,
+    env,
+    windowsHide: true,
+  } as const
 }
 
 // ─── Output extraction ────────────────────────────────────────────────────────
@@ -246,7 +262,19 @@ function trimRuns(data: RunsFile): void {
 
 // ─── Scheduler ─────────────────────────────────────────────────────────────────
 
-const TASK_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
+const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000 // 10 minutes
+
+export function resolveCronTaskTimeoutMs(
+  env: { CC_HAHA_TASK_TIMEOUT_MS?: string } = process.env,
+): number {
+  const raw = env.CC_HAHA_TASK_TIMEOUT_MS?.trim()
+  if (!raw) return DEFAULT_TASK_TIMEOUT_MS
+
+  const timeoutMs = Number(raw)
+  return Number.isInteger(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : DEFAULT_TASK_TIMEOUT_MS
+}
 
 type CronCliResolutionOptions = {
   cliPath?: string | null
@@ -366,6 +394,9 @@ export class CronScheduler {
 
   /** Stop the scheduler and kill any running task processes. */
   stop(): void {
+    const wasRunning = this.intervalId !== null || this.runningTasks.size > 0
+    if (!wasRunning) return
+
     if (this.intervalId) {
       clearInterval(this.intervalId)
       this.intervalId = null
@@ -451,13 +482,18 @@ export class CronScheduler {
       console.warn(`[cron] task ${task.id}: folderPath "${task.folderPath}" is not a valid directory, falling back to homedir`)
       workDir = os.homedir()
     }
+    workDir = this.resolveCanonicalWorkDir(workDir)
 
     // Only create a session when explicitly requested (manual "Run Now"),
     // not for automatic cron runs — avoids flooding the sidebar.
     let sessionId: string | undefined
     if (options?.createSession) {
       try {
-        const result = await this.sessionService.createSession(workDir)
+        const result = await this.sessionService.createSession(
+          workDir,
+          undefined,
+          'bypassPermissions',
+        )
         sessionId = result.sessionId
         // Delete the placeholder JSONL file so the CLI can create it fresh
         // with actual content. Same pattern as conversationService.ts.
@@ -506,15 +542,10 @@ export class CronScheduler {
     ])
 
     const childEnv = await this.buildTaskChildEnv(workDir, task)
+    const taskTimeoutMs = resolveCronTaskTimeoutMs()
     const proc = Bun.spawn(
       cliArgs,
-      {
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-        cwd: workDir,
-        env: childEnv,
-      },
+      buildCronTaskSpawnOptions(workDir, childEnv),
     )
 
     this.runningTasks.set(task.id, { proc, startedAt: Date.now(), runId })
@@ -536,7 +567,7 @@ export class CronScheduler {
           // ignore
         }
       }
-    }, TASK_TIMEOUT_MS)
+    }, taskTimeoutMs)
 
     try {
       // Collect stdout
@@ -567,7 +598,7 @@ export class CronScheduler {
         new Date(completedAt).getTime() - new Date(startedAt).getTime()
 
       // Determine if this was a timeout
-      const wasTimeout = durationMs >= TASK_TIMEOUT_MS
+      const wasTimeout = durationMs >= taskTimeoutMs
 
       // Extract only meaningful AI text responses from raw NDJSON output.
       // The raw stream contains system/init messages, tool_use blocks, and
@@ -594,6 +625,7 @@ export class CronScheduler {
         }
       }
 
+      await this.persistScheduledSessionPermission(sessionId, workDir)
       await updateRun(completedRun)
 
       // Send IM notification if configured
@@ -625,22 +657,49 @@ export class CronScheduler {
           new Date(completedAt).getTime() - new Date(startedAt).getTime(),
       }
 
+      await this.persistScheduledSessionPermission(sessionId, workDir)
       await updateRun(failedRun)
 
       return failedRun
     }
   }
 
+  private async persistScheduledSessionPermission(
+    sessionId: string | undefined,
+    workDir: string,
+  ): Promise<void> {
+    if (!sessionId) return
+    await this.sessionService.appendSessionMetadata(sessionId, {
+      workDir,
+      permissionMode: 'bypassPermissions',
+    }).catch(() => {
+      // The task result is still valid even if session metadata refresh fails.
+    })
+  }
+
+  private resolveCanonicalWorkDir(workDir: string): string {
+    try {
+      return realpathSync(workDir)
+    } catch {
+      return workDir
+    }
+  }
+
   private getRuntimeArgs(task: CronTask): string[] {
     const model = task.model?.trim()
-    return model ? ['--model', model] : []
+    return [
+      ...(model ? ['--model', model] : []),
+      '--dangerously-skip-permissions',
+      '--permission-mode',
+      'bypassPermissions',
+    ]
   }
 
   private async buildTaskChildEnv(
     workDir: string,
     task: CronTask,
   ): Promise<Record<string, string | undefined>> {
-    const cleanEnv = { ...process.env }
+    const cleanEnv = await getProcessEnvWithTerminalShellEnvironment()
     delete cleanEnv.CLAUDE_CODE_OAUTH_TOKEN
 
     if (this.shouldStripInheritedProviderEnv(task.providerId)) {
@@ -658,20 +717,30 @@ export class CronScheduler {
     if (explicitProviderEnv && task.model?.trim()) {
       explicitProviderEnv.ANTHROPIC_MODEL = task.model.trim()
     }
+    const attributionHeaderEnv = attributionHeaderEnvForModel(
+      task.model?.trim() ||
+        explicitProviderEnv?.ANTHROPIC_MODEL ||
+        cleanEnv.ANTHROPIC_MODEL,
+    )
 
     return {
       ...cleanEnv,
       CLAUDE_CODE_ENABLE_TASKS: '1',
+      CLAUDE_CODE_ENTRYPOINT: 'sdk-cli',
       CALLER_DIR: workDir,
       PWD: workDir,
       CC_HAHA_SKIP_DOTENV: '1',
       ...(explicitProviderEnv
-        ? { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1' }
+        ? {
+            CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
+            CLAUDE_CODE_ENTRYPOINT: 'sdk-cli',
+          }
         : {}),
       ...(explicitProviderEnv ?? {}),
       ...(this.shouldMarkManagedOAuth(task.providerId)
         ? await this.buildOfficialOAuthEnv()
         : {}),
+      ...attributionHeaderEnv,
     }
   }
 
@@ -763,13 +832,14 @@ export class CronScheduler {
     const data = await readRunsFile()
     let changed = false
     const now = Date.now()
+    const taskTimeoutMs = resolveCronTaskTimeoutMs()
 
     for (const run of data.runs) {
       if (run.status !== 'running') continue
       const startedAt = new Date(run.startedAt).getTime()
       // If "running" for longer than the task timeout + 1-minute buffer,
       // the owning process is certainly dead.
-      if (now - startedAt > TASK_TIMEOUT_MS + 60_000) {
+      if (now - startedAt > taskTimeoutMs + 60_000) {
         run.status = 'failed'
         run.error = 'Process terminated before task could complete'
         run.completedAt = new Date().toISOString()

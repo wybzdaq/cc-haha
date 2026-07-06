@@ -44,6 +44,7 @@ import {
   compressImageBufferWithTokenLimit,
   createImageMetadataText,
   detectImageFormatFromBuffer,
+  downsampleImageBufferToVisionTokenBudget,
   type ImageDimensions,
   ImageResizeError,
   maybeResizeAndDownsampleImageBuffer,
@@ -416,8 +417,15 @@ export const FileReadTool = buildTool({
   },
   renderToolUseErrorMessage,
   async validateInput({ file_path, pages }, toolUseContext: ToolUseContext) {
-    // Validate pages parameter (pure string parsing, no I/O)
-    if (pages !== undefined) {
+    // Path expansion + extension checks are string-only and avoid I/O before
+    // permission evaluation.
+    const fullFilePath = expandPath(file_path)
+    const ext = path.extname(fullFilePath).toLowerCase()
+
+    // Validate pages parameter only for PDF files. Models sometimes send
+    // PDF-only pages values when reading images or text files; those should
+    // not block the read path.
+    if (pages !== undefined && isPDFExtension(ext)) {
       const parsed = parsePDFPageRange(pages)
       if (!parsed) {
         return {
@@ -438,9 +446,6 @@ export const FileReadTool = buildTool({
         }
       }
     }
-
-    // Path expansion + deny rule check (no I/O)
-    const fullFilePath = expandPath(file_path)
 
     const appState = toolUseContext.getAppState()
     const denyRule = matchingRuleForInput(
@@ -468,7 +473,6 @@ export const FileReadTool = buildTool({
 
     // Binary extension check (string check on extension only, no I/O).
     // PDF, images, and SVG are excluded - this tool renders them natively.
-    const ext = path.extname(fullFilePath).toLowerCase()
     if (
       hasBinaryExtension(fullFilePath) &&
       !isPDFExtension(ext) &&
@@ -516,6 +520,7 @@ export const FileReadTool = buildTool({
     }
 
     const ext = path.extname(file_path).toLowerCase().slice(1)
+    const effectivePages = isPDFExtension(ext) ? pages : undefined
     // Use expandPath for consistent path normalization with FileEditTool/FileWriteTool
     // (especially handles whitespace trimming and Windows path separators)
     const fullFilePath = expandPath(file_path)
@@ -598,7 +603,7 @@ export const FileReadTool = buildTool({
         ext,
         offset,
         limit,
-        pages,
+        effectivePages,
         maxSizeBytes,
         maxTokens,
         readFileState,
@@ -621,7 +626,7 @@ export const FileReadTool = buildTool({
               ext,
               offset,
               limit,
-              pages,
+              effectivePages,
               maxSizeBytes,
               maxTokens,
               readFileState,
@@ -796,6 +801,18 @@ function createImageResponse(
       dimensions,
     },
   }
+}
+
+function estimateVisionImageTokens(dimensions?: ImageDimensions): number | null {
+  const width = dimensions?.displayWidth
+  const height = dimensions?.displayHeight
+  if (!width || !height || width <= 0 || height <= 0) {
+    return null
+  }
+  // Claude vision charges approximately width * height / 750 image tokens.
+  // Image blocks are not base64 text blocks, so using base64 length here would
+  // massively over-compress ordinary screenshots before the model sees them.
+  return Math.ceil((width * height) / 750)
 }
 
 /**
@@ -1133,10 +1150,31 @@ export async function readImageWithTokenBudget(
     result = createImageResponse(imageBuffer, detectedFormat, originalSize)
   }
 
-  // Check if it fits in token budget
-  const estimatedTokens = Math.ceil(result.file.base64.length * 0.125)
-  if (estimatedTokens > maxTokens) {
-    // Aggressive compression from the SAME buffer (no re-read)
+  // Check if it fits in vision token budget. This is intentionally based on
+  // image dimensions, not base64 payload length, because the tool result is an
+  // image content block rather than text.
+  const estimatedTokens = estimateVisionImageTokens(result.file.dimensions)
+  if (estimatedTokens !== null && estimatedTokens > maxTokens) {
+    // Downsample by vision pixel budget first. This preserves detail far better
+    // than the legacy base64-text token heuristic for image blocks.
+    try {
+      const downsampled = await downsampleImageBufferToVisionTokenBudget(
+        imageBuffer,
+        originalSize,
+        detectedFormat,
+        maxTokens,
+      )
+      return createImageResponse(
+        downsampled.buffer,
+        downsampled.mediaType,
+        originalSize,
+        downsampled.dimensions,
+      )
+    } catch (e) {
+      logError(e)
+    }
+
+    // Compatibility fallback from the SAME buffer (no re-read)
     try {
       const compressed = await compressImageBufferWithTokenLimit(
         imageBuffer,

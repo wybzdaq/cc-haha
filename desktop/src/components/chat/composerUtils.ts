@@ -1,28 +1,74 @@
 import type { SettingsTab } from '../../stores/uiStore'
+import type { TranslationKey } from '../../i18n'
+
+/** Map from slash command name to its i18n description key */
+const SLASH_CMD_DESCRIPTION_KEYS: Record<string, TranslationKey> = {
+  agent: 'slashCmd.agent.description',
+  mcp: 'slashCmd.mcp.description',
+  skills: 'slashCmd.skills.description',
+  help: 'slashCmd.help.description',
+  status: 'slashCmd.status.description',
+  cost: 'slashCmd.cost.description',
+  context: 'slashCmd.context.description',
+  plugin: 'slashCmd.plugin.description',
+  memory: 'slashCmd.memory.description',
+  doctor: 'slashCmd.doctor.description',
+  compact: 'slashCmd.compact.description',
+  clear: 'slashCmd.clear.description',
+  goal: 'slashCmd.goal.description',
+  review: 'slashCmd.review.description',
+  commit: 'slashCmd.commit.description',
+  pr: 'slashCmd.pr.description',
+  init: 'slashCmd.init.description',
+  bug: 'slashCmd.bug.description',
+  config: 'slashCmd.config.description',
+  login: 'slashCmd.login.description',
+  logout: 'slashCmd.logout.description',
+  model: 'slashCmd.model.description',
+  permissions: 'slashCmd.permissions.description',
+  'terminal-setup': 'slashCmd.terminal-setup.description',
+  vim: 'slashCmd.vim.description',
+}
+
+/** Names of commands the desktop owns the description for (i.e. localized in our locales). */
+const BUILT_IN_COMMAND_NAMES = new Set(Object.keys(SLASH_CMD_DESCRIPTION_KEYS))
 
 export const PANEL_SLASH_COMMANDS = [
+  { name: 'mcp' },
+  { name: 'skills' },
+  { name: 'help' },
+  { name: 'status' },
+  { name: 'cost' },
+  { name: 'context' },
+] as const
+
+export const SETTINGS_SLASH_COMMANDS = [
+  { name: 'config', tab: 'general' as const },
+  { name: 'plugin', tab: 'plugins' as const },
+  { name: 'memory', tab: 'memory' as const },
+  { name: 'doctor', tab: 'diagnostics' as const },
+] as const
+
+export const SLASH_COMMAND_ALIASES = [
+  { name: 'plugins', target: 'plugin' },
+  { name: 'settings', target: 'config' },
+] as const
+
+/** Static fallback with English descriptions (for non-React contexts) */
+export const FALLBACK_SLASH_COMMANDS: SlashCommandOption[] = [
+  { name: 'agent', description: 'Run a prompt with a selected Agent', argumentHint: '<agent> <prompt>' },
   { name: 'mcp', description: 'Open available MCP tools for the current chat context' },
   { name: 'skills', description: 'Browse user-invocable skills for the current chat context' },
   { name: 'help', description: 'Show available desktop and agent commands' },
   { name: 'status', description: 'Show session status, usage, and context' },
   { name: 'cost', description: 'Show session usage and costs' },
   { name: 'context', description: 'Show current context usage' },
-] as const
-
-export const SETTINGS_SLASH_COMMANDS = [
-  { name: 'plugin', description: 'Open desktop plugin controls in Settings', tab: 'plugins' as const },
-  { name: 'doctor', description: 'Open Doctor in Diagnostics', tab: 'diagnostics' as const },
-] as const
-
-export const SLASH_COMMAND_ALIASES = [
-  { name: 'plugins', target: 'plugin' },
-] as const
-
-export const FALLBACK_SLASH_COMMANDS = [
-  ...PANEL_SLASH_COMMANDS,
-  ...SETTINGS_SLASH_COMMANDS.map(({ name, description }) => ({ name, description })),
+  { name: 'plugin', description: 'Open desktop plugin controls in Settings' },
+  { name: 'memory', description: 'Open project memory files in Settings' },
+  { name: 'doctor', description: 'Open Doctor in Diagnostics' },
   { name: 'compact', description: 'Compact conversation context' },
   { name: 'clear', description: 'Clear conversation history' },
+  { name: 'goal', description: 'Set a completion goal', argumentHint: '[<condition> | clear]' },
   { name: 'review', description: 'Review code changes' },
   { name: 'commit', description: 'Create a git commit' },
   { name: 'pr', description: 'Create a pull request' },
@@ -31,16 +77,91 @@ export const FALLBACK_SLASH_COMMANDS = [
   { name: 'config', description: 'Open configuration' },
   { name: 'login', description: 'Switch Anthropic accounts' },
   { name: 'logout', description: 'Sign out of current account' },
-  { name: 'memory', description: 'Edit CLAUDE.md memory files' },
   { name: 'model', description: 'Switch AI model' },
   { name: 'permissions', description: 'View or manage tool permissions' },
   { name: 'terminal-setup', description: 'Set up terminal integration' },
   { name: 'vim', description: 'Toggle vim editing mode' },
 ]
 
+/** Build localized fallback commands using the current locale.
+ *
+ * Resolution order for each command's description:
+ *   1. Localized string from the i18n table (zh -> en) when a key is registered.
+ *   2. The static English description shipped in FALLBACK_SLASH_COMMANDS.
+ *
+ * This guarantees we never render a raw key (e.g. "slashCmd.foo.description")
+ * in the UI even if a command is missing from SLASH_CMD_DESCRIPTION_KEYS or
+ * its translation entry is absent.
+ */
+export function getLocalizedFallbackCommands(t: (key: TranslationKey) => string): SlashCommandOption[] {
+  return FALLBACK_SLASH_COMMANDS.map((cmd) => {
+    const key = SLASH_CMD_DESCRIPTION_KEYS[cmd.name]
+    let description = cmd.description
+    if (key) {
+      const translated = t(key)
+      // i18n returns the key itself when no translation is found; fall back to
+      // the static English description in that case.
+      if (translated && translated !== key) {
+        description = translated
+      }
+    }
+    return {
+      name: cmd.name,
+      description,
+      ...(cmd.argumentHint && { argumentHint: cmd.argumentHint }),
+    }
+  })
+}
+
 export type SlashCommandOption = {
   name: string
   description: string
+  argumentHint?: string
+}
+
+export type AgentSlashCommandSource = {
+  agentType: string
+  description?: string
+  modelDisplay?: string
+  source?: string
+}
+
+export function buildAgentSlashCommands(
+  agents: ReadonlyArray<AgentSlashCommandSource>,
+): SlashCommandOption[] {
+  const seen = new Set<string>()
+  const commands: SlashCommandOption[] = []
+
+  for (const agent of agents) {
+    const agentType = agent.agentType.trim()
+    if (!agentType || seen.has(agentType)) continue
+    seen.add(agentType)
+
+    const details = [agent.modelDisplay, agent.source].filter(Boolean).join(' - ')
+    const description = [
+      agent.description?.trim() || `Run with the ${agentType} Agent`,
+      details ? `(${details})` : '',
+    ].filter(Boolean).join(' ')
+
+    commands.push({
+      name: `agent ${agentType}`,
+      description,
+      argumentHint: '<prompt>',
+    })
+  }
+
+  return commands
+}
+
+export function appendAgentSlashCommands(
+  commands: ReadonlyArray<SlashCommandOption>,
+  agentCommands: ReadonlyArray<SlashCommandOption>,
+): SlashCommandOption[] {
+  const names = new Set(commands.map((command) => command.name))
+  return [
+    ...commands,
+    ...agentCommands.filter((command) => !names.has(command.name)),
+  ]
 }
 
 export type SlashUiAction =
@@ -51,6 +172,9 @@ export type SlashUiAction =
   | {
       type: 'settings'
       tab: SettingsTab
+    }
+  | {
+      type: 'model'
     }
 
 export function resolveSlashUiAction(value: string): SlashUiAction | null {
@@ -65,6 +189,10 @@ export function resolveSlashUiAction(value: string): SlashUiAction | null {
     return { type: 'settings', tab: settingsCommand.tab }
   }
 
+  if (normalizedValue === 'model') {
+    return { type: 'model' }
+  }
+
   return null
 }
 
@@ -72,32 +200,71 @@ export function mergeSlashCommands(
   preferred: ReadonlyArray<SlashCommandOption>,
   fallback: ReadonlyArray<SlashCommandOption> = FALLBACK_SLASH_COMMANDS,
 ): SlashCommandOption[] {
+  const fallbackByName = new Map<string, SlashCommandOption>()
+  for (const command of fallback) {
+    if (command?.name) fallbackByName.set(command.name, command)
+  }
+
   const merged = new Map<string, SlashCommandOption>()
 
   for (const command of preferred) {
     if (!command?.name) continue
+    const localized = fallbackByName.get(command.name)
+    // For commands the desktop owns the copy for, prefer the localized fallback
+    // description so users see translated text instead of the CLI's English.
+    const useLocalDescription =
+      BUILT_IN_COMMAND_NAMES.has(command.name) && Boolean(localized?.description)
+    const description = useLocalDescription
+      ? localized!.description
+      : command.description?.trim() || localized?.description || ''
+    const argumentHint = command.argumentHint?.trim() || localized?.argumentHint
     merged.set(command.name, {
       name: command.name,
-      description: command.description?.trim() || '',
+      description,
+      ...(argumentHint && { argumentHint }),
     })
   }
 
   for (const command of fallback) {
     if (!command?.name) continue
-    const existing = merged.get(command.name)
-    if (existing) {
-      if (!existing.description && command.description) {
-        merged.set(command.name, {
-          ...existing,
-          description: command.description,
-        })
-      }
-      continue
-    }
+    if (merged.has(command.name)) continue
     merged.set(command.name, command)
   }
 
   return [...merged.values()]
+}
+
+function getSlashCommandMatchRank(command: SlashCommandOption, filter: string): number {
+  const name = command.name.toLowerCase()
+  const description = command.description.toLowerCase()
+  const argumentHint = command.argumentHint?.toLowerCase() ?? ''
+  const nameParts = name.split(/[:/._-]+/).filter(Boolean)
+
+  if (name === filter) return 0
+  if (name.startsWith(filter)) return 1
+  if (nameParts.some((part) => part.startsWith(filter))) return 2
+  if (name.includes(filter)) return 3
+  if (description.includes(filter)) return 4
+  if (argumentHint.includes(filter)) return 5
+  return Number.POSITIVE_INFINITY
+}
+
+export function filterSlashCommands(
+  commands: ReadonlyArray<SlashCommandOption>,
+  filter: string,
+): SlashCommandOption[] {
+  const normalized = filter.toLowerCase()
+  if (!normalized.trim()) return [...commands]
+
+  return commands
+    .map((command, index) => ({
+      command,
+      index,
+      rank: getSlashCommandMatchRank(command, normalized),
+    }))
+    .filter((item) => Number.isFinite(item.rank))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((item) => item.command)
 }
 
 export type SlashTrigger = {
@@ -107,25 +274,12 @@ export type SlashTrigger = {
 
 export function findSlashTrigger(value: string, cursorPos: number): SlashTrigger | null {
   const textBeforeCursor = value.slice(0, cursorPos)
-  let slashPos = -1
-
-  for (let i = textBeforeCursor.length - 1; i >= 0; i--) {
-    const ch = textBeforeCursor[i]!
-    if (ch === '/') {
-      if (i === 0 || /\s/.test(textBeforeCursor[i - 1]!)) {
-        slashPos = i
-        break
-      }
-      break
-    }
-    if (/\s/.test(ch)) {
-      break
-    }
-  }
-
+  const slashPos = textBeforeCursor.lastIndexOf('/')
   if (slashPos < 0) return null
+  if (slashPos > 0 && !/\s/.test(textBeforeCursor[slashPos - 1]!)) return null
 
   const filter = textBeforeCursor.slice(slashPos + 1)
+  if (filter.includes('\n')) return null
   if (/\s/.test(filter)) return null
 
   return { slashPos, filter }

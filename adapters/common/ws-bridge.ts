@@ -113,11 +113,23 @@ export class WsBridge {
     this.handlers.set(chatId, handler)
   }
 
+  getSessionId(chatId: string): string | null {
+    return this.sessions.get(chatId)?.sessionId ?? null
+  }
+
+  isSessionOpen(chatId: string, sessionId?: string): boolean {
+    const session = this.sessions.get(chatId)
+    if (!session) return false
+    if (sessionId && session.sessionId !== sessionId) return false
+    return session.ws.readyState === WebSocket.OPEN
+  }
+
   /** Reset session for a chatId (e.g. /new command). */
   resetSession(chatId: string): void {
     const session = this.sessions.get(chatId)
     if (session) {
       if (session.reconnectTimer) clearTimeout(session.reconnectTimer)
+      session.ws.removeAllListeners()
       session.ws.close(1000, 'session reset')
       this.sessions.delete(chatId)
     }
@@ -139,6 +151,7 @@ export class WsBridge {
     }
     for (const [, session] of this.sessions) {
       if (session.reconnectTimer) clearTimeout(session.reconnectTimer)
+      session.ws.removeAllListeners()
       session.ws.close(1000, 'bridge destroyed')
     }
     this.sessions.clear()
@@ -181,6 +194,7 @@ export class WsBridge {
         return
       }
       if (msg.type === 'pong') return
+      if (this.sessions.get(chatId) !== session) return
       const handler = this.handlers.get(chatId)
       if (!handler) return
 

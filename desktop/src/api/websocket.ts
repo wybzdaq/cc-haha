@@ -1,5 +1,5 @@
 import type { ClientMessage, ServerMessage } from '../types/chat'
-import { getAccessToken, getBaseUrl } from './client'
+import { getAuthToken, getBaseUrl } from './client'
 
 type MessageHandler = (msg: ServerMessage) => void
 
@@ -39,10 +39,7 @@ class WebSocketManager {
       return
     }
 
-    const wsBaseUrl = getBaseUrl().replace(/^http/, 'ws')
-    const token = getAccessToken()
-    const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : ''
-    const ws = new WebSocket(`${wsBaseUrl}/ws/${sessionId}${tokenQuery}`)
+    const ws = new WebSocket(buildSessionWebSocketUrl(sessionId))
 
     const conn: Connection = {
       ws,
@@ -178,6 +175,22 @@ class WebSocketManager {
       }
     }, delay)
   }
+}
+
+export function buildSessionWebSocketUrl(sessionId: string) {
+  const url = new URL(getBaseUrl())
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  const basePath = url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '')
+  url.pathname = `${basePath}/ws/${encodeURIComponent(sessionId)}`
+
+  const token = getAuthToken()
+  if (token) {
+    url.searchParams.set('token', token)
+  } else {
+    url.searchParams.delete('token')
+  }
+
+  return url.toString()
 }
 
 export const wsManager = new WebSocketManager()

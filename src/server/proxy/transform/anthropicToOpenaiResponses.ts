@@ -12,11 +12,22 @@ import type {
   OpenAIResponsesInputItem,
   OpenAIChatContentPart,
 } from './types.js'
+import { stripLeadingBillingHeader } from './billingHeader.js'
+import { normalizeOpenAIReasoningEffort } from './effort.js'
+
+export type OpenAIResponsesTransformOptions = {
+  /** Stable cache routing key, forwarded as `prompt_cache_key`. */
+  cacheKey?: string
+  passSamplingParams?: boolean
+}
 
 /**
  * Convert Anthropic Messages request to OpenAI Responses API request.
  */
-export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIResponsesRequest {
+export function anthropicToOpenaiResponses(
+  body: AnthropicRequest,
+  options: OpenAIResponsesTransformOptions = {},
+): OpenAIResponsesRequest {
   const input: OpenAIResponsesInputItem[] = []
 
   // Convert messages to input items
@@ -31,21 +42,31 @@ export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIRespon
     store: false,
   }
 
-  // system → instructions
+  // system → instructions, minus the leading billing attribution: its
+  // rotating cch= signature would change the prefix every turn and defeat
+  // upstream prompt caching.
   if (body.system) {
-    if (typeof body.system === 'string') {
-      result.instructions = body.system
-    } else if (Array.isArray(body.system)) {
-      result.instructions = body.system.map((b) => b.text).join('\n')
+    const instructions = typeof body.system === 'string'
+      ? stripLeadingBillingHeader(body.system)
+      : body.system.map((b) => stripLeadingBillingHeader(b.text)).filter(Boolean).join('\n')
+    if (instructions) {
+      result.instructions = instructions
     }
+  }
+
+  if (options.cacheKey) {
+    result.prompt_cache_key = options.cacheKey
   }
 
   // max_tokens — omit to let upstream provider use its own default/max.
   // Claude Code sends very large values that exceed many providers' limits.
 
-  // temperature & top_p
-  if (body.temperature !== undefined) result.temperature = body.temperature
-  if (body.top_p !== undefined) result.top_p = body.top_p
+  // Claude Code sends Anthropic sampling params that some compatible
+  // providers reject. Keep them opt-in for providers known to accept them.
+  if (options.passSamplingParams) {
+    if (body.temperature !== undefined) result.temperature = body.temperature
+    if (body.top_p !== undefined) result.top_p = body.top_p
+  }
 
   // tools
   if (body.tools && body.tools.length > 0) {
@@ -74,6 +95,10 @@ export function anthropicToOpenaiResponses(body: AnthropicRequest): OpenAIRespon
     } else if (body.thinking.type === 'enabled') {
       result.reasoning = { effort: 'high' }
     }
+  }
+  const outputConfigEffort = normalizeOpenAIReasoningEffort(body.output_config?.effort)
+  if (outputConfigEffort !== undefined) {
+    result.reasoning = { ...(result.reasoning ?? {}), effort: outputConfigEffort }
   }
 
   // stop_sequences not supported in Responses API, dropped

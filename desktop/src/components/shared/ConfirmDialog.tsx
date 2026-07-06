@@ -1,12 +1,12 @@
-import { Modal } from './Modal'
-import { Button } from './Button'
+import type { ReactNode } from 'react'
+import { ActionDialog } from './ActionDialog'
 
 type ConfirmDialogProps = {
   open: boolean
   onClose: () => void
   onConfirm: () => void | Promise<void>
   title: string
-  body: string
+  body: ReactNode
   confirmLabel: string
   cancelLabel: string
   confirmVariant?: 'primary' | 'danger'
@@ -25,25 +25,25 @@ export function ConfirmDialog({
   loading = false,
 }: ConfirmDialogProps) {
   return (
-    <Modal
+    <ActionDialog
       open={open}
-      onClose={loading ? () => {} : onClose}
+      onClose={onClose}
       title={title}
-      width={460}
-      footer={(
-        <>
-          <Button variant="secondary" onClick={onClose} disabled={loading}>
-            {cancelLabel}
-          </Button>
-          <Button variant={confirmVariant} onClick={() => void onConfirm()} loading={loading}>
-            {confirmLabel}
-          </Button>
-        </>
-      )}
-    >
-      <p className="text-sm leading-6 text-[var(--color-text-secondary)]">
-        {body}
-      </p>
-    </Modal>
+      body={body}
+      loading={loading}
+      actions={[
+        {
+          label: cancelLabel,
+          onClick: onClose,
+          variant: 'secondary',
+        },
+        {
+          label: confirmLabel,
+          onClick: onConfirm,
+          variant: confirmVariant,
+          loading,
+        },
+      ]}
+    />
   )
 }

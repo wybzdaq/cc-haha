@@ -14,42 +14,68 @@ import type {
   OpenAIToolCall,
   OpenAITool,
 } from './types.js'
+import { stripLeadingBillingHeader } from './billingHeader.js'
+import { normalizeOpenAIReasoningEffort } from './effort.js'
+
+type OpenAIChatImageContentMode = 'vision' | 'text_only'
+
+type OpenAIChatTransformOptions = {
+  roundTripReasoningContent?: boolean
+  passThinkingToggle?: boolean
+  passSamplingParams?: boolean
+  imageContentMode?: OpenAIChatImageContentMode
+}
+
+const OMITTED_IMAGE_TEXT = '[Image omitted: this OpenAI-compatible chat endpoint only supports text content.]'
 
 /**
  * Convert Anthropic Messages request to OpenAI Chat Completions request.
  */
-export function anthropicToOpenaiChat(body: AnthropicRequest): OpenAIChatRequest {
+export function anthropicToOpenaiChat(
+  body: AnthropicRequest,
+  options: OpenAIChatTransformOptions = {},
+): OpenAIChatRequest {
   const messages: OpenAIChatMessage[] = []
 
-  // Convert system prompt
+  // Convert system prompt, minus the leading billing attribution: its
+  // rotating cch= signature would change the prefix every turn and defeat
+  // upstream prompt caching.
   if (body.system) {
-    if (typeof body.system === 'string') {
-      messages.push({ role: 'system', content: body.system })
-    } else if (Array.isArray(body.system)) {
-      const text = body.system.map((b) => b.text).join('\n')
+    const text = typeof body.system === 'string'
+      ? stripLeadingBillingHeader(body.system)
+      : body.system.map((b) => stripLeadingBillingHeader(b.text)).filter(Boolean).join('\n')
+    if (text) {
       messages.push({ role: 'system', content: text })
     }
   }
 
   // Convert messages
   for (const msg of body.messages) {
-    convertMessage(msg, messages)
+    convertMessage(msg, messages, options)
   }
 
   // Build request
   const result: OpenAIChatRequest = {
     model: body.model,
     messages,
-    stream: body.stream,
+    stream: body.stream === true,
+  }
+
+  // Many OpenAI-compatible servers omit usage on streams unless asked.
+  if (result.stream) {
+    result.stream_options = { include_usage: true }
   }
 
   // max_tokens — omit to let upstream provider use its own default/max.
   // Claude Code sends very large values (e.g. 128K) that exceed many
   // providers' limits (DeepSeek: 8192, etc.).
 
-  // temperature & top_p
-  if (body.temperature !== undefined) result.temperature = body.temperature
-  if (body.top_p !== undefined) result.top_p = body.top_p
+  // Claude Code sends Anthropic sampling params that some compatible
+  // providers reject. Keep them opt-in for providers known to accept them.
+  if (options.passSamplingParams) {
+    if (body.temperature !== undefined) result.temperature = body.temperature
+    if (body.top_p !== undefined) result.top_p = body.top_p
+  }
 
   // stop_sequences → stop
   if (body.stop_sequences && body.stop_sequences.length > 0) {
@@ -85,12 +111,23 @@ export function anthropicToOpenaiChat(body: AnthropicRequest): OpenAIChatRequest
     } else if (body.thinking.type === 'enabled') {
       result.reasoning_effort = 'high'
     }
+    if (options.passThinkingToggle) {
+      result.thinking = { type: body.thinking.type }
+    }
+  }
+  const outputConfigEffort = normalizeOpenAIReasoningEffort(body.output_config?.effort)
+  if (outputConfigEffort !== undefined) {
+    result.reasoning_effort = outputConfigEffort
   }
 
   return result
 }
 
-function convertMessage(msg: AnthropicMessage, output: OpenAIChatMessage[]): void {
+function convertMessage(
+  msg: AnthropicMessage,
+  output: OpenAIChatMessage[],
+  options: OpenAIChatTransformOptions,
+): void {
   const content = msg.content
 
   // Simple string content
@@ -106,22 +143,35 @@ function convertMessage(msg: AnthropicMessage, output: OpenAIChatMessage[]): voi
   }
 
   if (msg.role === 'user') {
-    convertUserMessage(content, output)
+    convertUserMessage(content, output, options.imageContentMode ?? 'vision')
   } else {
-    convertAssistantMessage(content, output)
+    convertAssistantMessage(content, output, options)
   }
 }
 
-function convertUserMessage(blocks: AnthropicContentBlock[], output: OpenAIChatMessage[]): void {
+function convertUserMessage(
+  blocks: AnthropicContentBlock[],
+  output: OpenAIChatMessage[],
+  imageContentMode: OpenAIChatImageContentMode,
+): void {
   // Separate tool_result blocks from other content
   const contentParts: OpenAIChatContentPart[] = []
+  const textOnlyParts: string[] = []
 
   for (const block of blocks) {
     if (block.type === 'text') {
-      contentParts.push({ type: 'text', text: block.text })
+      if (imageContentMode === 'text_only') {
+        textOnlyParts.push(block.text)
+      } else {
+        contentParts.push({ type: 'text', text: block.text })
+      }
     } else if (block.type === 'image') {
-      const url = `data:${block.source.media_type};base64,${block.source.data}`
-      contentParts.push({ type: 'image_url', image_url: { url } })
+      if (imageContentMode === 'text_only') {
+        textOnlyParts.push(OMITTED_IMAGE_TEXT)
+      } else {
+        const url = `data:${block.source.media_type};base64,${block.source.data}`
+        contentParts.push({ type: 'image_url', image_url: { url } })
+      }
     } else if (block.type === 'tool_result') {
       // tool_result → separate tool message
       const resultContent = typeof block.content === 'string'
@@ -137,7 +187,15 @@ function convertUserMessage(blocks: AnthropicContentBlock[], output: OpenAIChatM
     }
   }
 
-  if (contentParts.length > 0) {
+  if (imageContentMode === 'text_only') {
+    const content = textOnlyParts.filter(Boolean).join('\n')
+    if (content) {
+      output.push({
+        role: 'user',
+        content,
+      })
+    }
+  } else if (contentParts.length > 0) {
     output.push({
       role: 'user',
       content: contentParts.length === 1 && contentParts[0].type === 'text'
@@ -147,13 +205,20 @@ function convertUserMessage(blocks: AnthropicContentBlock[], output: OpenAIChatM
   }
 }
 
-function convertAssistantMessage(blocks: AnthropicContentBlock[], output: OpenAIChatMessage[]): void {
+function convertAssistantMessage(
+  blocks: AnthropicContentBlock[],
+  output: OpenAIChatMessage[],
+  options: { roundTripReasoningContent?: boolean },
+): void {
   let textContent = ''
+  let reasoningContent = ''
   const toolCalls: OpenAIToolCall[] = []
 
   for (const block of blocks) {
     if (block.type === 'text') {
       textContent += block.text
+    } else if (block.type === 'thinking' && options.roundTripReasoningContent) {
+      reasoningContent += block.thinking
     } else if (block.type === 'tool_use') {
       toolCalls.push({
         id: block.id,
@@ -164,7 +229,6 @@ function convertAssistantMessage(blocks: AnthropicContentBlock[], output: OpenAI
         },
       })
     }
-    // Skip thinking blocks — no OpenAI equivalent
   }
 
   const msg: OpenAIChatMessage = {
@@ -174,6 +238,9 @@ function convertAssistantMessage(blocks: AnthropicContentBlock[], output: OpenAI
 
   if (toolCalls.length > 0) {
     msg.tool_calls = toolCalls
+  }
+  if (reasoningContent) {
+    msg.reasoning_content = reasoningContent
   }
 
   output.push(msg)

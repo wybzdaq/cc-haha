@@ -35,7 +35,6 @@ import { isNonCustomOpusModel } from '../../utils/model/model.js'
 import { disableKeepAlive } from '../../utils/proxy.js'
 import { sleep } from '../../utils/sleep.js'
 import type { ThinkingConfig } from '../../utils/thinking.js'
-import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -167,6 +166,63 @@ export class FallbackTriggeredError extends Error {
   }
 }
 
+/**
+ * Raised inside the streaming path when a transient, server-side error arrives
+ * mid-stream (inside the 200 SSE body) and therefore bypasses withRetry — which
+ * only wraps stream *creation*, not stream *consumption*. Caught by
+ * withStreamRetry() in claude.ts, which re-establishes the stream and retries
+ * the whole request. Carries the original SDK error so the retries-exhausted
+ * path can surface a faithful API-error message.
+ */
+export class RetriableStreamError extends Error {
+  constructor(public readonly originalError: unknown) {
+    super(errorMessage(originalError))
+    this.name = 'RetriableStreamError'
+    if (originalError instanceof Error && originalError.stack) {
+      this.stack = originalError.stack
+    }
+  }
+}
+
+/**
+ * Detect transient, server-side errors that the SDK surfaces *during streaming*
+ * without a usable HTTP status. The upstream sends them inside a 200 SSE body as
+ *   {"type":"error","error":{"type":"api_error"|"overloaded_error",...}}
+ * so `error.status` is undefined and every status-based check in shouldRetry()
+ * falls through to `return false`. Per Anthropic semantics both are retryable:
+ * `api_error` = "unexpected error internal to the server", `overloaded_error` =
+ * capacity. Local/proxy providers (e.g. LM Studio) also wrap transient
+ * generation failures — such as a malformed tool_call the runtime rejects
+ * mid-stream — as `api_error`, which a fresh attempt almost always clears.
+ *
+ * Matches the serialized error body embedded in `error.message`, the same
+ * technique the overloaded-error check has always used (see shouldRetry).
+ */
+export function isRetryableStreamError(error: unknown): boolean {
+  if (!(error instanceof APIError)) {
+    return false
+  }
+  const message = error.message
+  if (!message) {
+    return false
+  }
+  return (
+    message.includes('"type":"api_error"') ||
+    message.includes('"type":"overloaded_error"')
+  )
+}
+
+/**
+ * Max times withStreamRetry() re-establishes a stream after a transient
+ * mid-stream error (see RetriableStreamError). Small by default — a malformed
+ * tool_call or a one-off blip usually clears on the first retry; this is not a
+ * capacity backoff loop. Override with CLAUDE_STREAM_TRANSIENT_RETRY_MAX.
+ */
+export function getMaxStreamTransientRetries(): number {
+  const raw = parseInt(process.env.CLAUDE_STREAM_TRANSIENT_RETRY_MAX || '', 10)
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2
+}
+
 export async function* withRetry<T>(
   getClient: () => Promise<Anthropic>,
   operation: (
@@ -216,13 +272,7 @@ export async function* withRetry<T>(
       // - Vertex-specific auth errors (credential refresh failures, 401)
       // - ECONNRESET/EPIPE: stale keep-alive socket; disable pooling and reconnect
       const isStaleConnection = isStaleConnectionError(lastError)
-      if (
-        isStaleConnection &&
-        getFeatureValue_CACHED_MAY_BE_STALE(
-          'tengu_disable_keepalive_on_econnreset',
-          false,
-        )
-      ) {
+      if (isStaleConnection) {
         logForDebugging(
           'Stale connection (ECONNRESET/EPIPE) — disabling keep-alive for retry',
         )

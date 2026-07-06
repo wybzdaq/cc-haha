@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { computerUseApi, type ComputerUseStatus, type SetupResult, type InstalledApp, type AuthorizedApp } from '../api/computerUse'
 import { useTranslation } from '../i18n'
+import { getDesktopHost } from '../lib/desktopHost'
 
 type CheckState = 'loading' | 'ready' | 'error'
 const PYTHON_DOWNLOAD_URLS: Record<string, string> = {
@@ -36,9 +37,9 @@ async function openSystemSettings(pane: 'Privacy_ScreenCapture' | 'Privacy_Acces
 }
 
 async function openExternalUrl(url: string) {
+  const host = getDesktopHost()
   try {
-    const { open } = await import('@tauri-apps/plugin-shell')
-    await open(url)
+    await host.shell.open(url)
   } catch {
     window.open(url, '_blank', 'noopener,noreferrer')
   }
@@ -61,6 +62,10 @@ export function ComputerUseSettings() {
   const [computerUseEnabled, setComputerUseEnabled] = useState(true)
   const [clipboardAccess, setClipboardAccess] = useState(true)
   const [systemKeys, setSystemKeys] = useState(true)
+  const [pythonPathDraft, setPythonPathDraft] = useState('')
+  const [pythonPathSaved, setPythonPathSaved] = useState('')
+  const [pythonPathSaving, setPythonPathSaving] = useState(false)
+  const [pythonPathMessage, setPythonPathMessage] = useState<string | null>(null)
   const configMutationSeqRef = useRef(0)
 
   const fetchStatus = useCallback(async () => {
@@ -84,6 +89,8 @@ export function ComputerUseSettings() {
     setAuthorizedBundleIds(new Set(configResult.authorizedApps.map(a => a.bundleId)))
     setClipboardAccess(configResult.grantFlags.clipboardRead)
     setSystemKeys(configResult.grantFlags.systemKeyCombos)
+    setPythonPathDraft(configResult.pythonPath ?? '')
+    setPythonPathSaved(configResult.pythonPath ?? '')
   }, [])
 
   const fetchConfig = useCallback(async () => {
@@ -190,6 +197,46 @@ export function ComputerUseSettings() {
     })
   }
 
+  const savePythonPath = async (value = pythonPathDraft) => {
+    configMutationSeqRef.current += 1
+    const normalized = value.trim()
+    setPythonPathSaving(true)
+    setPythonPathMessage(null)
+    try {
+      await computerUseApi.setAuthorizedApps({ pythonPath: normalized || null })
+      setPythonPathDraft(normalized)
+      setPythonPathSaved(normalized)
+      setPythonPathMessage(t('settings.computerUse.pythonPathSaved'))
+      await fetchStatus()
+    } catch {
+      setPythonPathMessage(t('settings.computerUse.pythonPathSaveFailed'))
+    } finally {
+      setPythonPathSaving(false)
+    }
+  }
+
+  const choosePythonPath = async () => {
+    const host = getDesktopHost()
+    if (!host.capabilities.dialogs) {
+      setPythonPathMessage(t('settings.computerUse.pythonPathDialogFailed'))
+      return
+    }
+    try {
+      const selected = await host.dialogs.open({
+        multiple: false,
+        directory: false,
+        title: t('settings.computerUse.pythonPathDialogTitle'),
+      })
+      const selectedPath = Array.isArray(selected) ? selected[0] : selected
+      if (typeof selectedPath === 'string' && selectedPath.trim()) {
+        setPythonPathDraft(selectedPath)
+        await savePythonPath(selectedPath)
+      }
+    } catch {
+      setPythonPathMessage(t('settings.computerUse.pythonPathDialogFailed'))
+    }
+  }
+
   const allReady =
     status?.supported &&
     status.python.installed &&
@@ -202,6 +249,12 @@ export function ComputerUseSettings() {
   const pythonDownloadUrl = status
     ? PYTHON_DOWNLOAD_URLS[status.platform] ?? 'https://www.python.org/downloads/'
     : 'https://www.python.org/downloads/'
+  const pythonPathDirty = pythonPathDraft.trim() !== pythonPathSaved
+  const pythonDetail = status?.python.installed
+    ? `${t('settings.computerUse.pythonFound')} — ${status.python.version} (${status.python.path})`
+    : status?.python.source === 'custom'
+      ? `${t('settings.computerUse.pythonCustomInvalid')} — ${status.python.path}${status.python.error ? `: ${status.python.error}` : ''}`
+      : t('settings.computerUse.pythonNotFound')
 
   // Filter apps by search query
   const filteredApps = useMemo(() => {
@@ -273,11 +326,7 @@ export function ComputerUseSettings() {
             <StatusRow
               label={t('settings.computerUse.python')}
               ok={status.python.installed}
-              detail={
-                status.python.installed
-                  ? `${t('settings.computerUse.pythonFound')} — ${status.python.version} (${status.python.path})`
-                  : t('settings.computerUse.pythonNotFound')
-              }
+              detail={pythonDetail}
             />
             <StatusRow
               label={t('settings.computerUse.venv')}
@@ -289,6 +338,54 @@ export function ComputerUseSettings() {
               ok={status.dependencies.installed}
               detail={status.dependencies.installed ? t('settings.computerUse.depsReady') : t('settings.computerUse.depsNotReady')}
             />
+          </div>
+
+          <div className="space-y-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-container-low)] p-4">
+            <label htmlFor="computer-use-python-path" className="block text-sm font-medium text-[var(--color-text-primary)]">
+              {t('settings.computerUse.pythonPathLabel')}
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <input
+                id="computer-use-python-path"
+                type="text"
+                value={pythonPathDraft}
+                onChange={e => {
+                  setPythonPathDraft(e.target.value)
+                  setPythonPathMessage(null)
+                }}
+                placeholder={t('settings.computerUse.pythonPathPlaceholder')}
+                className="min-w-[220px] flex-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-container)] px-3 py-2 font-mono text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-brand)] focus:outline-none"
+              />
+              <button
+                onClick={choosePythonPath}
+                disabled={pythonPathSaving}
+                className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] px-3 py-2 text-xs font-medium text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[16px]">folder_open</span>
+                {t('settings.computerUse.pythonPathBrowse')}
+              </button>
+              <button
+                onClick={() => savePythonPath()}
+                disabled={pythonPathSaving || !pythonPathDirty}
+                className="flex items-center gap-1.5 rounded-lg bg-[var(--color-brand)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+              >
+                <span className="material-symbols-outlined text-[16px]">{pythonPathSaving ? 'hourglass_empty' : 'save'}</span>
+                {t('settings.computerUse.pythonPathSave')}
+              </button>
+              {pythonPathSaved && (
+                <button
+                  onClick={() => savePythonPath('')}
+                  disabled={pythonPathSaving}
+                  className="flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] px-3 py-2 text-xs font-medium text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] disabled:opacity-50"
+                >
+                  <span className="material-symbols-outlined text-[16px]">restart_alt</span>
+                  {t('settings.computerUse.pythonPathAuto')}
+                </button>
+              )}
+            </div>
+            <p className="text-xs text-[var(--color-text-tertiary)]">
+              {pythonPathMessage ?? t('settings.computerUse.pythonPathHint')}
+            </p>
           </div>
 
           {/* macOS Permissions — only shown on macOS (darwin) */}
