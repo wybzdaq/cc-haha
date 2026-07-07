@@ -132,8 +132,6 @@ async function compileExecutable({
       'fflate',
       'sharp',
       'react-devtools-core',
-      'libsignal',
-      'libsignal/src/curve.js',
     ],
     compile: {
       target: bunTarget,

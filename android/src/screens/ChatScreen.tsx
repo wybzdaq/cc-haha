@@ -14,11 +14,21 @@ import MessageList from '../components/chat/MessageList'
 import ChatInput from '../components/chat/ChatInput'
 import { wsManager } from '../api/websocket'
 import {
+  buildPermissionModePayload,
   buildPermissionResponsePayload,
+  buildStopGenerationPayload,
   buildUserMessagePayload,
   createLocalUserMessage,
+  type PermissionMode,
   projectNameFromPath,
 } from '../lib/serverEvents'
+
+const PERMISSION_MODES: Array<{ mode: PermissionMode; label: string }> = [
+  { mode: 'default', label: 'Default' },
+  { mode: 'acceptEdits', label: 'Accept' },
+  { mode: 'plan', label: 'Plan' },
+  { mode: 'bypassPermissions', label: 'Bypass' },
+]
 
 export default function ChatScreen() {
   const navigation = useNavigation()
@@ -30,6 +40,8 @@ export default function ChatScreen() {
     setSending,
     handleServerEvent,
     clearPendingPermission,
+    permissionMode,
+    setPermissionMode,
     pendingPermission,
     isSending,
     isLoadingMessages,
@@ -68,6 +80,18 @@ export default function ChatScreen() {
     appendMessage(createLocalUserMessage(text))
     setSending(true)
     wsManager.send(activeSessionId, buildUserMessagePayload(text))
+  }
+
+  const handleStopGeneration = () => {
+    if (!activeSessionId) return
+    wsManager.send(activeSessionId, buildStopGenerationPayload())
+    setSending(false)
+  }
+
+  const handlePermissionModeChange = (mode: PermissionMode) => {
+    if (!activeSessionId) return
+    setPermissionMode(mode)
+    wsManager.send(activeSessionId, buildPermissionModePayload(mode))
   }
 
   const respondToPermission = (allowed: boolean) => {
@@ -110,6 +134,35 @@ export default function ChatScreen() {
           <Text style={styles.pathText} numberOfLines={1}>{projectPath}</Text>
         </View>
       ) : null}
+
+      <View style={styles.controlStrip}>
+        <TouchableOpacity
+          style={[styles.stopButton, !isSending && styles.controlDisabled]}
+          disabled={!isSending}
+          onPress={handleStopGeneration}
+        >
+          <Ionicons name="stop" size={15} color={isSending ? '#FFFFFF' : '#7A8798'} />
+          <Text style={[styles.stopButtonText, !isSending && styles.controlDisabledText]}>
+            Stop
+          </Text>
+        </TouchableOpacity>
+        <View style={styles.modeGroup}>
+          {PERMISSION_MODES.map((item) => {
+            const active = permissionMode === item.mode
+            return (
+              <TouchableOpacity
+                key={item.mode}
+                style={[styles.modeButton, active && styles.modeButtonActive]}
+                onPress={() => handlePermissionModeChange(item.mode)}
+              >
+                <Text style={[styles.modeButtonText, active && styles.modeButtonTextActive]}>
+                  {item.label}
+                </Text>
+              </TouchableOpacity>
+            )
+          })}
+        </View>
+      </View>
 
       {isLoadingMessages ? (
         <View style={styles.loadingContainer}>
@@ -216,6 +269,68 @@ const styles = StyleSheet.create({
     color: '#52627A',
     fontSize: 12,
     fontWeight: '600',
+  },
+  controlStrip: {
+    minHeight: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#F9FBFC',
+    borderBottomWidth: 1,
+    borderBottomColor: '#DDE5EE',
+  },
+  stopButton: {
+    height: 34,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: '#C2410C',
+  },
+  stopButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  controlDisabled: {
+    backgroundColor: '#E7EDF4',
+  },
+  controlDisabledText: {
+    color: '#7A8798',
+  },
+  modeGroup: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  modeButton: {
+    flex: 1,
+    minWidth: 0,
+    height: 34,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E7EDF4',
+    borderWidth: 1,
+    borderColor: '#D7E0EA',
+  },
+  modeButtonActive: {
+    backgroundColor: '#172033',
+    borderColor: '#172033',
+  },
+  modeButtonText: {
+    color: '#52627A',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  modeButtonTextActive: {
+    color: '#FFFFFF',
   },
   content: {
     flex: 1,

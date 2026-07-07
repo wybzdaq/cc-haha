@@ -170,6 +170,20 @@ export async function initializeDesktopServerUrl() {
     markDesktopServerReady()
     return serverUrl
   } catch (error) {
+    try {
+      setBaseUrl(fallbackUrl)
+      setAuthToken(null)
+      await waitForHealth(fallbackUrl)
+      markDesktopServerReady()
+      console.warn('[desktop] Falling back to default desktop server URL', {
+        fallbackUrl,
+        error,
+      })
+      return fallbackUrl
+    } catch {
+      // Preserve the native startup error below; it is more actionable than the fallback probe.
+    }
+
     const message =
       error instanceof Error ? error.message : `desktop server startup failed: ${String(error)}`
     console.error('[desktop] Failed to initialize desktop server URL', error)

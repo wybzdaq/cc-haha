@@ -126,6 +126,34 @@ describe('WebSocket handler session isolation', () => {
     })
   })
 
+  it('broadcasts stop status to all clients watching the same session', () => {
+    const sessionId = `remote-stop-${crypto.randomUUID()}`
+    const android = makeClientSocket(sessionId)
+    const desktop = makeClientSocket(sessionId)
+    spyOn(conversationService, 'hasSession').mockReturnValue(false)
+    spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+
+    handleWebSocket.open(android)
+    handleWebSocket.open(desktop)
+    android.sent.length = 0
+    desktop.sent.length = 0
+
+    handleWebSocket.message(android, JSON.stringify({
+      type: 'stop_generation',
+    }))
+
+    expect(android.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'status',
+      state: 'idle',
+    })
+    expect(desktop.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'status',
+      state: 'idle',
+    })
+  })
+
   it('closes and removes an active client socket when a session is deleted', () => {
     const sessionId = `delete-${crypto.randomUUID()}`
     const ws = makeClientSocket(sessionId)

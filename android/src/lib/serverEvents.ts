@@ -8,11 +8,14 @@ export type PendingPermission = {
   description?: string
 }
 
+export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions' | 'dontAsk'
+
 export type RemoteMessageState = {
   messages: MessageEntry[]
   streamingAssistantId: string | null
   sending: boolean
   pendingPermission: PendingPermission | null
+  permissionMode: PermissionMode
 }
 
 export type IdFactory = () => string
@@ -37,6 +40,19 @@ export function buildPermissionResponsePayload(requestId: string, allowed: boole
     type: 'permission_response' as const,
     requestId,
     allowed,
+  }
+}
+
+export function buildStopGenerationPayload() {
+  return {
+    type: 'stop_generation' as const,
+  }
+}
+
+export function buildPermissionModePayload(mode: PermissionMode) {
+  return {
+    type: 'set_permission_mode' as const,
+    mode,
   }
 }
 
@@ -86,6 +102,36 @@ export function reduceServerEvent(
         sending: false,
       }
 
+    case 'status':
+      if (event.state === 'idle') {
+        return {
+          ...state,
+          streamingAssistantId: null,
+          sending: false,
+        }
+      }
+      if (
+        event.state === 'thinking' ||
+        event.state === 'streaming' ||
+        event.state === 'tool_executing' ||
+        event.state === 'compacting'
+      ) {
+        return {
+          ...state,
+          sending: true,
+        }
+      }
+      return state
+
+    case 'permission_mode_changed':
+      if (isPermissionMode(event.mode)) {
+        return {
+          ...state,
+          permissionMode: event.mode,
+        }
+      }
+      return state
+
     case 'permission_request':
       return {
         ...state,
@@ -115,7 +161,6 @@ export function reduceServerEvent(
         ],
       }
 
-    case 'status':
     case 'connected':
     case 'content_start':
     case 'tool_use_complete':
@@ -127,6 +172,16 @@ export function reduceServerEvent(
     default:
       return state
   }
+}
+
+export function isPermissionMode(mode: unknown): mode is PermissionMode {
+  return (
+    mode === 'default' ||
+    mode === 'acceptEdits' ||
+    mode === 'plan' ||
+    mode === 'bypassPermissions' ||
+    mode === 'dontAsk'
+  )
 }
 
 export type ProjectSessionGroup = {

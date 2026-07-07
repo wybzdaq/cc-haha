@@ -673,7 +673,7 @@ async function handleSetPermissionMode(
 
   if (!conversationService.hasSession(sessionId)) {
     if (await persistSessionPermissionMode(sessionId, message.mode)) {
-      sendMessage(ws, { type: 'permission_mode_changed', mode: message.mode })
+      sendToSession(sessionId, { type: 'permission_mode_changed', mode: message.mode })
     }
     return
   }
@@ -714,7 +714,7 @@ async function applyPermissionModeToActiveSession(
   }
 
   if (currentMode === mode) {
-    sendMessage(ws, { type: 'permission_mode_changed', mode })
+    sendToSession(sessionId, { type: 'permission_mode_changed', mode })
     return
   }
   const needsRestart = shouldRestartForPermissionMode(currentMode, mode)
@@ -732,7 +732,7 @@ async function applyPermissionModeToActiveSession(
     return
   }
   await persistSessionPermissionMode(sessionId, mode)
-  sendMessage(ws, { type: 'permission_mode_changed', mode })
+  sendToSession(sessionId, { type: 'permission_mode_changed', mode })
 }
 
 async function handleSetRuntimeConfig(
@@ -841,8 +841,8 @@ async function restartSessionWithPermissionMode(
       `?token=${encodeURIComponent(crypto.randomUUID())}`
     await conversationService.startSession(sessionId, workDir, sdkUrl, runtimeSettings)
 
-    sendMessage(ws, { type: 'permission_mode_changed', mode })
-    sendMessage(ws, { type: 'status', state: 'idle' })
+    sendToSession(sessionId, { type: 'permission_mode_changed', mode })
+    sendToSession(sessionId, { type: 'status', state: 'idle' })
     console.log(`[WS] Restarted CLI for ${sessionId} with permission mode: ${mode}`)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
@@ -960,7 +960,7 @@ function handleStopGeneration(ws: ServerWebSocket<WebSocketData>) {
     }, 3_000)
   }
 
-  sendMessage(ws, { type: 'status', state: 'idle' })
+  sendToSession(sessionId, { type: 'status', state: 'idle' })
 }
 
 // ============================================================================

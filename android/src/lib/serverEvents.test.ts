@@ -1,11 +1,24 @@
 import { describe, expect, it } from 'bun:test'
 import {
+  buildPermissionModePayload,
   buildPermissionResponsePayload,
+  buildStopGenerationPayload,
   buildUserMessagePayload,
   groupSessionsByProject,
   reduceServerEvent,
   type RemoteMessageState,
 } from './serverEvents'
+
+function initialState(overrides: Partial<RemoteMessageState> = {}): RemoteMessageState {
+  return {
+    messages: [],
+    streamingAssistantId: null,
+    sending: false,
+    pendingPermission: null,
+    permissionMode: 'default',
+    ...overrides,
+  }
+}
 
 describe('mobile server event adapter', () => {
   it('sends user text with the desktop websocket protocol', () => {
@@ -15,8 +28,16 @@ describe('mobile server event adapter', () => {
     })
   })
 
+  it('builds remote control websocket payloads', () => {
+    expect(buildStopGenerationPayload()).toEqual({ type: 'stop_generation' })
+    expect(buildPermissionModePayload('plan')).toEqual({
+      type: 'set_permission_mode',
+      mode: 'plan',
+    })
+  })
+
   it('accumulates streamed content_delta events into one assistant message', () => {
-    const initial: RemoteMessageState = { messages: [], streamingAssistantId: null, sending: true, pendingPermission: null }
+    const initial = initialState({ sending: true })
 
     const first = reduceServerEvent(initial, { type: 'content_delta', text: 'Hello' }, () => 'assistant-1')
     const second = reduceServerEvent(first, { type: 'content_delta', text: ' world' }, () => 'assistant-2')
@@ -35,7 +56,7 @@ describe('mobile server event adapter', () => {
   })
 
   it('stores permission requests and builds permission responses', () => {
-    const initial: RemoteMessageState = { messages: [], streamingAssistantId: null, sending: true, pendingPermission: null }
+    const initial = initialState({ sending: true })
     const next = reduceServerEvent(initial, {
       type: 'permission_request',
       requestId: 'perm-1',
@@ -56,6 +77,21 @@ describe('mobile server event adapter', () => {
       requestId: 'perm-1',
       allowed: true,
     })
+  })
+
+  it('tracks permission mode and idle status from the server', () => {
+    const modeChanged = reduceServerEvent(initialState(), {
+      type: 'permission_mode_changed',
+      mode: 'bypassPermissions',
+    })
+    expect(modeChanged.permissionMode).toBe('bypassPermissions')
+
+    const running = reduceServerEvent(modeChanged, { type: 'status', state: 'thinking' })
+    expect(running.sending).toBe(true)
+
+    const stopped = reduceServerEvent(running, { type: 'status', state: 'idle' })
+    expect(stopped.sending).toBe(false)
+    expect(stopped.streamingAssistantId).toBeNull()
   })
 
   it('groups sessions by visible project', () => {

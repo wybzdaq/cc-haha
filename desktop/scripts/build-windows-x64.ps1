@@ -38,6 +38,16 @@ function Assert-Command {
   }
 }
 
+function Invoke-BunX {
+  param([string[]]$CommandArgs)
+
+  if (Get-Command bunx -ErrorAction SilentlyContinue) {
+    & bunx @CommandArgs
+  } else {
+    & bun x @CommandArgs
+  }
+}
+
 function Import-VsDevEnvironment {
   $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
   if (-not (Test-Path $vswhere)) {
@@ -83,7 +93,6 @@ function Clear-Directory {
 
 Assert-WindowsHost
 Assert-Command bun
-Assert-Command bunx
 Import-VsDevEnvironment
 
 if ($env:SKIP_INSTALL -ne '1') {
@@ -138,7 +147,7 @@ try {
 
   if ($env:REBUILD_NATIVE -eq '1') {
     Write-Step 'Rebuilding native dependencies for Electron ABI...'
-    & bunx electron-builder install-app-deps
+    Invoke-BunX @('electron-builder', 'install-app-deps')
     if ($LASTEXITCODE -ne 0) {
       throw "[build-windows-x64] electron-builder install-app-deps failed (exit $LASTEXITCODE)"
     }
@@ -148,14 +157,24 @@ try {
     }
   }
 
-  $args = @('electron-builder', '--win', 'nsis', '--x64', '--publish', 'never')
   $remainingArgs = @($BuilderArgs)
+  $isDirectoryBuild = $remainingArgs -contains '--dir'
+  if ($isDirectoryBuild) {
+    $args = @('electron-builder', '--win', '--x64', '--publish', 'never')
+  } else {
+    $args = @('electron-builder', '--win', 'nsis', '--x64', '--publish', 'never')
+  }
+
   if ($remainingArgs.Count -gt 0) {
     $args += $remainingArgs
   }
 
-  Write-Step 'Packaging Electron app...'
-  & bunx @args
+  if ($isDirectoryBuild) {
+    Write-Step 'Packaging Electron app as no-install directory...'
+  } else {
+    Write-Step 'Packaging Electron app installer...'
+  }
+  Invoke-BunX $args
   if ($LASTEXITCODE -ne 0) {
     throw "[build-windows-x64] electron-builder failed (exit $LASTEXITCODE)"
   }

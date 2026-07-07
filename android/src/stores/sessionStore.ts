@@ -1,7 +1,7 @@
 
 import { create } from 'zustand'
 import { sessionsApi, type SessionListItem, type MessageEntry } from '../api/sessions'
-import { reduceServerEvent, type PendingPermission } from '../lib/serverEvents'
+import { reduceServerEvent, type PendingPermission, type PermissionMode } from '../lib/serverEvents'
 
 type SessionStore = {
   sessions: SessionListItem[]
@@ -12,6 +12,7 @@ type SessionStore = {
   isSending: boolean
   streamingAssistantId: string | null
   pendingPermission: PendingPermission | null
+  permissionMode: PermissionMode
   error: string | null
 
   fetchSessions: (project?: string) => Promise<void>
@@ -25,6 +26,7 @@ type SessionStore = {
   setActiveMessages: (messages: MessageEntry[]) => void
   handleServerEvent: (event: Record<string, any>) => void
   clearPendingPermission: () => void
+  setPermissionMode: (mode: PermissionMode) => void
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -36,6 +38,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   isSending: false,
   streamingAssistantId: null,
   pendingPermission: null,
+  permissionMode: 'default',
   error: null,
 
   fetchSessions: async (project?: string) => {
@@ -60,6 +63,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         activeMessages: messages,
         streamingAssistantId: null,
         pendingPermission: null,
+        permissionMode: 'default',
         isSending: false,
         isLoadingMessages: false 
       })
@@ -91,6 +95,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         activeMessages: [],
         streamingAssistantId: null,
         pendingPermission: null,
+        permissionMode: 'default',
         isLoading: false,
       }))
 
@@ -109,6 +114,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       activeMessages: state.activeSessionId === sessionId ? [] : state.activeMessages,
       streamingAssistantId: state.activeSessionId === sessionId ? null : state.streamingAssistantId,
       pendingPermission: state.activeSessionId === sessionId ? null : state.pendingPermission,
+      permissionMode: state.activeSessionId === sessionId ? 'default' : state.permissionMode,
     }))
   },
 
@@ -146,6 +152,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         streamingAssistantId: state.streamingAssistantId,
         sending: state.isSending,
         pendingPermission: state.pendingPermission,
+        permissionMode: state.permissionMode,
       }, event)
 
       return {
@@ -153,11 +160,16 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         streamingAssistantId: next.streamingAssistantId,
         isSending: next.sending,
         pendingPermission: next.pendingPermission,
+        permissionMode: next.permissionMode,
       }
     })
   },
 
   clearPendingPermission: () => {
     set({ pendingPermission: null })
+  },
+
+  setPermissionMode: (mode: PermissionMode) => {
+    set({ permissionMode: mode })
   },
 }))

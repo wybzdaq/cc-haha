@@ -37,6 +37,14 @@ const DINGTALK_REGISTRATION_BASE_URL =
 const DINGTALK_REGISTRATION_SOURCE =
   process.env.DINGTALK_REGISTRATION_SOURCE?.trim() || 'DING_DWS_CLAW'
 
+const importRuntime = Function('specifier', 'return import(specifier)') as (
+  specifier: string,
+) => Promise<unknown>
+
+async function loadWhatsAppProtocol() {
+  return await importRuntime('../../../adapters/whatsapp/protocol.js') as typeof import('../../../adapters/whatsapp/protocol.js')
+}
+
 async function postDingtalkRegistration<T extends Record<string, unknown>>(
   path: string,
   body: Record<string, unknown>,
@@ -237,7 +245,7 @@ async function handleWechatAdaptersApi(req: Request, tail: string[]): Promise<Re
 
 async function handleWhatsAppAdaptersApi(req: Request, tail: string[]): Promise<Response> {
   if (req.method === 'POST' && tail[0] === 'login' && tail[1] === 'start') {
-    const { startWhatsAppLoginWithQr } = await import('../../../adapters/whatsapp/protocol.js')
+    const { startWhatsAppLoginWithQr } = await loadWhatsAppProtocol()
     const config = loadConfig()
     const result = await startWhatsAppLoginWithQr({
       authDir: config.whatsapp.authDir,
@@ -250,7 +258,7 @@ async function handleWhatsAppAdaptersApi(req: Request, tail: string[]): Promise<
   }
 
   if (req.method === 'POST' && tail[0] === 'login' && tail[1] === 'poll') {
-    const { pollWhatsAppLoginWithQr } = await import('../../../adapters/whatsapp/protocol.js')
+    const { pollWhatsAppLoginWithQr } = await loadWhatsAppProtocol()
     const body = (await req.json()) as { sessionKey?: string }
     if (!body.sessionKey) throw ApiError.badRequest('Missing sessionKey')
     const result = await pollWhatsAppLoginWithQr({ sessionKey: body.sessionKey })

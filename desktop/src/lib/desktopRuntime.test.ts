@@ -169,7 +169,37 @@ describe('desktopRuntime browser H5 bootstrap', () => {
     expect(isDesktopRuntime()).toBe(true)
   })
 
-  it('normalizes injected desktop host startup failures', async () => {
+  it('falls back to the default backend when the injected desktop host startup fails but the server is healthy', async () => {
+    const error = new Error('electron sidecar failed')
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      runtime: {
+        getServerUrl: vi.fn().mockRejectedValue(error),
+      },
+    }
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      healthOkResponse(),
+    ) as typeof fetch
+
+    await expect(initializeDesktopServerUrl()).resolves.toBe('http://127.0.0.1:3456')
+    expect(clientMocks.setBaseUrl).toHaveBeenLastCalledWith('http://127.0.0.1:3456')
+    expect(clientMocks.setAuthToken).toHaveBeenLastCalledWith(null)
+    expect(consoleWarn).toHaveBeenCalledWith(
+      '[desktop] Falling back to default desktop server URL',
+      {
+        fallbackUrl: 'http://127.0.0.1:3456',
+        error,
+      },
+    )
+
+    consoleWarn.mockRestore()
+  })
+
+  it('normalizes injected desktop host startup failures when no fallback backend is healthy', async () => {
+    vi.useFakeTimers()
     const error = new Error('electron sidecar failed')
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     window.desktopHost = {
@@ -180,8 +210,12 @@ describe('desktopRuntime browser H5 bootstrap', () => {
         getServerUrl: vi.fn().mockRejectedValue(error),
       },
     }
+    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch')) as typeof fetch
 
-    await expect(initializeDesktopServerUrl()).rejects.toThrow('electron sidecar failed')
+    const startup = expect(initializeDesktopServerUrl()).rejects.toThrow('electron sidecar failed')
+    await vi.runAllTimersAsync()
+
+    await startup
     expect(consoleError).toHaveBeenCalledWith(
       '[desktop] Failed to initialize desktop server URL',
       error,
