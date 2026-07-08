@@ -208,7 +208,8 @@ if ($env:SKIP_PACKAGE_SMOKE -eq '1') {
   Write-Step 'Running package-smoke against canonical Windows artifacts...'
   Push-Location $repoRoot
   try {
-    & bun run test:package-smoke --platform windows --package-kind release --artifacts-dir desktop/build-artifacts/windows-x64
+    $packageKind = if ($isDirectoryBuild) { 'dir' } else { 'release' }
+    & bun run test:package-smoke --platform windows --arch x64 --package-kind $packageKind --artifacts-dir desktop/build-artifacts/windows-x64
     if ($LASTEXITCODE -ne 0) {
       throw "[build-windows-x64] package-smoke failed (exit $LASTEXITCODE)"
     }
