@@ -1,5 +1,11 @@
 [CmdletBinding()]
 param(
+  [ValidateSet('x64', 'arm64')]
+  [string]$Arch = 'x64',
+
+  [ValidateSet('installer', 'portable-dir')]
+  [string]$Kind = 'installer',
+
   [Parameter(ValueFromRemainingArguments = $true)]
   [string[]]$BuilderArgs
 )
@@ -16,25 +22,30 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $desktopDir = (Resolve-Path (Join-Path $scriptDir '..')).Path
 $repoRoot = (Resolve-Path (Join-Path $desktopDir '..')).Path
 
-$targetTriple = 'x86_64-pc-windows-msvc'
-$canonicalOutputDir = Join-Path $desktopDir 'build-artifacts\windows-x64'
+$targetTriple = if ($Arch -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+$builderArch = if ($Arch -eq 'arm64') { 'arm64' } else { 'x64' }
+$vsArch = if ($Arch -eq 'arm64') { 'arm64' } else { 'x64' }
+$vcToolsRequirement = if ($Arch -eq 'arm64') { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' } else { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+$unpackedDirName = if ($Arch -eq 'arm64') { 'win-arm64-unpacked' } else { 'win-unpacked' }
+$canonicalOutputDir = Join-Path $desktopDir "build-artifacts\windows-$Arch"
 $electronOutputDir = Join-Path $desktopDir 'build-artifacts\electron'
+$packageKind = if ($Kind -eq 'portable-dir') { 'dir' } else { 'release' }
 
 function Write-Step {
   param([string]$Message)
-  Write-Host "[build-windows-x64] $Message"
+  Write-Host "[build-windows] $Message"
 }
 
 function Assert-WindowsHost {
   if ($env:OS -ne 'Windows_NT') {
-    throw '[build-windows-x64] This script must run on Windows.'
+    throw '[build-windows] This script must run on Windows.'
   }
 }
 
 function Assert-Command {
   param([string]$Name)
   if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
-    throw "[build-windows-x64] Missing required command: $Name"
+    throw "[build-windows] Missing required command: $Name"
   }
 }
 
@@ -51,29 +62,29 @@ function Invoke-BunX {
 function Import-VsDevEnvironment {
   $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
   if (-not (Test-Path $vswhere)) {
-    throw '[build-windows-x64] Could not find vswhere.exe. Install Visual Studio 2022 Build Tools with the C++ workload.'
+    throw '[build-windows] Could not find vswhere.exe. Install Visual Studio 2022 Build Tools with the C++ workload.'
   }
 
   $installationPath = & $vswhere `
     -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    -requires $vcToolsRequirement `
     -property installationPath |
     Select-Object -First 1
 
   if (-not $installationPath) {
-    throw '[build-windows-x64] Missing Visual C++ build tools. Install the Desktop development with C++ workload first.'
+    throw "[build-windows] Missing Visual C++ build tools for $Arch. Install the Desktop development with C++ workload first."
   }
 
   $vsDevCmd = Join-Path $installationPath 'Common7\Tools\VsDevCmd.bat'
   if (-not (Test-Path $vsDevCmd)) {
-    throw "[build-windows-x64] Could not find VsDevCmd.bat under $installationPath"
+    throw "[build-windows] Could not find VsDevCmd.bat under $installationPath"
   }
 
-  Write-Step "Importing MSVC environment from $vsDevCmd"
+  Write-Step "Importing MSVC environment from $vsDevCmd for $vsArch"
   $env:VSCMD_SKIP_SENDTELEMETRY = '1'
-  $envDump = & cmd.exe /d /s /c "`"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && set"
+  $envDump = & cmd.exe /d /s /c "`"$vsDevCmd`" -arch=$vsArch -host_arch=x64 >nul && set"
   if ($LASTEXITCODE -ne 0) {
-    throw "[build-windows-x64] Failed to initialize Visual Studio build environment (exit $LASTEXITCODE)"
+    throw "[build-windows] Failed to initialize Visual Studio build environment (exit $LASTEXITCODE)"
   }
 
   foreach ($line in $envDump) {
@@ -101,7 +112,7 @@ if ($env:SKIP_INSTALL -ne '1') {
   try {
     & bun install
     if ($LASTEXITCODE -ne 0) {
-      throw "[build-windows-x64] bun install failed in repo root (exit $LASTEXITCODE)"
+      throw "[build-windows] bun install failed in repo root (exit $LASTEXITCODE)"
     }
   } finally {
     Pop-Location
@@ -112,7 +123,7 @@ if ($env:SKIP_INSTALL -ne '1') {
   try {
     & bun install
     if ($LASTEXITCODE -ne 0) {
-      throw "[build-windows-x64] bun install failed in desktop (exit $LASTEXITCODE)"
+      throw "[build-windows] bun install failed in desktop (exit $LASTEXITCODE)"
     }
   } finally {
     Pop-Location
@@ -132,51 +143,46 @@ try {
   $env:SIDECAR_TARGET_TRIPLE = $targetTriple
   & bun run build:sidecars
   if ($LASTEXITCODE -ne 0) {
-    throw "[build-windows-x64] build:sidecars failed (exit $LASTEXITCODE)"
+    throw "[build-windows] build:sidecars failed (exit $LASTEXITCODE)"
   }
 
   Write-Step 'Building renderer and Electron main/preload bundles...'
   & bun run build
   if ($LASTEXITCODE -ne 0) {
-    throw "[build-windows-x64] renderer build failed (exit $LASTEXITCODE)"
+    throw "[build-windows] renderer build failed (exit $LASTEXITCODE)"
   }
   & bun run build:electron
   if ($LASTEXITCODE -ne 0) {
-    throw "[build-windows-x64] Electron build failed (exit $LASTEXITCODE)"
+    throw "[build-windows] Electron build failed (exit $LASTEXITCODE)"
   }
 
   if ($env:REBUILD_NATIVE -eq '1') {
     Write-Step 'Rebuilding native dependencies for Electron ABI...'
     Invoke-BunX @('electron-builder', 'install-app-deps')
     if ($LASTEXITCODE -ne 0) {
-      throw "[build-windows-x64] electron-builder install-app-deps failed (exit $LASTEXITCODE)"
+      throw "[build-windows] electron-builder install-app-deps failed (exit $LASTEXITCODE)"
     }
     & bun run prepare:node-pty
     if ($LASTEXITCODE -ne 0) {
-      throw "[build-windows-x64] prepare:node-pty failed (exit $LASTEXITCODE)"
+      throw "[build-windows] prepare:node-pty failed (exit $LASTEXITCODE)"
     }
   }
 
-  $remainingArgs = @($BuilderArgs)
-  $isDirectoryBuild = $remainingArgs -contains '--dir'
-  if ($isDirectoryBuild) {
-    $args = @('electron-builder', '--win', '--x64', '--publish', 'never')
+  if ($Kind -eq 'portable-dir') {
+    $args = @('electron-builder', '--win', "--$builderArch", '--dir', '--publish', 'never')
+    Write-Step "Packaging Electron app as Windows $Arch no-install directory..."
   } else {
-    $args = @('electron-builder', '--win', 'nsis', '--x64', '--publish', 'never')
+    $args = @('electron-builder', '--win', 'nsis', "--$builderArch", '--publish', 'never')
+    Write-Step "Packaging Electron app as Windows $Arch installer..."
   }
 
-  if ($remainingArgs.Count -gt 0) {
-    $args += $remainingArgs
+  if ($BuilderArgs.Count -gt 0) {
+    $args += $BuilderArgs
   }
 
-  if ($isDirectoryBuild) {
-    Write-Step 'Packaging Electron app as no-install directory...'
-  } else {
-    Write-Step 'Packaging Electron app installer...'
-  }
   Invoke-BunX $args
   if ($LASTEXITCODE -ne 0) {
-    throw "[build-windows-x64] electron-builder failed (exit $LASTEXITCODE)"
+    throw "[build-windows] electron-builder failed (exit $LASTEXITCODE)"
   }
 } finally {
   Pop-Location
@@ -188,15 +194,17 @@ Get-ChildItem -Path $electronOutputDir -File -ErrorAction SilentlyContinue |
   Where-Object { $_.Name -match '\.(exe|blockmap|yml)$' } |
   ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $canonicalOutputDir $_.Name) -Force }
 
-$winUnpackedDir = Join-Path $electronOutputDir 'win-unpacked'
+$winUnpackedDir = Join-Path $electronOutputDir $unpackedDirName
 if (Test-Path $winUnpackedDir) {
-  Copy-Item -LiteralPath $winUnpackedDir -Destination (Join-Path $canonicalOutputDir 'win-unpacked') -Recurse -Force
+  Copy-Item -LiteralPath $winUnpackedDir -Destination (Join-Path $canonicalOutputDir $unpackedDirName) -Recurse -Force
 } else {
-  Write-Step "Warning: win-unpacked was not found under $electronOutputDir; package-smoke will fail if it is required."
+  Write-Step "Warning: $unpackedDirName was not found under $electronOutputDir; package-smoke will fail if it is required."
 }
 
 Set-Content -Path (Join-Path $canonicalOutputDir 'BUILD_INFO.txt') -Value @"
 Target triple: $targetTriple
+Windows arch: $Arch
+Package kind: $Kind
 Builder output: $electronOutputDir
 Canonical output: $canonicalOutputDir
 Built at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')
@@ -205,13 +213,12 @@ Built at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')
 if ($env:SKIP_PACKAGE_SMOKE -eq '1') {
   Write-Step 'Skipping package-smoke because SKIP_PACKAGE_SMOKE=1.'
 } else {
-  Write-Step 'Running package-smoke against canonical Windows artifacts...'
+  Write-Step "Running package-smoke against canonical Windows $Arch $Kind artifacts..."
   Push-Location $repoRoot
   try {
-    $packageKind = if ($isDirectoryBuild) { 'dir' } else { 'release' }
-    & bun run test:package-smoke --platform windows --arch x64 --package-kind $packageKind --artifacts-dir desktop/build-artifacts/windows-x64
+    & bun run test:package-smoke --platform windows --arch $Arch --package-kind $packageKind --artifacts-dir "desktop/build-artifacts/windows-$Arch"
     if ($LASTEXITCODE -ne 0) {
-      throw "[build-windows-x64] package-smoke failed (exit $LASTEXITCODE)"
+      throw "[build-windows] package-smoke failed (exit $LASTEXITCODE)"
     }
   } finally {
     Pop-Location

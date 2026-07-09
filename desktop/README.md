@@ -15,8 +15,11 @@ bun run tauri dev
 # macOS (Apple Silicon)
 ./scripts/build-macos-arm64.sh
 
-# Windows (x64, MSI only)
-.\scripts\build-windows-x64.ps1
+# Windows x64 installer
+powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Arch x64 -Kind installer
+
+# Windows x64 no-install directory
+powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -Arch x64 -Kind portable-dir
 ```
 
 构建产物位于 `build-artifacts/` 目录，文件名会显式包含平台、架构和包类型。
