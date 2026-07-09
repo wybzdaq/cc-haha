@@ -20,8 +20,14 @@
         "backgroundColor": "#ffffff"
       },
       "package": "com.claudehaha.mobile",
+      "permissions": [
+        "android.permission.CAMERA"
+      ],
       "usesCleartextTraffic": true
     },
+    "plugins": [
+      "expo-camera"
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
     }

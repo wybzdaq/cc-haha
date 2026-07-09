@@ -3,10 +3,12 @@ import React, { useEffect } from 'react'
 import { NavigationContainer } from '@react-navigation/native'
 import { createNativeStackNavigator } from '@react-navigation/native-stack'
 import { initBaseUrl } from './src/api/client'
+import RemoteSessionSync from './src/components/RemoteSessionSync'
 import HomeScreen from './src/screens/HomeScreen'
 import ChatScreen from './src/screens/ChatScreen'
 import SessionListScreen from './src/screens/SessionListScreen'
 import ServerConfigScreen from './src/screens/ServerConfigScreen'
+import QrScannerScreen from './src/screens/QrScannerScreen'
 
 const Stack = createNativeStackNavigator()
 
@@ -17,8 +19,9 @@ export default function App() {
 
   return (
     <NavigationContainer>
+      <RemoteSessionSync />
       <Stack.Navigator 
-        initialRouteName="Home"
+        initialRouteName="SessionList"
         screenOptions={{
           headerShown: false,
         }}
@@ -38,6 +41,10 @@ export default function App() {
         <Stack.Screen 
           name="ServerConfig" 
           component={ServerConfigScreen}
+        />
+        <Stack.Screen
+          name="QrScanner"
+          component={QrScannerScreen}
         />
       </Stack.Navigator>
     </NavigationContainer>

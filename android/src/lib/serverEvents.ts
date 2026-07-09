@@ -35,11 +35,16 @@ export function buildUserMessagePayload(text: string) {
   }
 }
 
-export function buildPermissionResponsePayload(requestId: string, allowed: boolean) {
+export function buildPermissionResponsePayload(
+  requestId: string,
+  allowed: boolean,
+  options?: { rule?: 'always' },
+) {
   return {
     type: 'permission_response' as const,
     requestId,
     allowed,
+    ...(options?.rule ? { rule: options.rule } : {}),
   }
 }
 
@@ -53,6 +58,14 @@ export function buildPermissionModePayload(mode: PermissionMode) {
   return {
     type: 'set_permission_mode' as const,
     mode,
+  }
+}
+
+export function buildRuntimeConfigPayload(input: { providerId: string | null; modelId: string }) {
+  return {
+    type: 'set_runtime_config' as const,
+    providerId: input.providerId,
+    modelId: input.modelId,
   }
 }
 

@@ -377,7 +377,7 @@ desktop/
 └── scripts/
     ├── build-sidecars.ts
     ├── build-macos-arm64.sh
-    └── build-windows-x64.ps1
+    └── build-windows.ps1
 
 src/server/                           # 服务端（项目根目录）
 ├── api/                             #   REST 路由 (14 个模块)

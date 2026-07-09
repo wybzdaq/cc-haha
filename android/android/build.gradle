@@ -28,6 +28,8 @@ allprojects {
         maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/gradle-plugins/' }
         maven { url 'https://mirrors.tuna.tsinghua.edu.cn/maven/gradle-plugins/' }
         maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+        maven { url 'https://mirrors.tuna.tsinghua.edu.cn/maven/' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
 
         maven {
             url = uri("https://mirrors.tuna.tsinghua.edu.cn/maven/gradle-plugins/")
@@ -37,6 +39,10 @@ allprojects {
         }
         maven {
             url = uri("https://mirrors.tuna.tsinghua.edu.cn/maven/central/")
+        }
+        maven {
+            // expo-camera ships com.google.android:cameraview:1.0.0 in its package.
+            url(new File(rootDir.getParentFile(), "node_modules/expo-camera/android/maven"))
         }
         maven {
             // All of React Native (JS, Obj-C sources, Android binaries) is installed from npm

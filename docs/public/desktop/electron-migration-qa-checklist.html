@@ -332,7 +332,7 @@
         id: "windows-real-machine",
         priority: "P0",
         title: "Windows 实机验收",
-        refs: ["desktop/scripts/build-windows-x64.ps1", "electron-builder NSIS"],
+        refs: ["desktop/scripts/build-windows.ps1", "electron-builder NSIS"],
         steps: [
           "构建 NSIS 安装器并安装。",
           "运行 bun run test:package-smoke --platform windows。",

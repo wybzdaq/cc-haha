@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import {
   buildPermissionModePayload,
   buildPermissionResponsePayload,
+  buildRuntimeConfigPayload,
   buildStopGenerationPayload,
   buildUserMessagePayload,
   groupSessionsByProject,
@@ -33,6 +34,11 @@ describe('mobile server event adapter', () => {
     expect(buildPermissionModePayload('plan')).toEqual({
       type: 'set_permission_mode',
       mode: 'plan',
+    })
+    expect(buildRuntimeConfigPayload({ providerId: 'provider-1', modelId: 'model-main' })).toEqual({
+      type: 'set_runtime_config',
+      providerId: 'provider-1',
+      modelId: 'model-main',
     })
   })
 
@@ -76,6 +82,12 @@ describe('mobile server event adapter', () => {
       type: 'permission_response',
       requestId: 'perm-1',
       allowed: true,
+    })
+    expect(buildPermissionResponsePayload('perm-1', true, { rule: 'always' })).toEqual({
+      type: 'permission_response',
+      requestId: 'perm-1',
+      allowed: true,
+      rule: 'always',
     })
   })
 

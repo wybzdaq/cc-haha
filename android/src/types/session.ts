@@ -10,6 +10,12 @@ export type SessionListItem = {
   workDirExists: boolean
 }
 
+export type RecentProject = {
+  projectPath: string
+  modifiedAt: string
+  sessionCount: number
+}
+
 export type MessageEntry = {
   id: string
   type: 'user' | 'assistant' | 'system' | 'tool_use' | 'tool_result'
@@ -31,6 +37,7 @@ export type CreateSessionRequest = {
     branch?: string | null
     worktree?: boolean
   }
+  permissionMode?: string
 }
 
 export type CreateSessionResponse = {

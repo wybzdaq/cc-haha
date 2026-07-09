@@ -62,7 +62,7 @@ const desktopNativeExactPaths = new Set([
   'desktop/package-lock.json',
   'desktop/electron/tsconfig.json',
   'desktop/scripts/build-macos-arm64.sh',
-  'desktop/scripts/build-windows-x64.ps1',
+  'desktop/scripts/build-windows.ps1',
   'desktop/scripts/build-linux.sh',
 ])
 
@@ -86,7 +86,7 @@ const releaseExactPaths = new Set([
   'scripts/release.ts',
   'desktop/electron/tsconfig.json',
   'desktop/scripts/build-macos-arm64.sh',
-  'desktop/scripts/build-windows-x64.ps1',
+  'desktop/scripts/build-windows.ps1',
   'desktop/scripts/build-linux.sh',
 ])
 

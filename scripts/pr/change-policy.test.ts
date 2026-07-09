@@ -113,4 +113,14 @@ describe('evaluateChangePolicy', () => {
     expect(result.checks.coverage).toBe(true)
     expect(result.blocked).toBe(false)
   })
+
+  test('routes consolidated Windows build script changes through native and release checks', () => {
+    const result = evaluateChangePolicy([
+      'desktop/scripts/build-windows.ps1',
+    ])
+
+    expect(result.areas).toEqual(['desktop', 'release'])
+    expect(result.checks.desktopNative).toBe(true)
+    expect(result.checks.coverage).toBe(false)
+  })
 })

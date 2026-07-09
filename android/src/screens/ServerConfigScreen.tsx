@@ -1,8 +1,8 @@
-import React, { useState, useEffect } from 'react'
-import { View, Text, TextInput, StyleSheet, SafeAreaView, Alert, TouchableOpacity, Switch, ScrollView } from 'react-native'
-import Button from '../components/shared/Button'
-import { setBaseUrl, getBaseUrl, setAccessToken, getAccessToken, testConnection } from '../api/client'
+import React, { useEffect, useState } from 'react'
+import { Alert, SafeAreaView, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native'
 import { useNavigation } from '@react-navigation/native'
+import Button from '../components/shared/Button'
+import { getAccessToken, getBaseUrl, setAccessToken, setBaseUrl, testConnection } from '../api/client'
 
 export default function ServerConfigScreen() {
   const [serverUrl, setServerUrlInput] = useState('')
@@ -10,10 +10,9 @@ export default function ServerConfigScreen() {
   const [showToken, setShowToken] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<'unknown' | 'success' | 'failed'>('unknown')
-  const navigation = useNavigation()
+  const navigation = useNavigation<any>()
 
   useEffect(() => {
-    // 加载已保存的配置
     setServerUrlInput(getBaseUrl())
     setAccessTokenInput(getAccessToken())
   }, [])
@@ -27,16 +26,15 @@ export default function ServerConfigScreen() {
     setIsLoading(true)
     setConnectionStatus('unknown')
 
+    const originalUrl = getBaseUrl()
+    const originalToken = getAccessToken()
+
     try {
-      // 临时设置 URL 和 token 进行测试
-      const originalUrl = getBaseUrl()
-      const originalToken = getAccessToken()
       setBaseUrl(serverUrl.trim())
       await setAccessToken(accessToken.trim())
-      
-      // 测试连接
+
       const success = await testConnection()
-      
+
       if (success) {
         setConnectionStatus('success')
         Alert.alert('Success', 'Connection successful!')
@@ -48,6 +46,8 @@ export default function ServerConfigScreen() {
       }
     } catch (error) {
       setConnectionStatus('failed')
+      setBaseUrl(originalUrl)
+      await setAccessToken(originalToken)
       Alert.alert('Error', 'Connection failed: ' + (error as Error).message)
     } finally {
       setIsLoading(false)
@@ -64,9 +64,9 @@ export default function ServerConfigScreen() {
       setBaseUrl(serverUrl.trim())
       await setAccessToken(accessToken.trim())
       Alert.alert('Success', 'Configuration saved!', [
-        { text: 'OK', onPress: () => navigation.goBack() }
+        { text: 'OK', onPress: () => navigation.goBack() },
       ])
-    } catch (error) {
+    } catch {
       Alert.alert('Error', 'Failed to save configuration')
     }
   }
@@ -74,9 +74,9 @@ export default function ServerConfigScreen() {
   const getStatusText = () => {
     switch (connectionStatus) {
       case 'success':
-        return 'Connected ✓'
+        return 'Connected'
       case 'failed':
-        return 'Connection Failed ✗'
+        return 'Connection Failed'
       default:
         return 'Not Tested'
     }
@@ -98,10 +98,17 @@ export default function ServerConfigScreen() {
       <ScrollView style={styles.scrollView}>
         <Text style={styles.title}>Server Configuration</Text>
         <Text style={styles.subtitle}>
-          Configure your Claude Code API server connection
+          Pair Android with the Windows desktop server
         </Text>
 
         <View style={styles.form}>
+          <TouchableOpacity
+            style={styles.scanButton}
+            onPress={() => navigation.navigate('QrScanner')}
+          >
+            <Text style={styles.scanButtonText}>Scan Desktop QR</Text>
+          </TouchableOpacity>
+
           <View style={styles.field}>
             <Text style={styles.label}>Server URL</Text>
             <TextInput
@@ -114,13 +121,13 @@ export default function ServerConfigScreen() {
               keyboardType="url"
             />
             <Text style={styles.hint}>
-              Enter your server URL including port (e.g. http://your-ip:3456)
+              Scan the desktop H5 QR code to fill this automatically.
             </Text>
           </View>
 
           <View style={styles.field}>
             <View style={styles.labelRow}>
-              <Text style={styles.label}>Access Token (Optional)</Text>
+              <Text style={styles.label}>H5 Token</Text>
               <Switch
                 value={showToken}
                 onValueChange={setShowToken}
@@ -132,13 +139,13 @@ export default function ServerConfigScreen() {
               style={styles.input}
               value={accessToken}
               onChangeText={setAccessTokenInput}
-              placeholder="Enter your access token"
+              placeholder="Scan QR or paste H5 token"
               secureTextEntry={!showToken}
               autoCapitalize="none"
               autoCorrect={false}
             />
             <Text style={styles.hint}>
-              Required for public/network access. Configure SERVER_ACCESS_TOKEN on your server.
+              This is the desktop H5 access token, not the old SERVER_ACCESS_TOKEN unless they are the same value.
             </Text>
           </View>
 
@@ -167,19 +174,19 @@ export default function ServerConfigScreen() {
         <View style={styles.infoBox}>
           <Text style={styles.infoTitle}>Quick Setup Guide</Text>
           <Text style={styles.infoText}>
-            1. Start your Claude Code server on your computer
+            1. Open Windows desktop Settings and enable H5 access
           </Text>
           <Text style={styles.infoText}>
-            2. Set SERVER_HOST=0.0.0.0 for network access
+            2. Scan the H5 access QR code from Android
           </Text>
           <Text style={styles.infoText}>
-            3. Find your computer's local IP address
+            3. Android saves the server URL and H5 token
           </Text>
           <Text style={styles.infoText}>
-            4. Enter http://[YOUR IP]:3456 here
+            4. Confirm Windows Firewall allows TCP 3456
           </Text>
           <Text style={styles.infoText}>
-            5. Set SERVER_ACCESS_TOKEN for security
+            5. Keep Android and Windows on the same LAN
           </Text>
         </View>
       </ScrollView>
@@ -211,6 +218,19 @@ const styles = StyleSheet.create({
   },
   form: {
     paddingHorizontal: 20,
+  },
+  scanButton: {
+    height: 48,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#172033',
+    marginBottom: 24,
+  },
+  scanButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
   },
   field: {
     marginBottom: 24,

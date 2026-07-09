@@ -449,7 +449,7 @@
 - `desktop/package.json`
 - `package.json`
 - `desktop/scripts/build-macos-arm64.sh`
-- `desktop/scripts/build-windows-x64.ps1`
+- `desktop/scripts/build-windows.ps1`
 
 **步骤：**
 
@@ -468,9 +468,9 @@
 - Electron builder 配置包含 `dist/**`、`electron-dist/**`、`src-tauri/binaries/**`、`src-tauri/resources/preview-agent.js` 和 `node_modules/node-pty/**`；`electron-updater` 已打进 main bundle，`node-pty` 保持外部原生模块并通过 `asarUnpack` 解包。
 - `check:native` 已从 Tauri `cargo check` 改为 `build:sidecars + check:electron`；`quality:gate` native lane 描述同步为 Electron host/package checks。
 - `desktop/scripts/build-macos-arm64.sh` 改为 Electron Builder：构建 sidecar、renderer、Electron bundles，执行 `electron-builder --mac dmg zip --arm64 --publish never`，输出复制到 `desktop/build-artifacts/macos-arm64`。
-- `desktop/scripts/build-windows-x64.ps1` 改为 Electron Builder：导入 MSVC 环境，构建 sidecar、renderer、Electron bundles，执行 `electron-builder --win nsis --x64 --publish never`，输出复制到 `desktop/build-artifacts/windows-x64`。
+- `desktop/scripts/build-windows.ps1` 改为 Electron Builder：导入 MSVC 环境，构建 sidecar、renderer、Electron bundles，支持 `-Arch x64|arm64` 和 `-Kind installer|portable-dir`，输出复制到 `desktop/build-artifacts/windows-<arch>`。
 - `desktop/scripts/build-macos-arm64.sh` 支持 `MAC_TARGETS` 覆盖 Electron Builder macOS target，默认仍为 `dmg zip`；本机 DiskImages 异常时可用 `MAC_TARGETS=zip` 单独验证 zip/update metadata 链路。脚本会对当前 worktree 的 stale Electron Builder 临时 DMG 挂载 fail fast，成功复制 canonical artifacts 后默认运行 package-smoke。
-- `desktop/scripts/build-windows-x64.ps1` 会把 installer、update metadata、blockmap 和 `win-unpacked` 复制到 canonical `desktop/build-artifacts/windows-x64`；成功复制后默认运行 `bun run test:package-smoke --platform windows --package-kind release --artifacts-dir desktop/build-artifacts/windows-x64`，可用 `SKIP_PACKAGE_SMOKE=1` 跳过静态验包。
+- `desktop/scripts/build-windows.ps1` 会把 installer、update metadata、blockmap 和 unpacked 目录复制到 canonical `desktop/build-artifacts/windows-<arch>`；成功复制后默认按产物类型运行 package-smoke，可用 `SKIP_PACKAGE_SMOKE=1` 跳过静态验包。
 - `desktop/scripts/build-linux.sh` 支持 `LINUX_ARCH=x64|arm64` 和 `LINUX_TARGETS` 覆盖，默认构建 AppImage/deb x64；脚本会复制 `.AppImage`、`.deb`、`latest-linux.yml`、blockmap 和 `linux-unpacked` 到 canonical `desktop/build-artifacts/linux-<arch>`，并默认运行 `bun run test:package-smoke --platform linux --package-kind release --artifacts-dir desktop/build-artifacts/linux-<arch>`。
 - `node-pty` 原生模块验证：`bunx electron ./tmp-electron-node-pty-smoke.cjs` 在 Electron 42.3.0 runtime 下成功输出 `node-pty spawn type: function`。
 - `electron-builder install-app-deps` 在本机 `@electron/rebuild` node-gyp worker 上空转无输出；由于 `node-pty` Electron runtime smoke 已通过，默认配置设为 `npmRebuild=false`，脚本保留 `REBUILD_NATIVE=1` 作为 runner/调试开关。

@@ -5,7 +5,8 @@ import type {
   MessageEntry, 
   SessionDetail, 
   CreateSessionRequest, 
-  CreateSessionResponse 
+  CreateSessionResponse,
+  RecentProject,
 } from '../types/session'
 
 export type {
@@ -14,6 +15,7 @@ export type {
   SessionDetail,
   CreateSessionRequest,
   CreateSessionResponse,
+  RecentProject,
 } from '../types/session'
 
 type SessionsResponse = { sessions: SessionListItem[]; total: number }
@@ -53,5 +55,10 @@ export const sessionsApi = {
 
   rename(sessionId: string, title: string) {
     return api.patch<{ ok: true }>(`/api/sessions/${sessionId}`, { title })
+  },
+
+  getRecentProjects(limit?: number) {
+    const query = typeof limit === 'number' ? `?limit=${limit}` : ''
+    return api.get<{ projects: RecentProject[] }>(`/api/sessions/recent-projects${query}`)
   },
 }

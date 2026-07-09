@@ -148,7 +148,7 @@
 ## Windows 待实机
 
 - [ ] 构建 NSIS 安装器并安装。
-- [x] Windows build script 已补 canonical package-smoke：`desktop/scripts/build-windows-x64.ps1` 会复制 installer/update metadata/blockmap/`win-unpacked` 到 `desktop/build-artifacts/windows-x64`，并默认运行 `bun run test:package-smoke --platform windows --package-kind release --artifacts-dir desktop/build-artifacts/windows-x64`。
+- [x] Windows build script 已补 canonical package-smoke：`desktop/scripts/build-windows.ps1` 会复制 installer/update metadata/blockmap/`win-unpacked` 到 `desktop/build-artifacts/windows-<arch>`，并按 `-Kind installer|portable-dir` 自动运行 release 或 dir package-smoke。
 - [ ] 在 Windows runner/实机运行 `bun run test:package-smoke --platform windows` 或 build script 内置 canonical package-smoke。
 - [ ] 启动安装后的 app，验证 sidecar 自动启动。
 - [ ] 验证 sidecar 文件锁、更新前 stop process、通知、托盘、窗口隐藏/恢复、系统对话框。

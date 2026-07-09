@@ -73,7 +73,7 @@ jobs:
               'desktop/electron/tsconfig.json',
               'desktop/scripts/build-linux.sh',
               'desktop/scripts/build-macos-arm64.sh',
-              'desktop/scripts/build-windows-x64.ps1',
+              'desktop/scripts/build-windows.ps1',
             ])
 
             for (const filename of filenames) {
@@ -146,7 +146,7 @@ jobs:
                 file.startsWith('desktop/') ||
                 file.startsWith('adapters/') ||
                 file.startsWith('src/server/') ||
-                ['bun.lock', 'package.json', 'desktop/bun.lock', 'desktop/package.json', 'desktop/package-lock.json', 'desktop/electron/tsconfig.json', 'desktop/scripts/build-linux.sh', 'desktop/scripts/build-macos-arm64.sh', 'desktop/scripts/build-windows-x64.ps1'].includes(file)
+                ['bun.lock', 'package.json', 'desktop/bun.lock', 'desktop/package.json', 'desktop/package-lock.json', 'desktop/electron/tsconfig.json', 'desktop/scripts/build-linux.sh', 'desktop/scripts/build-macos-arm64.sh', 'desktop/scripts/build-windows.ps1'].includes(file)
               )
             ) requiredChecks.push('desktop-native-checks')
             if (areas.has('area:docs')) requiredChecks.push('docs-checks')
