@@ -69,6 +69,7 @@ describe('provider presets API', () => {
     const minimax = PROVIDER_PRESETS.find((preset) => preset.id === 'minimax')
     const jiekouai = PROVIDER_PRESETS.find((preset) => preset.id === 'jiekouai')
     const shengsuanyun = PROVIDER_PRESETS.find((preset) => preset.id === 'shengsuanyun')
+    const teamorouter = PROVIDER_PRESETS.find((preset) => preset.id === 'teamorouter')
 
     expect(lmstudio?.baseUrl).toBe('http://localhost:1234')
     expect(lmstudio?.apiFormat).toBe('anthropic')
@@ -114,6 +115,14 @@ describe('provider presets API', () => {
     expect(shengsuanyun?.defaultModels.main).toBe('anthropic/claude-sonnet-4.6')
     expect(shengsuanyun?.defaultModels.haiku).toBe('anthropic/claude-haiku-4.5:thinking')
     expect(shengsuanyun?.modelContextWindows?.['anthropic/claude-sonnet-4.6']).toBe(1000000)
+    expect(teamorouter?.baseUrl).toBe('https://api.teamorouter.com')
+    expect(teamorouter?.apiFormat).toBe('anthropic')
+    expect(teamorouter?.authStrategy).toBe('auth_token')
+    expect(teamorouter?.defaultModels.main).toBe('claude-opus-4-8')
+    expect(teamorouter?.defaultModels.haiku).toBe('claude-haiku-4-5')
+    expect(teamorouter?.defaultModels.sonnet).toBe('claude-sonnet-5')
+    expect(teamorouter?.defaultModels.opus).toBe('claude-opus-4-8')
+    expect(teamorouter?.modelContextWindows?.['claude-opus-4-8']).toBe(1000000)
   })
 
   test('configured presets can expose optional API key and promo metadata', () => {
@@ -125,6 +134,7 @@ describe('provider presets API', () => {
     const minimax = PROVIDER_PRESETS.find((preset) => preset.id === 'minimax')
     const jiekouai = PROVIDER_PRESETS.find((preset) => preset.id === 'jiekouai')
     const shengsuanyun = PROVIDER_PRESETS.find((preset) => preset.id === 'shengsuanyun')
+    const teamorouter = PROVIDER_PRESETS.find((preset) => preset.id === 'teamorouter')
     const custom = PROVIDER_PRESETS.find((preset) => preset.id === 'custom')
 
     expect(lmstudio?.needsApiKey).toBe(false)
@@ -166,6 +176,16 @@ describe('provider presets API', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: 'none',
     })
     expect(shengsuanyun?.modelContextWindows?.['anthropic/claude-opus-4.7']).toBe(1000000)
+    expect(teamorouter?.apiKeyUrl).toBe(
+      'https://teamorouter.com/?utm_source=cc_haha&utm_medium=referral&utm_campaign=ai_directory',
+    )
+    expect(teamorouter?.promoText).toContain('10% 折扣')
+    expect(teamorouter?.featured).toBe(true)
+    expect(teamorouter?.defaultEnv).toEqual({
+      CLAUDE_CODE_SUBAGENT_MODEL: 'claude-sonnet-5',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: 'none',
+    })
+    expect(teamorouter?.modelContextWindows?.['claude-sonnet-5']).toBe(1000000)
     expect(custom?.promoText).toBeUndefined()
     expect(custom?.authStrategy).toBe('auth_token')
     expect(custom?.defaultEnv).toBeUndefined()

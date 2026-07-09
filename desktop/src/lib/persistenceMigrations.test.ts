@@ -27,6 +27,47 @@ describe('desktop persistence migrations', () => {
     expect(window.localStorage.getItem(DESKTOP_PERSISTENCE_VERSION_KEY)).toBe(String(CURRENT_DESKTOP_PERSISTENCE_SCHEMA_VERSION))
   })
 
+  test('preserves persisted market tabs during startup migration', () => {
+    window.localStorage.setItem('cc-haha-open-tabs', JSON.stringify({
+      openTabs: [
+        { sessionId: '__market__', title: 'Market', type: 'market' },
+        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
+      ],
+      activeTabId: '__market__',
+    }))
+
+    const report = runDesktopPersistenceMigrations()
+
+    expect(report.migratedKeys).toContain('cc-haha-open-tabs')
+    expect(JSON.parse(window.localStorage.getItem('cc-haha-open-tabs') || '{}')).toEqual({
+      openTabs: [
+        { sessionId: '__market__', title: 'Market', type: 'market' },
+        { sessionId: '__traces__', title: 'Traces', type: 'traces' },
+      ],
+      activeTabId: '__market__',
+    })
+  })
+
+  test('canonicalizes mismatched persisted special tab ids and types during startup migration', () => {
+    window.localStorage.setItem('cc-haha-open-tabs', JSON.stringify({
+      openTabs: [
+        { sessionId: '__settings__', title: 'Settings', type: 'market' },
+        { sessionId: '__market__', title: 'Skills', type: 'settings' },
+      ],
+      activeTabId: '__settings__',
+    }))
+
+    runDesktopPersistenceMigrations()
+
+    expect(JSON.parse(window.localStorage.getItem('cc-haha-open-tabs') || '{}')).toEqual({
+      openTabs: [
+        { sessionId: '__settings__', title: 'Settings', type: 'settings' },
+        { sessionId: '__market__', title: 'Skills', type: 'market' },
+      ],
+      activeTabId: '__settings__',
+    })
+  })
+
   test('filters stale session runtime selections without clearing unrelated keys', () => {
     window.localStorage.setItem('unrelated-user-key', 'keep')
     window.localStorage.setItem('cc-haha-session-runtime', JSON.stringify({
@@ -63,6 +104,17 @@ describe('desktop persistence migrations', () => {
 
     expect(report.migratedKeys).not.toContain('cc-haha-theme')
     expect(window.localStorage.getItem('cc-haha-theme')).toBe('white')
+  })
+
+  test('preserves every supported locale during startup migration', () => {
+    for (const locale of ['en', 'zh', 'zh-TW', 'jp', 'kr']) {
+      window.localStorage.setItem('cc-haha-locale', locale)
+
+      const report = runDesktopPersistenceMigrations()
+
+      expect(report.migratedKeys).not.toContain('cc-haha-locale')
+      expect(window.localStorage.getItem('cc-haha-locale')).toBe(locale)
+    }
   })
 
   test('preserves valid app zoom and removes invalid app zoom values', () => {
