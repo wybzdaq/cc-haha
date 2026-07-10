@@ -13,9 +13,11 @@ import { Ionicons } from '@expo/vector-icons'
 import { CameraView, useCameraPermissions, type BarcodeScanningResult } from 'expo-camera'
 import { setAccessToken, setBaseUrl, testConnection } from '../api/client'
 import { parseH5LaunchUrl } from '../lib/h5Launch'
+import { useSessionStore } from '../stores/sessionStore'
 
 export default function QrScannerScreen() {
   const navigation = useNavigation<any>()
+  const fetchSessions = useSessionStore((state) => state.fetchSessions)
   const [permission, requestPermission] = useCameraPermissions()
   const [isHandlingScan, setIsHandlingScan] = useState(false)
   const [lastError, setLastError] = useState<string | null>(null)
@@ -35,9 +37,8 @@ export default function QrScannerScreen() {
         throw new Error('The QR code was parsed, but the Windows server did not accept the connection.')
       }
 
-      Alert.alert('Connected', 'Android is paired with the Windows desktop.', [
-        { text: 'OK', onPress: () => navigation.navigate('SessionList') },
-      ])
+      await fetchSessions()
+      navigation.navigate('SessionList')
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to use this QR code.'
       setLastError(message)

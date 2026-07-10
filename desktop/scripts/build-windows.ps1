@@ -102,6 +102,37 @@ function Clear-Directory {
   New-Item -ItemType Directory -Force -Path $Path | Out-Null
 }
 
+function Stop-PackagedWindowsProcesses {
+  $imageNames = @(
+    'Claude Code Haha.exe',
+    'claude-sidecar-x86_64-pc-windows-msvc.exe',
+    'claude-sidecar-aarch64-pc-windows-msvc.exe',
+    'claude-sidecar.exe'
+  )
+
+  foreach ($imageName in $imageNames) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      $taskkillOutput = & taskkill /F /T /IM $imageName 2>&1
+      $exitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($exitCode -eq 0) {
+      Write-Step "Stopped running process tree: $imageName"
+    } elseif ($exitCode -ne 128) {
+      $message = ($taskkillOutput | Select-Object -First 1)
+      if ($message) {
+        Write-Step "taskkill returned $exitCode for $imageName ($message); continuing."
+      } else {
+        Write-Step "taskkill returned $exitCode for $imageName; continuing."
+      }
+    }
+  }
+}
+
 Assert-WindowsHost
 Assert-Command bun
 Import-VsDevEnvironment
@@ -131,6 +162,7 @@ if ($env:SKIP_INSTALL -ne '1') {
 }
 
 Write-Step 'Cleaning stale Electron outputs...'
+Stop-PackagedWindowsProcesses
 Remove-Item -LiteralPath (Join-Path $desktopDir 'dist') -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $desktopDir 'electron-dist') -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $electronOutputDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -141,6 +173,10 @@ Write-Step "Building sidecars for $targetTriple..."
 Push-Location $desktopDir
 try {
   $env:SIDECAR_TARGET_TRIPLE = $targetTriple
+  if ($Arch -eq 'x64' -and -not $env:SIDECAR_BUN_TARGET) {
+    $env:SIDECAR_BUN_TARGET = 'bun-windows-x64'
+    Write-Step 'Using bun-windows-x64 for the local Windows x64 sidecar build. Set SIDECAR_BUN_TARGET to override.'
+  }
   & bun run build:sidecars
   if ($LASTEXITCODE -ne 0) {
     throw "[build-windows] build:sidecars failed (exit $LASTEXITCODE)"
@@ -176,8 +212,9 @@ try {
     Write-Step "Packaging Electron app as Windows $Arch installer..."
   }
 
-  if ($BuilderArgs.Count -gt 0) {
-    $args += $BuilderArgs
+  $extraBuilderArgs = @($BuilderArgs)
+  if ($extraBuilderArgs.Count -gt 0) {
+    $args += $extraBuilderArgs
   }
 
   Invoke-BunX $args
@@ -188,6 +225,7 @@ try {
   Pop-Location
 }
 
+Stop-PackagedWindowsProcesses
 Clear-Directory -Path $canonicalOutputDir
 
 Get-ChildItem -Path $electronOutputDir -File -ErrorAction SilentlyContinue |

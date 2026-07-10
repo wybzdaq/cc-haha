@@ -18,10 +18,11 @@ import {
 import { useNavigation } from '@react-navigation/native'
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack'
 import { Ionicons } from '@expo/vector-icons'
-import { initBaseUrl, testConnection } from '../api/client'
+import { checkConnection, initBaseUrl } from '../api/client'
 import { sessionsApi } from '../api/sessions'
 import { DEFAULT_WORK_DIR } from '../constants/config'
 import {
+  chooseDefaultWorkDir,
   runForegroundConnection,
   shouldConnectForAppState,
   type ForegroundConnectionStatus,
@@ -80,7 +81,7 @@ export default function SessionListScreen() {
     try {
       const result = await runForegroundConnection({
         initBaseUrl,
-        testConnection,
+        testConnection: checkConnection,
         fetchSessions: () => fetchSessions(),
       })
 
@@ -149,20 +150,23 @@ export default function SessionListScreen() {
     try {
       const response = await sessionsApi.getRecentProjects(12)
       setRecentProjects(response.projects)
+      return response.projects
     } catch {
       setRecentProjects([])
+      return []
     } finally {
       setRecentProjectsLoading(false)
     }
   }
 
-  const openNewSession = () => {
-    const selectedPath = selectedProject?.path && selectedProject.path !== 'Unknown project'
-      ? selectedProject.path
-      : recentProjects[0]?.projectPath || DEFAULT_WORK_DIR
-    setWorkDirDraft(selectedPath)
+  const openNewSession = async () => {
     setNewSessionOpen(true)
-    void loadRecentProjects()
+    const projects = await loadRecentProjects()
+    setWorkDirDraft(chooseDefaultWorkDir({
+      selectedProjectPath: selectedProject?.path,
+      recentProjects: projects,
+      fallbackWorkDir: DEFAULT_WORK_DIR,
+    }))
   }
 
   const handleCreateSession = async (workDir = workDirDraft) => {
@@ -216,6 +220,14 @@ export default function SessionListScreen() {
     setMenuOpen(false)
   }
 
+  const handleManualRefresh = () => {
+    if (connectionStatus === 'failed') {
+      void connectToDesktop()
+      return
+    }
+    void fetchSessions()
+  }
+
   const renderSession = ({ item }: { item: SessionListItem }) => (
     <TouchableOpacity
       onPress={() => handleSessionPress(item.id)}
@@ -246,6 +258,13 @@ export default function SessionListScreen() {
           <Ionicons name={menuOpen ? 'caret-up' : 'caret-down'} size={14} color="#111111" />
         </TouchableOpacity>
         <View style={styles.headerActions}>
+          <TouchableOpacity
+            accessibilityLabel="Refresh sessions"
+            style={styles.toolButton}
+            onPress={handleManualRefresh}
+          >
+            <Ionicons name="refresh-outline" size={22} color="#172033" />
+          </TouchableOpacity>
           <TouchableOpacity
             accessibilityLabel="Scan desktop QR"
             style={styles.toolButton}
@@ -315,6 +334,11 @@ export default function SessionListScreen() {
           ]} numberOfLines={1}>
             {connectionMessage}
           </Text>
+          {connectionStatus === 'failed' ? (
+            <TouchableOpacity style={styles.retryButton} onPress={() => void connectToDesktop()}>
+              <Text style={styles.retryButtonText}>Retry</Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
 
         {isLoading && sessions.length === 0 ? (
@@ -324,11 +348,40 @@ export default function SessionListScreen() {
           </View>
         ) : sessions.length === 0 ? (
           <View style={styles.emptyContainer}>
-            <Ionicons name="document-text-outline" size={56} color="#BBBBBB" />
-            <Text style={styles.emptyText}>No sessions</Text>
-            <Text style={styles.emptySubtext}>
-              Use the QR button or connection settings in the top-right corner to pair with Windows.
-            </Text>
+            {connectionStatus === 'failed' ? (
+              <>
+                <Ionicons name="wifi-outline" size={56} color="#BBBBBB" />
+                <Text style={styles.emptyText}>Not connected</Text>
+                <Text style={styles.emptySubtext}>
+                  Scan the Windows QR code, check the IP/token, or retry the desktop connection.
+                </Text>
+                <View style={styles.emptyActions}>
+                  <TouchableOpacity
+                    style={[styles.emptyPrimaryButton, styles.emptyActionButton]}
+                    onPress={() => navigation.navigate('QrScanner')}
+                  >
+                    <Text style={styles.emptyPrimaryButtonText}>Scan QR</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.emptySecondaryButton, styles.emptyActionButton]}
+                    onPress={() => void connectToDesktop()}
+                  >
+                    <Text style={styles.emptySecondaryButtonText}>Retry</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            ) : (
+              <>
+                <Ionicons name="document-text-outline" size={56} color="#BBBBBB" />
+                <Text style={styles.emptyText}>No sessions yet</Text>
+                <Text style={styles.emptySubtext}>
+                  Windows is connected. Create a remote session from a recent project.
+                </Text>
+                <TouchableOpacity style={styles.emptyPrimaryButton} onPress={() => void openNewSession()}>
+                  <Text style={styles.emptyPrimaryButtonText}>New session</Text>
+                </TouchableOpacity>
+              </>
+            )}
           </View>
         ) : (
           <FlatList
@@ -341,7 +394,7 @@ export default function SessionListScreen() {
           />
         )}
 
-        <TouchableOpacity style={styles.floatingButton} onPress={openNewSession}>
+        <TouchableOpacity style={styles.floatingButton} onPress={() => void openNewSession()}>
           <Ionicons name="add" size={24} color="#FFFFFF" />
         </TouchableOpacity>
       </View>
@@ -479,7 +532,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    maxWidth: '62%',
+    maxWidth: '54%',
   },
   title: {
     fontSize: 30,
@@ -490,12 +543,12 @@ const styles = StyleSheet.create({
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
   },
   toolButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 10,
     backgroundColor: '#EEF3F8',
     alignItems: 'center',
     justifyContent: 'center',
@@ -579,6 +632,20 @@ const styles = StyleSheet.create({
   },
   connectionTextFailed: {
     color: '#A33A2E',
+  },
+  retryButton: {
+    minWidth: 54,
+    height: 30,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#172033',
+    paddingHorizontal: 10,
+  },
+  retryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
   },
   sessionList: {
     paddingBottom: 92,
@@ -677,6 +744,43 @@ const styles = StyleSheet.create({
     color: '#777777',
     textAlign: 'center',
     lineHeight: 20,
+  },
+  emptyActions: {
+    marginTop: 18,
+    flexDirection: 'row',
+    gap: 10,
+  },
+  emptyPrimaryButton: {
+    marginTop: 18,
+    minWidth: 128,
+    height: 44,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#172033',
+    paddingHorizontal: 16,
+  },
+  emptyPrimaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  emptySecondaryButton: {
+    minWidth: 108,
+    height: 44,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E7EDF4',
+    paddingHorizontal: 16,
+  },
+  emptyActionButton: {
+    marginTop: 0,
+  },
+  emptySecondaryButtonText: {
+    color: '#172033',
+    fontSize: 14,
+    fontWeight: '800',
   },
   modalBackdrop: {
     flex: 1,

@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { DEFAULT_SERVER_URL, SERVER_ACCESS_TOKEN_KEY, SERVER_URL_KEY } from '../constants/config'
+import type { ConnectionCheckResult } from '../lib/foregroundConnection'
 
 let baseUrl = DEFAULT_SERVER_URL
 let accessToken = ''
@@ -153,6 +154,11 @@ export const api = {
 }
 
 export async function testConnection(): Promise<boolean> {
+  const result = await checkConnection()
+  return result.ok
+}
+
+export async function checkConnection(): Promise<ConnectionCheckResult> {
   console.log('[connection-test] start', getConnectionSummary())
   try {
     console.log('[connection-test] step 1/2 health')
@@ -161,12 +167,39 @@ export async function testConnection(): Promise<boolean> {
     console.log('[connection-test] step 2/2 sessions')
     await api.get('/api/sessions?limit=1')
     console.log('[connection-test] success')
-    return true
+    return { ok: true }
   } catch (error) {
     console.error('[connection-test] failed', {
       summary: getConnectionSummary(),
       error,
     })
-    return false
+    return classifyConnectionError(error)
   }
+}
+
+function classifyConnectionError(error: unknown): ConnectionCheckResult {
+  if (error instanceof ApiError) {
+    if (error.status === 401 || error.status === 403) {
+      return { ok: false, reason: 'unauthorized', message: error.message }
+    }
+    return { ok: false, reason: 'server-error', message: error.message }
+  }
+
+  if (error instanceof Error) {
+    const message = error.message
+    if (message.toLowerCase().includes('timed out') || error.name === 'AbortError') {
+      return { ok: false, reason: 'timeout', message }
+    }
+    if (
+      message.includes('Network request failed') ||
+      message.includes('Failed to fetch') ||
+      message.includes('ECONNREFUSED') ||
+      message.includes('ENETUNREACH')
+    ) {
+      return { ok: false, reason: 'network', message }
+    }
+    return { ok: false, reason: 'unknown', message }
+  }
+
+  return { ok: false, reason: 'unknown' }
 }

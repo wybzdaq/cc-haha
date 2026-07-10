@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'bun:test'
-import { shouldConnectForAppState, runForegroundConnection } from './foregroundConnection'
+import {
+  chooseDefaultWorkDir,
+  describeConnectionFailure,
+  shouldConnectForAppState,
+  runForegroundConnection,
+} from './foregroundConnection'
 
 describe('foreground desktop connection', () => {
   it('connects on initial active state and when returning from background', () => {
@@ -43,5 +48,32 @@ describe('foreground desktop connection', () => {
 
     expect(result.status).toBe('failed')
     expect(calls).toEqual(['init', 'test'])
+  })
+
+  it('describes common connection failures with next steps', () => {
+    expect(describeConnectionFailure({ ok: false, reason: 'timeout' })).toContain('timed out')
+    expect(describeConnectionFailure({ ok: false, reason: 'unauthorized' })).toContain('Token')
+    expect(describeConnectionFailure({ ok: false, reason: 'network' })).toContain('service is running')
+    expect(describeConnectionFailure({ ok: false, reason: 'server-error' })).toContain('Windows desktop responded')
+  })
+
+  it('uses the newest Windows recent project as the default workdir', () => {
+    expect(chooseDefaultWorkDir({
+      selectedProjectPath: '',
+      recentProjects: [
+        { projectPath: 'D:\\Code\\Recent', modifiedAt: '2026-07-09T10:00:00.000Z', sessionCount: 1 },
+      ],
+      fallbackWorkDir: 'D:\\Code\\Fallback',
+    })).toBe('D:\\Code\\Recent')
+  })
+
+  it('keeps the selected project path ahead of recent projects', () => {
+    expect(chooseDefaultWorkDir({
+      selectedProjectPath: 'D:\\Code\\Selected',
+      recentProjects: [
+        { projectPath: 'D:\\Code\\Recent', modifiedAt: '2026-07-09T10:00:00.000Z', sessionCount: 1 },
+      ],
+      fallbackWorkDir: 'D:\\Code\\Fallback',
+    })).toBe('D:\\Code\\Selected')
   })
 })
