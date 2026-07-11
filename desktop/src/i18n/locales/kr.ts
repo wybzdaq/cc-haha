@@ -1004,6 +1004,7 @@ export const kr: Record<TranslationKey, string> = {
   'settings.general.effort.low': '낮음',
   'settings.general.effort.medium': '보통',
   'settings.general.effort.high': '높음',
+  'settings.general.effort.xhigh': '매우 높음',
   'settings.general.effort.max': '최대',
   'settings.general.thinkingTitle': '사고 모드',
   'settings.general.thinkingDescription': '새 세션을 모델 사고를 사용으로 시작할지 제어합니다. 꺼져 있으면 DeepSeek 같은 호환 공급자에 명시적인 비사고 매개변수가 전달됩니다.',
@@ -1640,6 +1641,7 @@ export const kr: Record<TranslationKey, string> = {
   'permMode.permShell': '임의의 셸 명령 실행',
   'permMode.permPackages': '패키지 설치 또는 제거',
   'permMode.enableBypassBtn': '우회 사용',
+  'permMode.disabledDuringTurn': '세션이 진행 중일 때는 권한을 변경할 수 없습니다',
 
   // Mode labels (compact, for chips)
   'permMode.label.default': '권한 확인',
@@ -1700,6 +1702,8 @@ export const kr: Record<TranslationKey, string> = {
   'session.activity.openTeamMember': '팀 멤버 {name} 열기',
   'session.activity.openRun': '실행 {name} 열기',
   'session.activity.openBackgroundTask': '백그라운드 작업 {name} 열기',
+  'session.activity.stopBackgroundTask': '백그라운드 작업 {name} 중지',
+  'session.activity.stoppingBackgroundTask': '백그라운드 작업 {name} 중지 중',
   'session.activity.details.title': '세부 정보',
   'session.activity.details.type': '유형',
   'session.activity.details.description': '설명',

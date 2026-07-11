@@ -452,6 +452,23 @@ describe('WebSocket background task events', () => {
       },
     ])
   })
+
+  it('keeps AutoDream lifecycle visible without reviving foreground activity', () => {
+    const started = {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'dream-task-1',
+      description: 'dreaming',
+      task_type: 'dream',
+    }
+
+    expect(translateCliMessage(started, 'session-1')).toEqual([{
+      type: 'system_notification',
+      subtype: 'task_started',
+      message: 'dreaming',
+      data: started,
+    }])
+  })
 })
 
 describe('WebSocket goal command events', () => {
@@ -629,6 +646,99 @@ describe('WebSocket goal command events', () => {
 })
 
 describe('WebSocket stream event translation', () => {
+  it('does not replay buffered assistant blocks after their raw stream events', () => {
+    const sessionId = `buffered-assistant-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start' },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'thinking_delta', thinking: 'reasoning' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'text', text: '' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'text_delta', text: 'hello' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 1 },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_stop' },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      message: { content: [{ type: 'thinking', thinking: 'reasoning' }] },
+    }, sessionId)).toEqual([])
+    expect(translateCliMessage({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'hello' }] },
+    }, sessionId)).toEqual([])
+  })
+
+  it('accepts the complete assistant response after a non-streaming fallback', () => {
+    const sessionId = `non-stream-fallback-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start' },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+    }, sessionId)
+
+    translateCliMessage({
+      type: 'system',
+      subtype: 'streaming_fallback',
+      cause: 'watchdog',
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'fallback answer' }] },
+    }, sessionId)).toEqual([
+      { type: 'content_start', blockType: 'text' },
+      { type: 'content_delta', text: 'fallback answer' },
+    ])
+  })
+
   it('keeps subagent parent linkage when later stream events omit the parent id', () => {
     const sessionId = `subagent-parent-${crypto.randomUUID()}`
 
@@ -699,7 +809,7 @@ describe('WebSocket stream event translation', () => {
       type: 'stream_event',
       event: { type: 'message_start' },
     }, sessionId)).toEqual([
-      { type: 'status', state: 'thinking' },
+      { type: 'status', state: 'thinking', attemptStart: true },
     ])
 
     expect(translateCliMessage({
@@ -738,6 +848,73 @@ describe('WebSocket stream event translation', () => {
       },
     }, sessionId)).toEqual([
       { type: 'content_start', blockType: 'text' },
+    ])
+  })
+
+  it('resets partial block accumulation before a safe stream retry', () => {
+    const sessionId = `stream-retry-${crypto.randomUUID()}`
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start' },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'stale-tool', name: 'Write' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"stale":' },
+      },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'system',
+      subtype: 'streaming_fallback',
+      cause: 'stream_retry',
+    }, sessionId)).toEqual([
+      { type: 'streaming_fallback', cause: 'stream_retry' },
+    ])
+
+    translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'message_start' },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'fresh-tool', name: 'Write' },
+      },
+    }, sessionId)
+    translateCliMessage({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"fresh":true}' },
+      },
+    }, sessionId)
+
+    expect(translateCliMessage({
+      type: 'stream_event',
+      event: { type: 'content_block_stop', index: 0 },
+    }, sessionId)).toEqual([
+      {
+        type: 'tool_use_complete',
+        toolName: 'Write',
+        toolUseId: 'fresh-tool',
+        input: { fresh: true },
+        parentToolUseId: undefined,
+      },
     ])
   })
 })

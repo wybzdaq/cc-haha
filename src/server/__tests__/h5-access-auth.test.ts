@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs/promises'
-import { createServer } from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { startServer } from '../index.js'
+import {
+  clearFilesystemAccessRootsForTests,
+  registerFilesystemAccessRoot,
+} from '../services/filesystemAccessRoots.js'
 import { H5AccessService } from '../services/h5AccessService.js'
 import { ProviderService } from '../services/providerService.js'
 
@@ -36,22 +39,6 @@ async function waitForServer(url: string): Promise<void> {
   throw new Error(`Timed out waiting for server at ${url}`)
 }
 
-async function availablePort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const probe = createServer()
-    probe.once('error', reject)
-    probe.listen(0, '0.0.0.0', () => {
-      const address = probe.address()
-      if (!address || typeof address === 'string') {
-        probe.close(() => reject(new Error('Failed to allocate an H5 access test port')))
-        return
-      }
-      const port = address.port
-      probe.close(() => resolve(port))
-    })
-  })
-}
-
 function resolvePrivateLanBaseUrl(port: number): string | null {
   for (const entries of Object.values(os.networkInterfaces())) {
     for (const entry of entries ?? []) {
@@ -79,8 +66,8 @@ async function startRemoteServer(options: { authRequired?: boolean } = {}): Prom
     delete process.env.SERVER_AUTH_REQUIRED
   }
 
-  const port = await availablePort()
-  server = startServer(port, '0.0.0.0')
+  server = startServer(0, '0.0.0.0')
+  const port = server.port
   baseUrl = `http://127.0.0.1:${port}`
   wsBaseUrl = `ws://127.0.0.1:${port}`
   lanBaseUrl = resolvePrivateLanBaseUrl(port) ?? ''
@@ -197,6 +184,8 @@ const settingsSurfaceEndpoints = [
 ] as const
 
 beforeEach(async () => {
+  clearFilesystemAccessRootsForTests()
+  registerFilesystemAccessRoot(process.cwd())
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'h5-access-auth-test-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY
@@ -221,6 +210,7 @@ beforeEach(async () => {
 afterEach(async () => {
   server?.stop(true)
   server = undefined
+  clearFilesystemAccessRootsForTests()
   ProviderService.setServerPort(originalServerPort)
 
   if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR

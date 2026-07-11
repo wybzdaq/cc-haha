@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, FileStack, LoaderCircle, MessageCircle, Settings, Target, XCircle } from 'lucide-react'
 import { ApiError } from '../../api/client'
 import { sessionsApi, type SessionTurnCheckpoint } from '../../api/sessions'
-import { useChatStore } from '../../stores/chatStore'
+import { listPendingPermissions, useChatStore } from '../../stores/chatStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
@@ -1378,9 +1378,8 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
   const agentTaskNotifications = sessionState?.agentTaskNotifications ?? EMPTY_AGENT_TASK_NOTIFICATIONS
   const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(sessionState?.backgroundAgentTasks)
   const activeAskUserQuestionToolUseId =
-    sessionState?.pendingPermission?.toolName === 'AskUserQuestion'
-      ? sessionState.pendingPermission.toolUseId
-      : null
+    listPendingPermissions(sessionState)
+      .find((permission) => permission.toolName === 'AskUserQuestion')?.toolUseId ?? null
   const shouldFollowContentResize =
     streamingText.trim().length > 0 ||
     chatState === 'streaming' ||

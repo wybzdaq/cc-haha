@@ -5,7 +5,7 @@
  * WebSocket 集成测试验证消息从客户端经过服务端到达 CLI 的完整流转。
  */
 
-import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import { describe, it, expect, beforeAll, afterAll, afterEach, spyOn } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
@@ -330,6 +330,19 @@ describe('ConversationService', () => {
       'medium',
       '--thinking',
       'disabled',
+    ])
+  })
+
+  it('should keep OpenAI-native reasoning controls out of Claude CLI args', () => {
+    const svc = new ConversationService()
+    expect((svc as any).getRuntimeArgs({
+      providerId: 'openai-official',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      thinking: 'disabled',
+    })).toEqual([
+      '--model',
+      'gpt-5.6-sol',
     ])
   })
 
@@ -702,11 +715,13 @@ describe('ConversationService', () => {
   it('should prefer the persisted runtime model when provider responses use aliased model names', async () => {
     const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
     const previousNodeEnv = process.env.NODE_ENV
+    const previousAnthropicApiKey = process.env.ANTHROPIC_API_KEY
     const previousModelContextWindows = process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
     const tmpConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-transcript-runtime-model-'))
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workdir-runtime-model-'))
     process.env.CLAUDE_CONFIG_DIR = tmpConfigDir
     process.env.NODE_ENV = 'development'
+    process.env.ANTHROPIC_API_KEY = 'test-api-key'
     delete process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
 
     try {
@@ -775,6 +790,11 @@ describe('ConversationService', () => {
       } else {
         process.env.NODE_ENV = previousNodeEnv
       }
+      if (previousAnthropicApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY
+      } else {
+        process.env.ANTHROPIC_API_KEY = previousAnthropicApiKey
+      }
       if (previousModelContextWindows === undefined) {
         delete process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
       } else {
@@ -788,11 +808,13 @@ describe('ConversationService', () => {
   it('should keep transcript usage context windows tied to runtime metadata order', async () => {
     const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
     const previousNodeEnv = process.env.NODE_ENV
+    const previousAnthropicApiKey = process.env.ANTHROPIC_API_KEY
     const previousModelContextWindows = process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
     const tmpConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-transcript-runtime-switch-'))
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-workdir-runtime-switch-'))
     process.env.CLAUDE_CONFIG_DIR = tmpConfigDir
     process.env.NODE_ENV = 'development'
+    process.env.ANTHROPIC_API_KEY = 'test-api-key'
     delete process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
 
     try {
@@ -879,6 +901,11 @@ describe('ConversationService', () => {
         delete process.env.NODE_ENV
       } else {
         process.env.NODE_ENV = previousNodeEnv
+      }
+      if (previousAnthropicApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY
+      } else {
+        process.env.ANTHROPIC_API_KEY = previousAnthropicApiKey
       }
       if (previousModelContextWindows === undefined) {
         delete process.env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS
@@ -1295,34 +1322,6 @@ describe('WebSocket Chat Integration', () => {
     }
   }
 
-  async function withMockStartupStdoutExit<T>(
-    stdout: string,
-    exitDelayMs: number,
-    callback: () => Promise<T>,
-  ): Promise<T> {
-    const previousStdout = process.env.MOCK_SDK_STARTUP_STDOUT
-    const previousExitDelay = process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS
-
-    process.env.MOCK_SDK_STARTUP_STDOUT = stdout
-    process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS = String(exitDelayMs)
-
-    try {
-      return await callback()
-    } finally {
-      if (previousStdout === undefined) {
-        delete process.env.MOCK_SDK_STARTUP_STDOUT
-      } else {
-        process.env.MOCK_SDK_STARTUP_STDOUT = previousStdout
-      }
-
-      if (previousExitDelay === undefined) {
-        delete process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS
-      } else {
-        process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS = previousExitDelay
-      }
-    }
-  }
-
   async function runTurn(sessionId: string, content: string, allowError = false): Promise<any[]> {
     const messages: any[] = []
     const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
@@ -1411,6 +1410,7 @@ describe('WebSocket Chat Integration', () => {
     throw new Error(`Timed out waiting for ${label}`)
   }
   const originalCliPath = process.env.CLAUDE_CLI_PATH
+  const originalConfigDir = process.env.CLAUDE_CONFIG_DIR
 
   beforeAll(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-conv-'))
@@ -1426,6 +1426,10 @@ describe('WebSocket Chat Integration', () => {
     wsUrl = `ws://127.0.0.1:${server.port}`
   })
 
+  afterEach(async () => {
+    await conversationService.stopAllSessionsAndWait(1_000)
+  })
+
   afterAll(async () => {
     server?.stop(true)
     if (tmpDir) {
@@ -1436,7 +1440,11 @@ describe('WebSocket Chat Integration', () => {
     } else {
       delete process.env.CLAUDE_CLI_PATH
     }
-    delete process.env.CLAUDE_CONFIG_DIR
+    if (originalConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    }
   })
 
   it('should connect and receive connected event', async () => {
@@ -1890,6 +1898,7 @@ describe('WebSocket Chat Integration', () => {
         conversationService.stopSession(sessionId)
       }
       await providerService.activateOfficial()
+      await providerService.deleteProvider(provider.id)
       await fs.writeFile(path.join(tmpDir, 'settings.json'), '{}\n', 'utf-8')
     }
   }, 20_000)
@@ -2350,25 +2359,6 @@ describe('WebSocket Chat Integration', () => {
     expect(error?.message).toContain('activeProviderId:')
     expect(error?.message).toContain('configuredProviders:')
   })
-
-  it('should include CLI stdout diagnostics when startup exits before SDK messages', async () => {
-    const sessionId = `chat-startup-stdout-${crypto.randomUUID()}`
-
-    const messages = await withMockStartupStdoutExit(
-      'provider rejected request: invalid model id',
-      25,
-      () => runTurn(sessionId, 'trigger startup stdout diagnostics', true),
-    )
-    const error = messages.find((msg) => msg.type === 'error')
-
-    expect(error).toMatchObject({
-      code: 'CLI_START_FAILED',
-    })
-    expect(error?.message).toContain(
-      'CLI exited during startup (code 1): provider rejected request: invalid model id',
-    )
-    expect(error?.message).toContain('Desktop service diagnostics:')
-  }, 10_000)
 
   it('should prewarm the CLI before the first user turn and reuse that process', async () => {
     const createRes = await fetch(`${baseUrl}/api/sessions`, {
@@ -4202,8 +4192,11 @@ describe('WebSocket Chat Integration', () => {
         sessionId,
         options: {
           providerId: 'openai-official',
+          model: 'gpt-5.6-sol',
+          effort: 'low',
         },
       })
+      expect(startCalls[0]?.options?.thinking).toBeUndefined()
       expect(messages.some((msg) => msg.type === 'message_complete')).toBe(true)
       await expect(providerService.listProviders()).resolves.toMatchObject({
         activeId: 'openai-official',
@@ -4214,6 +4207,100 @@ describe('WebSocket Chat Integration', () => {
       await providerService.activateOfficial()
     }
   }, 20_000)
+
+  it('should accept xhigh for GPT-5.6 and pass it to the OpenAI runtime', async () => {
+    const providerService = new ProviderService()
+    await providerService.activateProvider('openai-official')
+
+    const createRes = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workDir: process.cwd() }),
+    })
+    const { sessionId } = await createRes.json() as { sessionId: string }
+    const originalStartSession = conversationService.startSession.bind(conversationService)
+    const startCalls: Array<{ options?: { model?: string; effort?: string; providerId?: string | null } }> = []
+    conversationService.startSession = (async function patchedStartSession(
+      sid: string,
+      workDir: string,
+      sdkUrl: string,
+      options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
+    ) {
+      startCalls.push({ options })
+      return originalStartSession(sid, workDir, sdkUrl, options)
+    }) as typeof conversationService.startSession
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+        const timeout = setTimeout(() => {
+          ws.close()
+          reject(new Error('Timed out waiting for GPT-5.6 xhigh runtime turn'))
+        }, 10_000)
+
+        ws.onmessage = (event) => {
+          const message = JSON.parse(event.data as string)
+          if (message.type === 'connected') {
+            ws.send(JSON.stringify({
+              type: 'set_runtime_config',
+              providerId: 'openai-official',
+              modelId: 'gpt-5.6-sol',
+              effortLevel: 'xhigh',
+            }))
+            ws.send(JSON.stringify({ type: 'user_message', content: 'use xhigh' }))
+          } else if (message.type === 'error') {
+            clearTimeout(timeout)
+            ws.close()
+            reject(new Error(message.message))
+          } else if (message.type === 'message_complete') {
+            clearTimeout(timeout)
+            ws.close()
+            resolve()
+          }
+        }
+        ws.onerror = () => reject(new Error('WebSocket failed for GPT-5.6 xhigh runtime'))
+      })
+
+      expect(startCalls[0]?.options).toMatchObject({
+        providerId: 'openai-official',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      })
+    } finally {
+      conversationService.startSession = originalStartSession
+      conversationService.stopSession(sessionId)
+      await providerService.activateOfficial()
+    }
+  }, 20_000)
+
+  it('should reject a reasoning effort that the selected ChatGPT model does not support', async () => {
+    const sessionId = `chat-openai-invalid-effort-${crypto.randomUUID()}`
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+      const timeout = setTimeout(() => {
+        ws.close()
+        reject(new Error('Timed out waiting for invalid OpenAI effort rejection'))
+      }, 5_000)
+
+      ws.onmessage = (event) => {
+        const message = JSON.parse(event.data as string)
+        if (message.type === 'connected') {
+          ws.send(JSON.stringify({
+            type: 'set_runtime_config',
+            providerId: 'openai-official',
+            modelId: 'gpt-5.5',
+            effortLevel: 'max',
+          }))
+        } else if (message.type === 'error') {
+          clearTimeout(timeout)
+          expect(message).toMatchObject({ code: 'RUNTIME_CONFIG_INVALID' })
+          ws.close()
+          resolve()
+        }
+      }
+      ws.onerror = () => reject(new Error('WebSocket failed for invalid OpenAI effort'))
+    })
+  }, 10_000)
 
   it('should resume streaming to a reconnected client during an active turn', async () => {
     await withMockStreamDelay(150, async () => {
@@ -4280,6 +4367,96 @@ describe('WebSocket Chat Integration', () => {
       expect(secondMessages.some((msg) => msg.type === 'connected')).toBe(true)
       expect(secondMessages.some((msg) => msg.type === 'content_delta')).toBe(true)
       expect(secondMessages.some((msg) => msg.type === 'message_complete')).toBe(true)
+    })
+  })
+
+  it('should reconcile an idle turn that completed while the client was disconnected', async () => {
+    await withMockStreamDelay(75, async () => {
+      const sessionId = `chat-reconnect-completed-${crypto.randomUUID()}`
+      const firstMessages: any[] = []
+      const reconnectMessages: any[] = []
+      let firstSocket: WebSocket | null = null
+      let reconnectSocket: WebSocket | null = null
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error(`Timed out waiting for disconnected completion for session ${sessionId}`))
+          }, 10_000)
+
+          const fail = (error: unknown) => {
+            clearTimeout(timeout)
+            reject(error instanceof Error ? error : new Error(String(error)))
+          }
+
+          firstSocket = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+          firstSocket.onmessage = (event) => {
+            const message = JSON.parse(event.data as string)
+            firstMessages.push(message)
+            if (message.type === 'connected') {
+              firstSocket?.send(JSON.stringify({
+                type: 'user_message',
+                content: 'finish while disconnected',
+              }))
+              return
+            }
+            if (message.type !== 'thinking') return
+
+            firstSocket?.close()
+            void (async () => {
+              const deadline = Date.now() + 5_000
+              while (
+                Date.now() < deadline &&
+                !conversationService.getRecentSdkMessages(sessionId).some(
+                  (entry) => entry?.type === 'result',
+                )
+              ) {
+                await new Promise((pollResolve) => setTimeout(pollResolve, 25))
+              }
+              if (!conversationService.getRecentSdkMessages(sessionId).some(
+                (entry) => entry?.type === 'result',
+              )) {
+                fail(new Error(`CLI did not finish while disconnected for session ${sessionId}`))
+                return
+              }
+
+              reconnectSocket = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+              reconnectSocket.onmessage = (reconnectEvent) => {
+                const reconnectMessage = JSON.parse(reconnectEvent.data as string)
+                reconnectMessages.push(reconnectMessage)
+                if (reconnectMessage.type === 'connected') {
+                  reconnectSocket?.send(JSON.stringify({ type: 'sync_state' }))
+                  return
+                }
+                if (
+                  reconnectMessage.type === 'session_state' &&
+                  reconnectMessage.turnState === 'idle'
+                ) {
+                  clearTimeout(timeout)
+                  resolve()
+                }
+              }
+              reconnectSocket.onerror = () => fail(
+                new Error(`Reconnect WebSocket error for session ${sessionId}`),
+              )
+            })().catch(fail)
+          }
+          firstSocket.onerror = () => fail(
+            new Error(`Initial WebSocket error for session ${sessionId}`),
+          )
+        })
+
+        expect(firstMessages.some((message) => message.type === 'thinking')).toBe(true)
+        expect(reconnectMessages).toContainEqual({
+          type: 'session_state',
+          turnState: 'idle',
+        })
+        expect(reconnectMessages.some((message) => message.type === 'message_complete')).toBe(false)
+      } finally {
+        firstSocket?.close()
+        reconnectSocket?.close()
+        conversationService.stopSession(sessionId)
+      }
     })
   })
 

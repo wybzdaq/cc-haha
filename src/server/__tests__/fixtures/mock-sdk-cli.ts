@@ -30,22 +30,12 @@ const streamDelayMs = Number(process.env.MOCK_SDK_STREAM_DELAY_MS || '0')
 const exitAfterOpenMs = Number(process.env.MOCK_SDK_EXIT_AFTER_OPEN_MS || '0')
 const exitAfterFirstUserMs = Number(process.env.MOCK_SDK_EXIT_AFTER_FIRST_USER_MS || '0')
 const mcpStatusDelayMs = Number(process.env.MOCK_SDK_MCP_STATUS_DELAY_MS || '0')
-const startupStdout = process.env.MOCK_SDK_STARTUP_STDOUT || ''
-const exitBeforeSdkMs = Number(process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS || '0')
 let initSent = false
 let firstUserExitScheduled = false
 
 if (!sdkUrl) {
   console.error('Missing --sdk-url')
   process.exit(1)
-}
-
-if (startupStdout) {
-  console.log(startupStdout)
-}
-
-if (exitBeforeSdkMs > 0) {
-  setTimeout(() => process.exit(1), exitBeforeSdkMs)
 }
 
 const ws = new WebSocket(sdkUrl)

@@ -12,7 +12,7 @@ import { DRAFT_RUNTIME_SELECTION_KEY, useSessionRuntimeStore } from '../../store
 import { useSettingsStore } from '../../stores/settingsStore'
 import type { SavedProvider } from '../../types/provider'
 import type { RuntimeSelection } from '../../types/runtime'
-import type { EffortLevel, ModelInfo } from '../../types/settings'
+import type { ModelInfo, ReasoningEffortLevel } from '../../types/settings'
 import { useMobileViewport } from '../../hooks/useMobileViewport'
 import { isDesktopRuntime } from '../../lib/desktopRuntime'
 import { resolveDefaultRuntimeSelection } from '../../lib/runtimeSelection'
@@ -182,10 +182,11 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const requestedProvidersRef = useRef(false)
   const requestedOAuthStatusRef = useRef(false)
 
-  const EFFORT_OPTIONS: { value: EffortLevel; label: string }[] = [
+  const EFFORT_OPTIONS: { value: ReasoningEffortLevel; label: string }[] = [
     { value: 'low', label: t('settings.general.effort.low') },
     { value: 'medium', label: t('settings.general.effort.medium') },
     { value: 'high', label: t('settings.general.effort.high') },
+    { value: 'xhigh', label: t('settings.general.effort.xhigh') },
     { value: 'max', label: t('settings.general.effort.max') },
   ]
 
@@ -344,7 +345,13 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const buttonProviderLabel = isRuntimeScoped
     ? selectedProviderChoice?.providerName ?? activeProviderName ?? t('settings.providers.officialName')
     : null
-  const selectedRuntimeEffort = activeRuntimeSelection?.effortLevel ?? effortLevel
+  const selectedRuntimeEffort = activeRuntimeSelection?.effortLevel
+    ?? selectedRuntimeModel?.defaultReasoningEffort
+    ?? effortLevel
+  const supportedRuntimeEfforts = selectedRuntimeModel?.supportedReasoningEfforts
+  const runtimeEffortOptions = supportedRuntimeEfforts?.length
+    ? EFFORT_OPTIONS.filter((option) => supportedRuntimeEfforts.includes(option.value))
+    : EFFORT_OPTIONS.filter((option) => option.value !== 'xhigh')
 
   const handleRuntimeSelect = (selection: RuntimeSelection) => {
     onRuntimeSelectionChange?.(selection)
@@ -357,7 +364,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
     setOpen(false)
   }
 
-  const handleRuntimeEffortSelect = (level: EffortLevel) => {
+  const handleRuntimeEffortSelect = (level: ReasoningEffortLevel) => {
     if (!activeRuntimeSelection) return
     handleRuntimeSelect({
       ...activeRuntimeSelection,
@@ -397,11 +404,20 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                     return (
                       <button
                         key={`${choice.providerId ?? 'official'}:${model.id}`}
-                        onClick={() => handleRuntimeSelect({
-                          providerId: choice.providerId,
-                          modelId: model.id,
-                          effortLevel: selectedRuntimeEffort,
-                        })}
+                        onClick={() => {
+                          const supportedEfforts = model.supportedReasoningEfforts
+                          const explicitEffort = activeRuntimeSelection?.effortLevel
+                          const nextEffort = supportedEfforts?.length
+                            ? explicitEffort && supportedEfforts.includes(explicitEffort)
+                              ? explicitEffort
+                              : model.defaultReasoningEffort ?? supportedEfforts[0]
+                            : explicitEffort ?? effortLevel
+                          handleRuntimeSelect({
+                            providerId: choice.providerId,
+                            modelId: model.id,
+                            ...(nextEffort ? { effortLevel: nextEffort } : {}),
+                          })
+                        }}
                         className={`
                           w-full rounded-lg border px-3 text-left transition-colors
                           ${isMobileBrowser ? 'min-h-[56px] py-3' : 'py-2.5'}
@@ -492,8 +508,8 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
           <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-[var(--color-outline)]">
             {t('model.effort')}
           </div>
-          <div className="grid grid-cols-4 gap-1.5">
-            {EFFORT_OPTIONS.map((opt) => {
+          <div className={`grid gap-1.5 ${runtimeEffortOptions.length === 5 ? 'grid-cols-5' : 'grid-cols-4'}`}>
+            {runtimeEffortOptions.map((opt) => {
               const isSelected = opt.value === selectedRuntimeEffort
               return (
                 <button

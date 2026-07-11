@@ -72,14 +72,14 @@ describe('desktop persistence migrations', () => {
     window.localStorage.setItem('unrelated-user-key', 'keep')
     window.localStorage.setItem('cc-haha-session-runtime', JSON.stringify({
       good: { providerId: null, modelId: 'claude-sonnet' },
-      alsoGood: { providerId: 'provider-1', modelId: 'gpt-5.4' },
+      alsoGood: { providerId: 'openai-official', modelId: 'gpt-5.6-sol', effortLevel: 'xhigh' },
       bad: { providerId: 'provider-2' },
     }))
 
     runDesktopPersistenceMigrations()
 
     expect(JSON.parse(window.localStorage.getItem('cc-haha-session-runtime') || '{}')).toEqual({
-      alsoGood: { providerId: 'provider-1', modelId: 'gpt-5.4' },
+      alsoGood: { providerId: 'openai-official', modelId: 'gpt-5.6-sol', effortLevel: 'xhigh' },
       good: { providerId: null, modelId: 'claude-sonnet' },
     })
     expect(window.localStorage.getItem('unrelated-user-key')).toBe('keep')

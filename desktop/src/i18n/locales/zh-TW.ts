@@ -1004,6 +1004,7 @@ export const zh: Record<TranslationKey, string> = {
   'settings.general.effort.low': '低',
   'settings.general.effort.medium': '中',
   'settings.general.effort.high': '高',
+  'settings.general.effort.xhigh': '極高',
   'settings.general.effort.max': '最大',
   'settings.general.thinkingTitle': '思考模式',
   'settings.general.thinkingDescription': '控制新會話是否啟用模型思考。關閉後，DeepSeek 等相容供應商會收到顯式非思考模式引數。',
@@ -1640,6 +1641,7 @@ export const zh: Record<TranslationKey, string> = {
   'permMode.permShell': '執行任意 Shell 命令',
   'permMode.permPackages': '安裝或移除軟體包',
   'permMode.enableBypassBtn': '啟用跳過',
+  'permMode.disabledDuringTurn': '工作階段進行中，無法切換權限',
 
   // Mode labels (compact, for chips)
   'permMode.label.default': '詢問許可權',
@@ -1700,6 +1702,8 @@ export const zh: Record<TranslationKey, string> = {
   'session.activity.openTeamMember': '開啟團隊成員 {name}',
   'session.activity.openRun': '開啟執行 {name}',
   'session.activity.openBackgroundTask': '開啟後台任務 {name}',
+  'session.activity.stopBackgroundTask': '停止後台任務 {name}',
+  'session.activity.stoppingBackgroundTask': '正在停止後台任務 {name}',
   'session.activity.details.title': '詳情',
   'session.activity.details.type': '類型',
   'session.activity.details.description': '描述',

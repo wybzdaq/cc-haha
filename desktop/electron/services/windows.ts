@@ -129,6 +129,9 @@ export function writeWindowState(
 }
 
 export function captureWindowState(window: BrowserWindow): StoredWindowState | null {
+  // quitAndInstall/quit can emit late move/resize/close events on an already
+  // torn-down native window; touching it then throws "Object has been destroyed".
+  if (window.isDestroyed()) return null
   if (window.isMinimized()) return null
   const bounds = window.getBounds()
   const state = {

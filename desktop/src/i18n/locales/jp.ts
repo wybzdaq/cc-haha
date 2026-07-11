@@ -1004,6 +1004,7 @@ export const jp: Record<TranslationKey, string> = {
   'settings.general.effort.low': '低',
   'settings.general.effort.medium': '中',
   'settings.general.effort.high': '高',
+  'settings.general.effort.xhigh': '最高',
   'settings.general.effort.max': '最大',
   'settings.general.thinkingTitle': '思考モード',
   'settings.general.thinkingDescription': '新しいセッションをモデルの思考を有効にして開始するかどうかを制御します。オフの場合、DeepSeek などの対応プロバイダーには明示的に非思考パラメーターが渡されます。',
@@ -1640,6 +1641,7 @@ export const jp: Record<TranslationKey, string> = {
   'permMode.permShell': '任意のシェルコマンドの実行',
   'permMode.permPackages': 'パッケージのインストールまたは削除',
   'permMode.enableBypassBtn': 'バイパスを有効化',
+  'permMode.disabledDuringTurn': 'セッションの実行中は権限を切り替えられません',
 
   // Mode labels (compact, for chips)
   'permMode.label.default': '権限を確認',
@@ -1700,6 +1702,8 @@ export const jp: Record<TranslationKey, string> = {
   'session.activity.openTeamMember': 'チームメンバー {name} を開く',
   'session.activity.openRun': '実行 {name} を開く',
   'session.activity.openBackgroundTask': 'バックグラウンドタスク {name} を開く',
+  'session.activity.stopBackgroundTask': 'バックグラウンドタスク {name} を停止',
+  'session.activity.stoppingBackgroundTask': 'バックグラウンドタスク {name} を停止中',
   'session.activity.details.title': '詳細',
   'session.activity.details.type': '種類',
   'session.activity.details.description': '説明',

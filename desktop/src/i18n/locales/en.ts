@@ -1002,6 +1002,7 @@ export const en = {
   'settings.general.effort.low': 'Low',
   'settings.general.effort.medium': 'Medium',
   'settings.general.effort.high': 'High',
+  'settings.general.effort.xhigh': 'X-High',
   'settings.general.effort.max': 'Max',
   'settings.general.thinkingTitle': 'Thinking Mode',
   'settings.general.thinkingDescription': 'Controls whether new sessions start with model thinking enabled. When off, compatible providers such as DeepSeek receive an explicit non-thinking parameter.',
@@ -1638,6 +1639,7 @@ export const en = {
   'permMode.permShell': 'Execute arbitrary shell commands',
   'permMode.permPackages': 'Install or remove packages',
   'permMode.enableBypassBtn': 'Enable bypass',
+  'permMode.disabledDuringTurn': 'Cannot switch permissions while session is active',
 
   // Mode labels (compact, for chips)
   'permMode.label.default': 'Ask permissions',
@@ -1698,6 +1700,8 @@ export const en = {
   'session.activity.openTeamMember': 'Open team member {name}',
   'session.activity.openRun': 'Open run {name}',
   'session.activity.openBackgroundTask': 'Open background task {name}',
+  'session.activity.stopBackgroundTask': 'Stop background task {name}',
+  'session.activity.stoppingBackgroundTask': 'Stopping background task {name}',
   'session.activity.details.title': 'Details',
   'session.activity.details.type': 'Type',
   'session.activity.details.description': 'Description',

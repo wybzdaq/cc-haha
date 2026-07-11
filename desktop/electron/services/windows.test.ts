@@ -124,9 +124,24 @@ describe('Electron window service', () => {
 
   it('does not capture minimized windows', () => {
     const window = {
+      isDestroyed: () => false,
       isMinimized: () => true,
       isMaximized: () => false,
       getBounds: () => ({ x: 0, y: 0, width: 1280, height: 820 }),
+    }
+
+    expect(captureWindowState(window as never)).toBeNull()
+  })
+
+  it('does not capture destroyed windows', () => {
+    const destroyedAccess = () => {
+      throw new TypeError('Object has been destroyed')
+    }
+    const window = {
+      isDestroyed: () => true,
+      isMinimized: destroyedAccess,
+      isMaximized: destroyedAccess,
+      getBounds: destroyedAccess,
     }
 
     expect(captureWindowState(window as never)).toBeNull()
@@ -260,6 +275,7 @@ describe('Electron window service', () => {
         hide: vi.fn(),
         isSimpleFullScreen: () => false,
         isFullScreen: () => false,
+        isDestroyed: () => false,
         isMinimized: () => false,
         isMaximized: () => false,
         getBounds: () => ({ x: 0, y: 0, width: 1280, height: 820 }),
@@ -398,6 +414,7 @@ describe('Electron window service', () => {
           handlers.set(event, handler)
         }),
         hide: vi.fn(),
+        isDestroyed: () => false,
         isMinimized: () => false,
         isMaximized: () => false,
         getBounds: () => ({ x: 0, y: 0, width: 1280, height: 820 }),
@@ -412,6 +429,46 @@ describe('Electron window service', () => {
       handlers.get('close')?.({ preventDefault } as never)
       expect(preventDefault).not.toHaveBeenCalled()
       expect(window.hide).not.toHaveBeenCalled()
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores late move and resize events after the window is destroyed during quit-and-install', () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'electron-window-destroyed-events-'))
+    try {
+      const handlers = new Map<string, (...args: never[]) => void>()
+      let destroyed = false
+      const destroyedAccess = () => {
+        if (destroyed) throw new TypeError('Object has been destroyed')
+        return false
+      }
+      const app = fakeApp(tmp)
+      const window = {
+        on: vi.fn((event: string, handler: (...args: never[]) => void) => {
+          handlers.set(event, handler)
+        }),
+        hide: vi.fn(),
+        isDestroyed: () => destroyed,
+        isMinimized: destroyedAccess,
+        isMaximized: destroyedAccess,
+        getBounds: () => {
+          if (destroyed) throw new TypeError('Object has been destroyed')
+          return { x: 0, y: 0, width: 1280, height: 820 }
+        },
+      }
+
+      installWindowLifecycle({
+        app: app as never,
+        window: window as never,
+        shouldQuit: () => true,
+      })
+
+      destroyed = true
+
+      expect(() => handlers.get('move')?.()).not.toThrow()
+      expect(() => handlers.get('resize')?.()).not.toThrow()
+      expect(() => handlers.get('close')?.({ preventDefault: vi.fn() } as never)).not.toThrow()
     } finally {
       rmSync(tmp, { recursive: true, force: true })
     }
