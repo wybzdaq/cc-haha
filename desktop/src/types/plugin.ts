@@ -78,6 +78,36 @@ export type PluginMarketplaceSummary = {
   installedCount: number
 }
 
+export type PluginMarketEntry = {
+  id: string
+  name: string
+  marketplace: string
+  description?: string
+  version?: string
+  authorName?: string
+  homepage?: string
+  repository?: string
+  category?: string
+  tags: string[]
+  source: string
+  installed: boolean
+  enabled: boolean
+  blocked: boolean
+  installCount?: number
+}
+
+export type PluginMarketListResponse = {
+  plugins: PluginMarketEntry[]
+  marketplaces: PluginMarketplaceSummary[]
+  failures: Array<{ name: string; error: string }>
+  summary: {
+    total: number
+    installed: number
+    blocked: number
+    marketplaceCount: number
+  }
+}
+
 export type PluginListResponse = {
   plugins: PluginSummary[]
   marketplaces: PluginMarketplaceSummary[]

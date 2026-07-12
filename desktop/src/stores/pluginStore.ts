@@ -3,6 +3,8 @@ import { pluginsApi } from '../api/plugins'
 import type {
   PluginDetail,
   PluginListResponse,
+  PluginMarketEntry,
+  PluginMarketListResponse,
   PluginReloadSummary,
   PluginScope,
   PluginSummary,
@@ -12,15 +14,22 @@ type PluginStore = {
   plugins: PluginSummary[]
   marketplaces: PluginListResponse['marketplaces']
   summary: PluginListResponse['summary'] | null
+  marketPlugins: PluginMarketEntry[]
+  marketSummary: PluginMarketListResponse['summary'] | null
+  marketFailures: PluginMarketListResponse['failures']
   selectedPlugin: PluginDetail | null
   lastReloadSummary: PluginReloadSummary | null
   isLoading: boolean
+  isMarketLoading: boolean
   isDetailLoading: boolean
   isApplying: boolean
   error: string | null
+  marketError: string | null
   fetchPlugins: (cwd?: string) => Promise<void>
+  fetchPluginMarket: (cwd?: string) => Promise<void>
   fetchPluginDetail: (id: string, cwd?: string) => Promise<void>
   reloadPlugins: (cwd?: string, sessionId?: string) => Promise<PluginReloadSummary>
+  installPlugin: (id: string, scope?: PluginScope, cwd?: string, sessionId?: string) => Promise<string>
   enablePlugin: (id: string, scope?: PluginScope, cwd?: string, sessionId?: string) => Promise<string>
   disablePlugin: (id: string, scope?: PluginScope, cwd?: string, sessionId?: string) => Promise<string>
   bulkEnablePlugins: (plugins: PluginActionTarget[], cwd?: string, sessionId?: string) => Promise<number>
@@ -39,12 +48,17 @@ export const usePluginStore = create<PluginStore>((set, get) => ({
   plugins: [],
   marketplaces: [],
   summary: null,
+  marketPlugins: [],
+  marketSummary: null,
+  marketFailures: [],
   selectedPlugin: null,
   lastReloadSummary: null,
   isLoading: false,
+  isMarketLoading: false,
   isDetailLoading: false,
   isApplying: false,
   error: null,
+  marketError: null,
 
   fetchPlugins: async (cwd) => {
     set({ isLoading: true, error: null })
@@ -60,6 +74,24 @@ export const usePluginStore = create<PluginStore>((set, get) => ({
       set({
         isLoading: false,
         error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  },
+
+  fetchPluginMarket: async (cwd) => {
+    set({ isMarketLoading: true, marketError: null })
+    try {
+      const data = await pluginsApi.market(cwd)
+      set({
+        marketPlugins: data.plugins,
+        marketSummary: data.summary,
+        marketFailures: data.failures,
+        isMarketLoading: false,
+      })
+    } catch (err) {
+      set({
+        isMarketLoading: false,
+        marketError: err instanceof Error ? err.message : String(err),
       })
     }
   },
@@ -93,6 +125,18 @@ export const usePluginStore = create<PluginStore>((set, get) => ({
       set({ isApplying: false, error: message })
       throw err
     }
+  },
+
+  installPlugin: async (id, scope, cwd, sessionId) => {
+    return runAction(
+      () => pluginsApi.install({ id, scope }),
+      set,
+      get,
+      cwd,
+      sessionId,
+      false,
+      true,
+    )
   },
 
   enablePlugin: async (id, scope, cwd, sessionId) => {
@@ -168,12 +212,16 @@ async function runAction(
   cwd?: string,
   sessionId?: string,
   clearSelection = false,
+  refreshMarket = false,
 ): Promise<string> {
   set({ isApplying: true, error: null })
   try {
     const { message } = await action()
     const { summary } = await pluginsApi.reload(cwd, sessionId)
     await get().fetchPlugins(cwd)
+    if (refreshMarket) {
+      await get().fetchPluginMarket(cwd)
+    }
     const selected = get().selectedPlugin
     if (clearSelection) {
       set({ selectedPlugin: null })

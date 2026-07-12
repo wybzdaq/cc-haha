@@ -2,6 +2,7 @@ import { api } from './client'
 import type {
   PluginDetail,
   PluginListResponse,
+  PluginMarketListResponse,
   PluginReloadSummary,
   PluginSessionReloadSummary,
   PluginScope,
@@ -19,6 +20,11 @@ export const pluginsApi = {
     return api.get<PluginListResponse>(`/api/plugins${query}`)
   },
 
+  market: (cwd?: string) => {
+    const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : ''
+    return api.get<PluginMarketListResponse>(`/api/plugins/market${query}`, { timeout: 120_000 })
+  },
+
   detail: (id: string, cwd?: string) => {
     const query = new URLSearchParams({ id })
     if (cwd) query.set('cwd', cwd)
@@ -27,6 +33,13 @@ export const pluginsApi = {
 
   enable: (payload: PluginActionPayload) =>
     api.post<{ ok: true; message: string }>('/api/plugins/enable', payload),
+
+  install: (payload: PluginActionPayload) =>
+    api.post<{ ok: true; message: string }>(
+      '/api/plugins/install',
+      payload,
+      { timeout: 120_000 },
+    ),
 
   disable: (payload: PluginActionPayload) =>
     api.post<{ ok: true; message: string }>('/api/plugins/disable', payload),

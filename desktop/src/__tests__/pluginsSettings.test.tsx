@@ -157,15 +157,21 @@ describe('Settings > Plugins tab', () => {
     })
     usePluginStore.setState({
       plugins: [],
+      marketPlugins: [],
+      marketSummary: { total: 0, installed: 0, blocked: 0, marketplaceCount: 0 },
+      marketFailures: [],
       marketplaces: [],
       summary: { total: 0, enabled: 0, errorCount: 0, marketplaceCount: 0 },
       selectedPlugin: null,
       lastReloadSummary: null,
       isLoading: false,
+      isMarketLoading: false,
       isDetailLoading: false,
       isApplying: false,
       error: null,
+      marketError: null,
       fetchPlugins: noop,
+      fetchPluginMarket: noop,
       fetchPluginDetail: noop,
       reloadPlugins: vi.fn().mockResolvedValue({
         enabled: 1,
@@ -177,6 +183,7 @@ describe('Settings > Plugins tab', () => {
         lspServers: 0,
         errors: 0,
       }),
+      installPlugin: vi.fn().mockResolvedValue('installed'),
       enablePlugin: vi.fn().mockResolvedValue('enabled'),
       disablePlugin: vi.fn().mockResolvedValue('disabled'),
       bulkEnablePlugins: vi.fn().mockResolvedValue(0),
@@ -251,6 +258,101 @@ describe('Settings > Plugins tab', () => {
     expect(screen.getByText('github')).toBeInTheDocument()
     expect(screen.getByText('Python language tooling')).toBeInTheDocument()
     expect(screen.getByText('Known marketplaces')).toBeInTheDocument()
+  })
+
+  it('renders plugin market entries and installs a selected plugin', async () => {
+    const installPlugin = vi.fn().mockResolvedValue('Successfully installed plugin: playwright@claude-plugins-official')
+    usePluginStore.setState({
+      marketPlugins: [
+        {
+          id: 'playwright@claude-plugins-official',
+          name: 'playwright',
+          marketplace: 'claude-plugins-official',
+          description: 'Browser automation for agent smoke tests',
+          category: 'Browser automation',
+          tags: ['browser', 'testing'],
+          source: 'anthropics/claude-plugins-official',
+          installed: false,
+          enabled: false,
+          blocked: false,
+          installCount: 1200,
+        },
+        {
+          id: 'github@claude-plugins-official',
+          name: 'github',
+          marketplace: 'claude-plugins-official',
+          description: 'GitHub issue and pull request tools',
+          category: 'Code collaboration',
+          tags: ['github'],
+          source: 'anthropics/claude-plugins-official',
+          installed: true,
+          enabled: true,
+          blocked: false,
+          installCount: 2500,
+        },
+      ],
+      marketSummary: { total: 2, installed: 1, blocked: 0, marketplaceCount: 1 },
+      installPlugin,
+    })
+
+    render(<Settings />)
+    switchToPluginsTab()
+
+    expect(screen.getByText('Discover AI agent plugins')).toBeInTheDocument()
+    expect(screen.getByText('Browser automation for agent smoke tests')).toBeInTheDocument()
+    expect(screen.getByText('2.5K installs')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Install' }))
+
+    await waitFor(() => {
+      expect(installPlugin).toHaveBeenCalledWith(
+        'playwright@claude-plugins-official',
+        'user',
+        '/workspace/project',
+        'session-1',
+      )
+    })
+  })
+
+  it('shows Chinese plugin market descriptions when the UI locale is Chinese', () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    useUIStore.setState({ activeSettingsTab: 'plugins', pendingSettingsTab: null })
+    usePluginStore.setState({
+      marketPlugins: [
+        {
+          id: 'frontend-design@claude-plugins-official',
+          name: 'frontend-design',
+          marketplace: 'claude-plugins-official',
+          description: 'Design polished frontend interfaces',
+          category: 'AI agent plugins',
+          tags: ['agent', 'frontend'],
+          source: 'anthropics/claude-plugins-official',
+          installed: false,
+          enabled: false,
+          blocked: false,
+          installCount: 800,
+        },
+        {
+          id: 'playwright@claude-plugins-official',
+          name: 'playwright',
+          marketplace: 'claude-plugins-official',
+          description: 'Browser automation for agent smoke tests',
+          category: 'Browser automation',
+          tags: ['browser', 'testing'],
+          source: 'anthropics/claude-plugins-official',
+          installed: false,
+          enabled: false,
+          blocked: false,
+          installCount: 1200,
+        },
+      ],
+      marketSummary: { total: 2, installed: 0, blocked: 0, marketplaceCount: 1 },
+    })
+
+    render(<Settings />)
+
+    expect(screen.getByText('前端设计增强插件，帮助 Agent 按产品场景设计更完整、更好看的界面和组件。')).toBeInTheDocument()
+    expect(screen.getByText('浏览器自动化')).toBeInTheDocument()
   })
 
   it('bulk enables selected disabled plugins from the list after confirmation', async () => {
