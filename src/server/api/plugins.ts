@@ -31,6 +31,10 @@ export async function handlePluginsApi(
       return Response.json(await pluginService.listPlugins(cwd))
     }
 
+    if (method === 'GET' && sub === 'market') {
+      return Response.json(await pluginService.listMarketplacePlugins(cwd))
+    }
+
     if (method === 'GET' && sub === 'detail') {
       const pluginId = url.searchParams.get('id')
       if (!pluginId) {
@@ -64,6 +68,11 @@ export async function handlePluginsApi(
       const scope = coerceScope(body.scope)
 
       switch (sub) {
+        case 'install':
+          if (scope === 'managed') {
+            throw ApiError.badRequest('Plugin install does not support managed scope')
+          }
+          return Response.json(await pluginService.installPlugin(pluginId, scope))
         case 'enable':
           return Response.json(await pluginService.enablePlugin(pluginId, scope))
         case 'disable':

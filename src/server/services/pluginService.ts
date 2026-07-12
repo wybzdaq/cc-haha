@@ -2,6 +2,7 @@ import { basename, join, sep } from 'node:path'
 import { getBuiltinPluginDefinition } from '../../plugins/builtinPlugins.js'
 import type { McpServerConfig } from '../../services/mcp/types.js'
 import {
+  installPluginOp,
   disablePluginOp,
   enablePluginOp,
   type InstallableScope,
@@ -13,12 +14,21 @@ import type { LoadedPlugin, PluginError } from '../../types/plugin.js'
 import { getPluginErrorMessage } from '../../types/plugin.js'
 import { clearAllCaches } from '../../utils/plugins/cacheUtils.js'
 import {
+  createPluginId,
   getMarketplaceSourceDisplay,
+  loadMarketplacesWithGracefulDegradation,
 } from '../../utils/plugins/marketplaceHelpers.js'
 import { loadInstalledPluginsV2 } from '../../utils/plugins/installedPluginsManager.js'
 import {
+  addMarketplaceSource,
   loadKnownMarketplacesConfig,
 } from '../../utils/plugins/marketplaceManager.js'
+import { getInstallCounts } from '../../utils/plugins/installCounts.js'
+import { isPluginBlockedByPolicy } from '../../utils/plugins/pluginPolicy.js'
+import {
+  OFFICIAL_MARKETPLACE_NAME,
+  OFFICIAL_MARKETPLACE_SOURCE,
+} from '../../utils/plugins/officialMarketplace.js'
 import { loadPluginLspServers } from '../../utils/plugins/lspPluginIntegration.js'
 import { loadPluginMcpServers } from '../../utils/plugins/mcpPluginIntegration.js'
 import { parsePluginIdentifier } from '../../utils/plugins/pluginIdentifier.js'
@@ -112,6 +122,36 @@ export type ApiPluginMarketplaceSummary = {
   installedCount: number
 }
 
+export type ApiPluginMarketEntry = {
+  id: string
+  name: string
+  marketplace: string
+  description?: string
+  version?: string
+  authorName?: string
+  homepage?: string
+  repository?: string
+  category?: string
+  tags: string[]
+  source: string
+  installed: boolean
+  enabled: boolean
+  blocked: boolean
+  installCount?: number
+}
+
+export type ApiPluginMarketListResponse = {
+  plugins: ApiPluginMarketEntry[]
+  marketplaces: ApiPluginMarketplaceSummary[]
+  failures: Array<{ name: string; error: string }>
+  summary: {
+    total: number
+    installed: number
+    blocked: number
+    marketplaceCount: number
+  }
+}
+
 export type ApiPluginListResponse = {
   plugins: ApiPluginSummary[]
   marketplaces: ApiPluginMarketplaceSummary[]
@@ -175,6 +215,85 @@ export class PluginService {
     }
 
     return detail
+  }
+
+  async listMarketplacePlugins(cwd?: string): Promise<ApiPluginMarketListResponse> {
+    let marketplaceConfig = await loadKnownMarketplacesConfig()
+    if (!marketplaceConfig[OFFICIAL_MARKETPLACE_NAME]) {
+      try {
+        await addMarketplaceSource(OFFICIAL_MARKETPLACE_SOURCE)
+        marketplaceConfig = await loadKnownMarketplacesConfig()
+      } catch {
+        // Keep discovery best-effort. The response will still include any
+        // marketplaces that were already configured and loadable.
+      }
+    }
+
+    const [{ plugins: installedPlugins, marketplaces }, loadedMarketplaces, installCounts] = await Promise.all([
+      this.collectPluginState(cwd),
+      loadMarketplacesWithGracefulDegradation(marketplaceConfig),
+      getInstallCounts(),
+    ])
+
+    const installedById = new Map(installedPlugins.map((plugin) => [plugin.id, plugin]))
+    const entries: ApiPluginMarketEntry[] = []
+
+    for (const { name: marketplaceName, config, data } of loadedMarketplaces.marketplaces) {
+      if (!data) continue
+      const source = getMarketplaceSourceDisplay(config.source)
+      for (const entry of data.plugins) {
+        const id = createPluginId(entry.name, marketplaceName)
+        const installed = installedById.get(id)
+        entries.push({
+          id,
+          name: entry.name,
+          marketplace: marketplaceName,
+          description: entry.description,
+          version: entry.version,
+          authorName: entry.author?.name,
+          homepage: entry.homepage,
+          repository: entry.repository,
+          category: entry.category,
+          tags: [...(entry.tags ?? entry.keywords ?? [])],
+          source,
+          installed: Boolean(installed),
+          enabled: installed?.enabled ?? false,
+          blocked: isPluginBlockedByPolicy(id),
+          installCount: installCounts?.get(id),
+        })
+      }
+    }
+
+    entries.sort((a, b) => {
+      if (a.installed !== b.installed) return a.installed ? -1 : 1
+      const countDelta = (b.installCount ?? -1) - (a.installCount ?? -1)
+      if (countDelta !== 0) return countDelta
+      if (a.marketplace !== b.marketplace) return a.marketplace.localeCompare(b.marketplace)
+      return a.name.localeCompare(b.name)
+    })
+
+    return {
+      plugins: entries,
+      marketplaces,
+      failures: loadedMarketplaces.failures,
+      summary: {
+        total: entries.length,
+        installed: entries.filter((plugin) => plugin.installed).length,
+        blocked: entries.filter((plugin) => plugin.blocked).length,
+        marketplaceCount: marketplaces.length,
+      },
+    }
+  }
+
+  async installPlugin(
+    pluginId: string,
+    scope?: InstallableScope,
+  ): Promise<ApiPluginActionResponse> {
+    const result = await installPluginOp(pluginId, scope)
+    if (!result.success) {
+      throw ApiError.badRequest(result.message)
+    }
+    return { ok: true, message: result.message }
   }
 
   async enablePlugin(
@@ -318,7 +437,7 @@ export class PluginService {
       this.toSummary(detail),
     )
 
-    const marketplaces = Object.entries(marketplaceConfig.marketplaces ?? {})
+    const marketplaces = Object.entries(marketplaceConfig)
       .map(([name, entry]) => ({
         name,
         source: getMarketplaceSourceDisplay(entry.source),

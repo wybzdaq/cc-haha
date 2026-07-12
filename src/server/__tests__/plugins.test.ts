@@ -82,6 +82,143 @@ describe('Plugins API', () => {
     expect(body.summary.errorCount).toBe(0)
   })
 
+  it('GET /api/plugins/market lists configured marketplace plugins with local install state', async () => {
+    const marketplaceRoot = path.join(tmpDir, 'marketplace-root')
+    const pluginRoot = path.join(marketplaceRoot, 'plugins', 'playwright')
+    const pluginsDir = path.join(tmpDir, 'plugins')
+    const marketplaceFile = path.join(marketplaceRoot, '.claude-plugin', 'marketplace.json')
+
+    await fs.mkdir(path.join(pluginRoot, '.claude-plugin'), { recursive: true })
+    await fs.mkdir(path.dirname(marketplaceFile), { recursive: true })
+    await fs.mkdir(pluginsDir, { recursive: true })
+    await fs.writeFile(
+      path.join(pluginRoot, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({
+        name: 'playwright',
+        version: '1.0.0',
+        description: 'Browser automation for agent smoke tests',
+        author: { name: 'Test Author' },
+        keywords: ['browser', 'testing'],
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      marketplaceFile,
+      JSON.stringify({
+        name: 'test-market',
+        owner: { name: 'Test' },
+        plugins: [
+          {
+            name: 'playwright',
+            source: './plugins/playwright',
+            version: '1.0.0',
+            description: 'Browser automation for agent smoke tests',
+            category: 'Browser automation',
+            tags: ['browser'],
+          },
+        ],
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        'test-market': {
+          source: { source: 'directory', path: marketplaceRoot },
+          installLocation: marketplaceRoot,
+          lastUpdated: new Date(0).toISOString(),
+        },
+      }),
+      'utf-8',
+    )
+
+    const { req, url, segments } = makeRequest('GET', '/api/plugins/market')
+    const res = await handlePluginsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      plugins: Array<{
+        id: string
+        name: string
+        marketplace: string
+        installed: boolean
+        category?: string
+        tags: string[]
+      }>
+      summary: { total: number; installed: number; marketplaceCount: number }
+    }
+
+    expect(body.plugins).toContainEqual(expect.objectContaining({
+      id: 'playwright@test-market',
+      name: 'playwright',
+      marketplace: 'test-market',
+      installed: false,
+      category: 'Browser automation',
+      tags: ['browser'],
+    }))
+    expect(body.summary.total).toBe(1)
+    expect(body.summary.installed).toBe(0)
+    expect(body.summary.marketplaceCount).toBe(1)
+  })
+
+  it('POST /api/plugins/install installs a marketplace plugin', async () => {
+    const marketplaceRoot = path.join(tmpDir, 'marketplace-root')
+    const pluginRoot = path.join(marketplaceRoot, 'plugins', 'demo')
+    const pluginsDir = path.join(tmpDir, 'plugins')
+    const marketplaceFile = path.join(marketplaceRoot, '.claude-plugin', 'marketplace.json')
+
+    await fs.mkdir(path.join(pluginRoot, '.claude-plugin'), { recursive: true })
+    await fs.mkdir(path.dirname(marketplaceFile), { recursive: true })
+    await fs.mkdir(pluginsDir, { recursive: true })
+    await fs.writeFile(
+      path.join(pluginRoot, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({
+        name: 'demo',
+        version: '1.0.0',
+        description: 'Demo plugin',
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      marketplaceFile,
+      JSON.stringify({
+        name: 'test-market',
+        owner: { name: 'Test' },
+        plugins: [
+          {
+            name: 'demo',
+            source: './plugins/demo',
+            version: '1.0.0',
+          },
+        ],
+      }),
+      'utf-8',
+    )
+    await fs.writeFile(
+      path.join(pluginsDir, 'known_marketplaces.json'),
+      JSON.stringify({
+        'test-market': {
+          source: { source: 'directory', path: marketplaceRoot },
+          installLocation: marketplaceRoot,
+          lastUpdated: new Date(0).toISOString(),
+        },
+      }),
+      'utf-8',
+    )
+
+    const { req, url, segments } = makeRequest(
+      'POST',
+      '/api/plugins/install',
+      { id: 'demo@test-market', scope: 'user' },
+    )
+    const res = await handlePluginsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json() as { ok: boolean; message: string }
+    expect(body.ok).toBe(true)
+    expect(body.message).toContain('Successfully installed plugin: demo@test-market')
+  })
+
   it('treats enabledPlugins version constraint arrays as enabled plugins', async () => {
     const marketplaceRoot = path.join(tmpDir, 'marketplace-root')
     const pluginRoot = path.join(marketplaceRoot, 'plugins', 'demo')
