@@ -23,7 +23,9 @@ import {
   readLastServerPort,
   reserveLocalPort,
   reserveServerPort,
+  resolveBundledRipgrepExecutable,
   resolveHostTriple,
+  RIPGREP_PATH_ENV,
   SERVER_STATE_FILE,
   spawnSidecar,
   waitForServer,
@@ -77,6 +79,7 @@ describe('Electron sidecar manager', () => {
     expect(resolveHostTriple('darwin', 'x64')).toBe('x86_64-apple-darwin')
     expect(resolveHostTriple('win32', 'x64')).toBe('x86_64-pc-windows-msvc')
     expect(resolveHostTriple('win32', 'arm64')).toBe('aarch64-pc-windows-msvc')
+    expect(resolveHostTriple('linux', 'x64')).toBe('x86_64-unknown-linux-gnu')
     expect(resolveHostTriple('linux', 'arm64')).toBe('aarch64-unknown-linux-gnu')
   })
 
@@ -113,6 +116,57 @@ describe('Electron sidecar manager', () => {
     expect(plan.command).toContain('/Applications/App.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/claude-sidecar-')
     expect(plan.args).toContain('/Applications/App.app/Contents/Resources/app.asar')
     expect(plan.env.CLAUDE_H5_DIST_DIR).toBe('/Applications/App.app/Contents/Resources/app.asar.unpacked/dist')
+  })
+
+  it('passes the packaged ripgrep path to the server and its CLI children', () => {
+    const desktopRoot = mkdtempSync(path.join(tmpdir(), 'cc-haha-ripgrep-plan-'))
+    try {
+      const bundledRipgrep = resolveBundledRipgrepExecutable(desktopRoot)
+      mkdirSync(path.dirname(bundledRipgrep), { recursive: true })
+      writeFileSync(bundledRipgrep, 'fixture')
+
+      const plan = createServerPlan({
+        desktopRoot,
+        appRoot: '/app',
+        port: 49321,
+        env: {},
+      })
+
+      expect(plan.env[RIPGREP_PATH_ENV]).toBe(bundledRipgrep)
+      expect(plan.env.PATH?.split(path.delimiter)).toContain(
+        path.dirname(bundledRipgrep),
+      )
+
+      const adapter = createAdapterPlan({
+        desktopRoot,
+        appRoot: '/app',
+        serverUrl: 'http://127.0.0.1:49321',
+        flag: '--telegram',
+        env: {},
+      })
+      expect(adapter.env[RIPGREP_PATH_ENV]).toBe(bundledRipgrep)
+    } finally {
+      rmSync(desktopRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an explicit ripgrep override', () => {
+    const customDir = mkdtempSync(path.join(tmpdir(), 'cc-haha-custom-ripgrep-'))
+    try {
+      const customRipgrep = path.join(customDir, 'rg')
+      writeFileSync(customRipgrep, 'fixture')
+      const plan = createServerPlan({
+        desktopRoot: '/app/desktop',
+        appRoot: '/app',
+        port: 49321,
+        env: { PATH: '/usr/bin', [RIPGREP_PATH_ENV]: customRipgrep },
+      })
+
+      expect(plan.env[RIPGREP_PATH_ENV]).toBe(customRipgrep)
+      expect(plan.env.PATH?.split(path.delimiter)).toContain(customDir)
+    } finally {
+      rmSync(customDir, { recursive: true, force: true })
+    }
   })
 
   it('passes portable config and adapter server URL through the sidecar env', () => {

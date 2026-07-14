@@ -266,12 +266,45 @@ describe('SearchService.searchSessions', () => {
     await writeSessionFile('proj-a', 'session-13', [
       { type: 'user', uuid: 'u1', message: { role: 'user', content: 'fallbackword works fine' } },
     ])
-    ;(service as unknown as { commandExists: () => Promise<boolean> }).commandExists = async () => false
+    service = new SearchService({
+      resolveRipgrepCommand: () => ({ rgPath: '', rgArgs: [] }),
+    })
 
     const { results } = await service.searchSessions('fallbackword')
     expect(results).toHaveLength(1)
     expect(results[0].matches[0].role).toBe('user')
     expect(results[0].matches[0].snippet).toContain('fallbackword')
+  })
+
+  it('uses the packaged ripgrep resolver without PATH lookup', async () => {
+    await writeSessionFile('proj-a', 'session-14', [
+      { type: 'user', uuid: 'u1', message: { role: 'user', content: 'bundledword works' } },
+    ])
+    service = new SearchService({
+      resolveRipgrepCommand: () => ({
+        rgPath: '/packaged/rg',
+        rgArgs: ['--no-config'],
+      }),
+    })
+    let invokedCommand = ''
+    let invokedArgs: string[] = []
+    ;(service as unknown as {
+      runCommand: (command: string, args: string[]) => Promise<string>
+    }).runCommand = async (command, args) => {
+      invokedCommand = command
+      invokedArgs = args
+      const filePath = path.join(tmpDir, 'projects', 'proj-a', 'session-14.jsonl')
+      return `${JSON.stringify({
+        type: 'match',
+        data: { path: { text: filePath }, line_number: 1 },
+      })}\n`
+    }
+
+    const { results } = await service.searchSessions('bundledword')
+
+    expect(invokedCommand).toBe('/packaged/rg')
+    expect(invokedArgs[0]).toBe('--no-config')
+    expect(results).toHaveLength(1)
   })
 
   it('returns empty when the projects dir does not exist', async () => {

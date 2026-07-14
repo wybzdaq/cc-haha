@@ -14,6 +14,7 @@ import {
   getCommandMetadataDisplayText,
   shouldHideCommandMetadataContent,
 } from '../../utils/commandMetadata.js'
+import { ripgrepCommand } from '../../utils/ripgrep.js'
 
 export type SearchResult = {
   file: string
@@ -78,7 +79,15 @@ const SESSION_SNIPPET_WINDOW = 120
 /** Guard ripgrep output against multi-MB single lines (base64 / big tool results). */
 const RG_MAX_COLUMNS = 500
 
+type SearchServiceDependencies = {
+  resolveRipgrepCommand?: typeof ripgrepCommand
+}
+
 export class SearchService {
+  constructor(
+    private readonly dependencies: SearchServiceDependencies = {},
+  ) {}
+
   // ---------------------------------------------------------------------------
   // 工作区搜索
   // ---------------------------------------------------------------------------
@@ -100,9 +109,8 @@ export class SearchService {
     const cwd = options?.cwd || process.cwd()
     const maxResults = options?.maxResults || 200
 
-    // 尝试 rg，降级到 grep
-    const hasRg = await this.commandExists('rg')
-    if (hasRg) {
+    // 尝试产品统一解析出的 rg，降级到 grep
+    if (this.hasRipgrep()) {
       try {
         return await this.searchWithRipgrep(query, cwd, maxResults, options)
       } catch {
@@ -253,7 +261,7 @@ export class SearchService {
     projectsDir: string,
     opts: { caseSensitive: boolean },
   ): Promise<Map<string, Set<number>>> {
-    if (await this.commandExists('rg')) {
+    if (this.hasRipgrep()) {
       try {
         return await this.findSessionCandidatesWithRipgrep(query, projectsDir, opts)
       } catch {
@@ -272,7 +280,7 @@ export class SearchService {
     if (!opts.caseSensitive) args.push('--ignore-case')
     args.push('--', query, projectsDir)
 
-    const output = await this.runCommand('rg', args)
+    const output = await this.runRipgrep(args)
     const map = new Map<string, Set<number>>()
 
     for (const line of output.split('\n')) {
@@ -489,7 +497,7 @@ export class SearchService {
 
     args.push('--', query, cwd)
 
-    const output = await this.runCommand('rg', args)
+    const output = await this.runRipgrep(args)
     return this.parseRipgrepJson(output, maxResults)
   }
 
@@ -709,10 +717,37 @@ export class SearchService {
   // 工具方法
   // ---------------------------------------------------------------------------
 
+  private hasRipgrep(): boolean {
+    return Boolean(this.getRipgrepCommand().rgPath)
+  }
+
+  private getRipgrepCommand(): ReturnType<typeof ripgrepCommand> {
+    return (this.dependencies.resolveRipgrepCommand ?? ripgrepCommand)()
+  }
+
+  private runRipgrep(args: string[]): Promise<string> {
+    const command = this.getRipgrepCommand()
+    if (!command.rgPath) {
+      return Promise.reject(new Error('ripgrep is unavailable'))
+    }
+    return this.runCommand(
+      command.rgPath,
+      [...command.rgArgs, ...args],
+      command.argv0 ? { argv0: command.argv0 } : undefined,
+    )
+  }
+
   /** 运行外部命令，返回 stdout */
-  private runCommand(cmd: string, args: string[]): Promise<string> {
+  private runCommand(
+    cmd: string,
+    args: string[],
+    options?: { argv0?: string },
+  ): Promise<string> {
     return new Promise((resolve, reject) => {
-      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      const proc = spawn(cmd, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(options?.argv0 ? { argv0: options.argv0 } : {}),
+      })
       const chunks: Buffer[] = []
       const errorChunks: Buffer[] = []
 
