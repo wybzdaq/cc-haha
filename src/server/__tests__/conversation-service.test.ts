@@ -21,6 +21,7 @@ describe('ConversationService', () => {
   let originalEntrypoint: string | undefined
   let originalOAuthToken: string | undefined
   let originalProviderManagedByHost: string | undefined
+  let originalLocalAccessToken: string | undefined
   let originalDiagnosticsFile: string | undefined
   let originalAttributionHeader: string | undefined
   let originalDisableExperimentalBetas: string | undefined
@@ -45,6 +46,7 @@ describe('ConversationService', () => {
     originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
     originalOAuthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN
     originalProviderManagedByHost = process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
     originalDiagnosticsFile = process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
     originalAttributionHeader = process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
     originalDisableExperimentalBetas = process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
@@ -69,6 +71,7 @@ describe('ConversationService', () => {
     // buildChildEnv injects it or not without interference from the shell env.
     delete process.env.CLAUDE_CODE_ENTRYPOINT
     delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
     delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
     delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
     delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
@@ -105,6 +108,9 @@ describe('ConversationService', () => {
 
     if (originalProviderManagedByHost === undefined) delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
     else process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = originalProviderManagedByHost
+
+    if (originalLocalAccessToken === undefined) delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+    else process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
 
     if (originalDiagnosticsFile === undefined) delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
     else process.env.CLAUDE_CODE_DIAGNOSTICS_FILE = originalDiagnosticsFile
@@ -458,6 +464,7 @@ describe('ConversationService', () => {
   })
 
   test('buildChildEnv injects explicit provider runtime env for session-scoped providers', async () => {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
     const providerService = new ProviderService()
     const provider = await providerService.addProvider({
       presetId: 'custom',
@@ -485,6 +492,7 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-k2.6')
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-k2.6')
     expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe('1')
+    expect(env.CC_HAHA_LOCAL_ACCESS_TOKEN).toBe('desktop-local-secret')
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CC_HAHA_TRANSCRIPT_ENTRYPOINT).toBe('claude-desktop')
     expect(env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined()

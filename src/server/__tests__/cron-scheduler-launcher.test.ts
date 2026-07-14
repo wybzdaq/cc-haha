@@ -26,6 +26,7 @@ const originalShell = process.env.SHELL
 const originalZdotdir = process.env.ZDOTDIR
 const originalDisableTerminalShellEnv = process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
 const originalTaskTimeout = process.env.CC_HAHA_TASK_TIMEOUT_MS
+const originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
 
 const isWindows = process.platform === 'win32'
 const unixOnly = isWindows ? it.skip : it
@@ -113,6 +114,11 @@ function restoreEnv(): void {
     process.env.CC_HAHA_TASK_TIMEOUT_MS = originalTaskTimeout
   } else {
     delete process.env.CC_HAHA_TASK_TIMEOUT_MS
+  }
+  if (originalLocalAccessToken !== undefined) {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
+  } else {
+    delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
   }
   resetTerminalShellEnvironmentCacheForTests()
 }
@@ -352,6 +358,7 @@ describe('cron scheduler launcher resolution', () => {
     process.env.ANTHROPIC_BASE_URL = 'https://stale-parent.example'
     process.env.ANTHROPIC_MODEL = 'stale-parent-model'
     process.env.CLAUDE_CODE_ENTRYPOINT = 'stale-parent-entrypoint'
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
 
     const provider = await new ProviderService().addProvider({
       presetId: 'custom',
@@ -405,6 +412,7 @@ describe('cron scheduler launcher resolution', () => {
     expect(env.ANTHROPIC_MODEL).toBe('provider-fast')
     expect(env.ANTHROPIC_MODEL).not.toBe('stale-parent-model')
     expect(env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe('1')
+    expect(env.CC_HAHA_LOCAL_ACCESS_TOKEN).toBe('desktop-local-secret')
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
     expect(env.CLAUDE_CODE_ENTRYPOINT).toBe('sdk-cli')
   })
