@@ -932,6 +932,7 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
 type MessageListProps = {
   sessionId?: string | null
   compact?: boolean
+  mobileLayout?: boolean
 }
 
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 48
@@ -1428,7 +1429,7 @@ const MeasuredRenderItem = memo(function MeasuredRenderItem({
   )
 })
 
-export function MessageList({ sessionId, compact = false }: MessageListProps = {}) {
+export function MessageList({ sessionId, compact = false, mobileLayout = false }: MessageListProps = {}) {
   const activeTabId = useTabStore((s) => s.activeTabId)
   const resolvedSessionId = sessionId ?? activeTabId
   const isWorkspacePanelOpen = useWorkspacePanelStore((state) =>
@@ -1953,6 +1954,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
         ? 'compact'
         : 'edge'
   const showConversationNavigator =
+    !mobileLayout &&
     !isTouchH5Document() &&
     conversationNavigationItems.length >= CONVERSATION_NAVIGATION_MIN_ITEMS
   const chatScrollPaddingClass = compact

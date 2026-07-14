@@ -72,14 +72,14 @@ vi.mock('../controls/PermissionModeSelector', () => ({
 vi.mock('../controls/ModelSelector', async () => {
   const React = await vi.importActual<typeof import('react')>('react')
   return {
-    ModelSelector: React.forwardRef<{ open: () => void }, Record<string, never>>((_props, ref) => {
+    ModelSelector: React.forwardRef<{ open: () => void }, { fluid?: boolean }>(({ fluid }, ref) => {
       const [open, setOpen] = React.useState(false)
       React.useImperativeHandle(ref, () => ({ open: () => setOpen(true) }), [])
       return (
-        <>
+        <div data-testid="model-selector-shell" className={fluid ? 'min-w-0 flex-1' : 'shrink-0'}>
           <button type="button">Model</button>
           {open && <div data-testid="model-selector-dropdown">Model selector opened</div>}
-        </>
+        </div>
       )
     }),
   }
@@ -1380,6 +1380,9 @@ describe('ChatInput file mentions', () => {
     expect(screen.getByTestId('chat-input-shell').className).toContain('safe-area-inset-bottom')
     expect(screen.getByTestId('chat-input-panel')).toHaveClass('rounded-2xl')
     expect(screen.getByTestId('chat-input-panel')).not.toHaveClass('rounded-b-none')
+    expect(screen.getByTestId('chat-input-toolbar-leading')).toHaveClass('shrink-0', 'gap-1')
+    expect(screen.getByTestId('chat-input-toolbar-trailing')).toHaveClass('min-w-0', 'flex-1', 'justify-end', 'gap-1')
+    expect(screen.getByTestId('model-selector-shell')).toHaveClass('min-w-0', 'flex-1')
 
     fireEvent.change(screen.getByRole('textbox'), {
       target: { value: '@cond', selectionStart: 5 },

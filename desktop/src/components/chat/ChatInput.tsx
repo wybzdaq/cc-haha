@@ -1269,9 +1269,12 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
           <div data-testid="chat-input-toolbar" className={isHeroComposer
             ? 'flex items-center justify-between border-t border-[var(--color-border-separator)] pt-3'
             : `mt-2 flex items-center justify-between border-t border-[var(--color-border-separator)] ${
-              useCompactControls ? '-mx-3 -mb-3 gap-2 px-2.5 py-2' : '-mx-4 -mb-4 px-3 py-3'
+              useCompactControls ? `-mx-3 -mb-3 px-2.5 py-2 ${isMobileComposer ? 'gap-1' : 'gap-2'}` : '-mx-4 -mb-4 px-3 py-3'
             }`}>
-            <div className="flex min-w-0 items-center gap-2">
+            <div
+              data-testid="chat-input-toolbar-leading"
+              className={`flex min-w-0 items-center ${isMobileComposer ? 'shrink-0 gap-1' : 'gap-2'}`}
+            >
               {!isMemberSession && (
                 <>
                   <div ref={plusMenuRef} className="relative">
@@ -1308,7 +1311,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
               )}
             </div>
 
-            <div className="flex min-w-0 items-center gap-2">
+            <div
+              data-testid="chat-input-toolbar-trailing"
+              className={`flex min-w-0 items-center ${isMobileComposer ? 'flex-1 justify-end gap-1' : 'gap-2'}`}
+            >
               {!isMemberSession && activeTabId && (
                 <ContextUsageIndicator
                   sessionId={activeTabId}
@@ -1321,7 +1327,13 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
                 />
               )}
               {!isMemberSession && activeTabId && (
-                <ModelSelector ref={modelSelectorRef} runtimeKey={activeTabId} disabled={isActive} compact={useCompactControls} />
+                <ModelSelector
+                  ref={modelSelectorRef}
+                  runtimeKey={activeTabId}
+                  disabled={isActive}
+                  compact={useCompactControls}
+                  fluid={isMobileComposer}
+                />
               )}
               <button
                 onClick={!isMemberSession && isActive ? () => stopGeneration(activeTabId!) : handleSubmit}

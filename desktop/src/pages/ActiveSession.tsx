@@ -678,7 +678,7 @@ export function ActiveSession() {
                   {historyError}
                 </div>
               ) : (
-                <MessageList compact={showRightPanel} />
+                <MessageList compact={showRightPanel} mobileLayout={isMobileLayout} />
               )}
             </>
           )}

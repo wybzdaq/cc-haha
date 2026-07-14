@@ -688,19 +688,21 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
             {t('sidebar.scheduled')}
           </NavItem>
         )}
-        <NavItem
-          active={activeTabId === MARKET_TAB_ID}
-          collapsed={!expanded}
-          label={t('sidebar.market')}
-          touchFriendly={isMobile}
-          onClick={() => {
-            useTabStore.getState().openTab(MARKET_TAB_ID, t('sidebar.market'), 'market')
-            closeMobileDrawer()
-          }}
-          icon={<StorefrontIcon />}
-        >
-          {t('sidebar.market')}
-        </NavItem>
+        {!isMobile && (
+          <NavItem
+            active={activeTabId === MARKET_TAB_ID}
+            collapsed={!expanded}
+            label={t('sidebar.market')}
+            touchFriendly={isMobile}
+            onClick={() => {
+              useTabStore.getState().openTab(MARKET_TAB_ID, t('sidebar.market'), 'market')
+              closeMobileDrawer()
+            }}
+            icon={<StorefrontIcon />}
+          >
+            {t('sidebar.market')}
+          </NavItem>
+        )}
       </div>
 
       {expanded ? (
