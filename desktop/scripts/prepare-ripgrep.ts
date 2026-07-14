@@ -14,7 +14,9 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const RIPGREP_VERSION = '15.1.0'
+export const RIPGREP_LICENSE_FILES = ['COPYING', 'LICENSE-MIT', 'UNLICENSE'] as const
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url))
+const ripgrepLicenseSourceDirectory = path.join(scriptDirectory, 'ripgrep-licenses')
 
 type RipgrepAsset = {
   assetTriple: string
@@ -78,6 +80,17 @@ export function getBundledRipgrepName(targetTriple: string): string {
 export function getRipgrepDownloadUrl(targetTriple: string): string {
   const asset = getRipgrepAsset(targetTriple)
   return `https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${asset.archiveName}`
+}
+
+export async function stageRipgrepLicenses(binariesDir: string): Promise<string> {
+  const licensesDir = path.join(binariesDir, 'ripgrep-licenses')
+  await mkdir(licensesDir, { recursive: true })
+  await Promise.all(RIPGREP_LICENSE_FILES.map(fileName =>
+    copyFile(
+      path.join(ripgrepLicenseSourceDirectory, fileName),
+      path.join(licensesDir, fileName),
+    )))
+  return licensesDir
 }
 
 export async function prepareRipgrep({
@@ -157,13 +170,7 @@ export async function prepareRipgrep({
       }, null, 2)}\n`,
     )
 
-    const licensesDir = path.join(binariesDir, 'ripgrep-licenses')
-    await mkdir(licensesDir, { recursive: true })
-    await Promise.all([
-      copyFile(path.join(archiveRoot, 'COPYING'), path.join(licensesDir, 'COPYING')),
-      copyFile(path.join(archiveRoot, 'LICENSE-MIT'), path.join(licensesDir, 'LICENSE-MIT')),
-      copyFile(path.join(archiveRoot, 'UNLICENSE'), path.join(licensesDir, 'UNLICENSE')),
-    ])
+    await stageRipgrepLicenses(binariesDir)
 
     console.log(`[prepare-ripgrep] ${destination}`)
     return destination

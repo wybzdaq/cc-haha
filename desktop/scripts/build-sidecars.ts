@@ -1,6 +1,9 @@
 import { chmod, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { getBundledRipgrepName } from './prepare-ripgrep'
+import {
+  getBundledRipgrepName,
+  stageRipgrepLicenses,
+} from './prepare-ripgrep'
 
 const desktopRoot = path.resolve(import.meta.dir, '..')
 const repoRoot = path.resolve(desktopRoot, '..')
@@ -27,6 +30,7 @@ if (scanExit !== 0) {
 }
 
 await mkdir(binariesDir, { recursive: true })
+await stageRipgrepLicenses(binariesDir)
 await stageHostRipgrepForOfflineBuild()
 
 // 单一合并 sidecar：server / cli 共享一份 bun runtime + 共享依赖代码。

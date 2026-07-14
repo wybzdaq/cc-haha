@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'vitest'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
@@ -7,7 +7,9 @@ import {
   getRipgrepAsset,
   getRipgrepDownloadUrl,
   prepareRipgrep,
+  RIPGREP_LICENSE_FILES,
   RIPGREP_VERSION,
+  stageRipgrepLicenses,
 } from './prepare-ripgrep'
 
 const tempDirs: string[] = []
@@ -57,6 +59,17 @@ describe('prepare-ripgrep target mapping', () => {
     expect(() => getRipgrepAsset('armv7-unknown-linux-gnu')).toThrow(
       'Unsupported target triple',
     )
+  })
+
+  test('stages the pinned ripgrep license set for offline builds', async () => {
+    const fixtureDir = await mkdtemp(path.join(tmpdir(), 'cc-haha-ripgrep-licenses-'))
+    tempDirs.push(fixtureDir)
+
+    const licensesDir = await stageRipgrepLicenses(fixtureDir)
+
+    for (const fileName of RIPGREP_LICENSE_FILES) {
+      expect(await readFile(path.join(licensesDir, fileName), 'utf8')).not.toHaveLength(0)
+    }
   })
 
   test('rejects a local archive that does not match the pinned checksum', async () => {
