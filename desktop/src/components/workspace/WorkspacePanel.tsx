@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type RefObject } from 'react'
 import { CircleAlert, Code2, File as FileIcon, FileText, FolderOpen, Image as ImageIcon, MessageCircle, PanelRightClose, PanelRightOpen, RefreshCw, Search, Settings2, X, type LucideIcon } from 'lucide-react'
 import { Highlight } from 'prism-react-renderer'
-import type {
-  WorkspaceChangedFile,
-  WorkspaceFileStatus,
-  WorkspaceTreeEntry,
-  WorkspaceTreeResult,
+import {
+  sessionsApi,
+  type WorkspaceSearchResult,
+  type WorkspaceChangedFile,
+  type WorkspaceFileStatus,
+  type WorkspaceTreeEntry,
+  type WorkspaceTreeResult,
 } from '../../api/sessions'
 import { useTranslation } from '../../i18n'
 import { useShallow } from 'zustand/react/shallow'
@@ -31,6 +33,7 @@ import {
 } from './WorkspaceCodeSurface'
 import { WorkspaceFileOpenWith } from './WorkspaceFileOpenWith'
 import { getFileIdentity, getWorkspaceStatusLabel, type WorkspaceFileIdentity } from './fileIdentity'
+import type { WorkspaceDiffHighlightToken } from './workspaceDiffHighlighter'
 
 type WorkspacePanelProps = {
   sessionId: string
@@ -118,6 +121,7 @@ const EMPTY_EXPANDED_PATHS: string[] = []
 const SELECTION_MENU_OFFSET = 10
 const SELECTION_MENU_WIDTH = 158
 const SELECTION_MENU_HEIGHT = 44
+const WORKSPACE_SEARCH_DEBOUNCE_MS = 250
 const FILE_BADGE_META: Record<string, { label: string; className: string }> = {
   ts: { label: 'TS', className: 'bg-[var(--color-secondary)]/14 text-[var(--color-secondary)]' },
   tsx: { label: 'TSX', className: 'bg-[var(--color-secondary)]/14 text-[var(--color-secondary)]' },
@@ -378,11 +382,13 @@ function PanelMessage({
   message,
   tone = 'muted',
   compact = false,
+  announce = true,
 }: {
   icon: string
   message: string
   tone?: 'muted' | 'error'
   compact?: boolean
+  announce?: boolean
 }) {
   const toneClass =
     tone === 'error'
@@ -392,7 +398,7 @@ function PanelMessage({
   return (
     <div
       className={`flex items-center gap-2 px-4 ${compact ? 'py-2 text-[11px]' : 'py-8 text-xs'} ${toneClass}`}
-      role={tone === 'error' ? 'alert' : 'status'}
+      role={announce ? tone === 'error' ? 'alert' : 'status' : undefined}
     >
       <span className={`material-symbols-outlined shrink-0 text-[16px] ${icon === 'progress_activity' ? 'animate-spin' : ''}`}>
         {icon}
@@ -427,35 +433,62 @@ function WorkspaceFilterInput({
   value,
   onChange,
   summary,
+  mode,
+  loading = false,
+  inputRef,
+  onFocusFirstResult,
 }: {
   value: string
   onChange: (value: string) => void
   summary?: string
+  mode: 'changed' | 'all'
+  loading?: boolean
+  inputRef: RefObject<HTMLInputElement>
+  onFocusFirstResult?: () => void
 }) {
   const t = useTranslation()
+  const placeholder = mode === 'all'
+    ? t('workspace.searchAllPlaceholder')
+    : t('workspace.filterChangedPlaceholder')
 
   return (
     <div className="shrink-0 border-b border-[var(--color-text-primary)]/10 px-3 pb-2.5 pt-2.5">
-      <label className="flex h-9 items-center gap-2 rounded-[7px] bg-[var(--color-surface-container-low)] px-2.5 text-[var(--color-text-tertiary)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-text-primary)_8%,transparent)] transition-[background-color,box-shadow] duration-200 ease-out focus-within:bg-[var(--color-surface)] focus-within:shadow-[inset_0_0_0_1px_var(--color-info),0_0_0_3px_color-mix(in_srgb,var(--color-info)_12%,transparent)]">
+      <div className="flex h-9 items-center gap-2 rounded-[7px] bg-[var(--color-surface-container-low)] px-2.5 text-[var(--color-text-tertiary)] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-text-primary)_8%,transparent)] transition-[background-color,box-shadow] duration-200 ease-out focus-within:bg-[var(--color-surface)] focus-within:shadow-[inset_0_0_0_1px_var(--color-info),0_0_0_3px_color-mix(in_srgb,var(--color-info)_12%,transparent)]">
         <Search size={15} strokeWidth={1.9} aria-hidden="true" className="shrink-0" />
         <input
+          ref={inputRef}
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          aria-label={t('workspace.filterPlaceholder')}
-          placeholder={t('workspace.filterPlaceholder')}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && value) {
+              event.preventDefault()
+              onChange('')
+            } else if (event.key === 'ArrowDown' && onFocusFirstResult) {
+              event.preventDefault()
+              onFocusFirstResult()
+            }
+          }}
+          aria-label={placeholder}
+          placeholder={placeholder}
           className="min-w-0 flex-1 bg-transparent text-[13px] text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)]"
         />
+        {loading && (
+          <RefreshCw size={13} aria-hidden="true" className="shrink-0 animate-spin" />
+        )}
         {value.length > 0 && (
           <button
             type="button"
             aria-label={t('workspace.clearFilter')}
-            onClick={() => onChange('')}
-            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]"
+            onClick={() => {
+              onChange('')
+              inputRef.current?.focus()
+            }}
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]"
           >
             <X size={13} strokeWidth={2} aria-hidden="true" />
           </button>
         )}
-      </label>
+      </div>
       {summary && (
         <div
           role="status"
@@ -482,6 +515,15 @@ function FileStatusBadge({ status }: { status: WorkspaceFileStatus }) {
   )
 }
 
+function workspaceCodeTokenStyle(token: WorkspaceDiffHighlightToken): CSSProperties {
+  const fontStyle = token.fontStyle ?? 0
+  return {
+    color: token.color,
+    fontStyle: fontStyle & 1 ? 'italic' : undefined,
+    fontWeight: fontStyle & 2 ? 700 : undefined,
+  }
+}
+
 function CodeSurface({
   value,
   language,
@@ -500,6 +542,7 @@ function CodeSurface({
   const [commentDraft, setCommentDraft] = useState('')
   const [showAllLines, setShowAllLines] = useState(false)
   const [selectionMenu, setSelectionMenu] = useState<FloatingSelectionMenuState | null>(null)
+  const [shikiTokensByLine, setShikiTokensByLine] = useState<WorkspaceDiffHighlightToken[][] | null>(null)
   const lines = value.split('\n')
   const visibleLines = showAllLines ? lines : lines.slice(0, WORKSPACE_PREVIEW_LINE_LIMIT)
   const activeQuote = commentLine ? visibleLines[commentLine - 1] ?? '' : ''
@@ -512,6 +555,27 @@ function CodeSurface({
     setCommentDraft('')
     setSelectionMenu(null)
   }, [language, value])
+
+  useEffect(() => {
+    if (usePlainLargePreview) {
+      setShikiTokensByLine(null)
+      return
+    }
+
+    let cancelled = false
+    setShikiTokensByLine(null)
+    void import('./workspaceDiffHighlighter')
+      .then(({ highlightWorkspaceCode }) => highlightWorkspaceCode({ value: visibleCode, language }))
+      .then((result) => {
+        if (!cancelled && result.engine === 'shiki') setShikiTokensByLine(result.tokensByLine)
+      })
+      .catch(() => {
+        if (!cancelled) setShikiTokensByLine(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [language, usePlainLargePreview, visibleCode])
 
   const dismissSelectionMenu = useCallback(() => {
     setSelectionMenu(null)
@@ -648,6 +712,40 @@ function CodeSurface({
               )
             })}
           </pre>
+        ) : shikiTokensByLine ? (
+          <pre
+            data-workspace-code=""
+            data-testid="workspace-code"
+            data-highlight-engine="shiki"
+            className="m-0 font-[var(--font-mono)] text-[12px] leading-[1.55]"
+            style={{ color: 'var(--color-code-fg)', background: 'transparent' }}
+          >
+            {shikiTokensByLine.map((line, index) => {
+              const lineNumber = index + 1
+              return (
+                <div key={lineNumber}>
+                  <div
+                    data-workspace-line-number={lineNumber}
+                    className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]"
+                  >
+                    {renderLineNumberButton(lineNumber)}
+                    <span className="whitespace-pre pr-6">
+                      {line.length === 0 ? ' ' : line.map((token, tokenIndex) => (
+                        <span
+                          key={`${tokenIndex}:${token.content}`}
+                          data-workspace-token=""
+                          style={workspaceCodeTokenStyle(token)}
+                        >
+                          {token.content}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                  {renderLineCommentEditor(lineNumber)}
+                </div>
+              )
+            })}
+          </pre>
         ) : (
           <Highlight
             theme={workspacePrismTheme}
@@ -658,6 +756,7 @@ function CodeSurface({
               <pre
                 data-workspace-code=""
                 data-testid="workspace-code"
+                data-highlight-engine="prism"
                 className="m-0 font-[var(--font-mono)] text-[12px] leading-[1.55]"
                 style={{ color: 'var(--color-code-fg)', background: 'transparent' }}
               >
@@ -860,6 +959,93 @@ function ChangedFileRow({
   )
 }
 
+function moveWorkspaceSearchResultFocus(
+  event: ReactKeyboardEvent<HTMLButtonElement>,
+  direction: 'next' | 'previous' | 'first' | 'last',
+) {
+  const list = event.currentTarget.closest('[data-workspace-search-results]')
+  const results = list
+    ? Array.from(list.querySelectorAll<HTMLButtonElement>('[data-workspace-search-result]'))
+    : []
+  if (results.length === 0) return
+
+  const currentIndex = results.indexOf(event.currentTarget)
+  const targetIndex = direction === 'first'
+    ? 0
+    : direction === 'last'
+      ? results.length - 1
+      : direction === 'next'
+        ? Math.min(currentIndex + 1, results.length - 1)
+        : Math.max(currentIndex - 1, 0)
+  results[targetIndex]?.focus()
+}
+
+function WorkspaceSearchResultRow({
+  entry,
+  active,
+  onOpen,
+  onContextMenu,
+  onClearSearch,
+}: {
+  entry: WorkspaceTreeEntry
+  active: boolean
+  onOpen: () => void
+  onContextMenu: (event: MouseEvent, path: string, isDirectory: boolean) => void
+  onClearSearch: () => void
+}) {
+  const normalizedPath = entry.path.replace(/\\/g, '/')
+  const lastSlash = normalizedPath.lastIndexOf('/')
+  const parentPath = lastSlash >= 0 ? normalizedPath.slice(0, lastSlash) : '.'
+
+  return (
+    <div role="listitem">
+      <button
+        type="button"
+        data-workspace-search-result=""
+        data-workspace-file-path={entry.path}
+        aria-current={active ? 'true' : undefined}
+        aria-label={`${entry.name}, ${parentPath}`}
+        title={normalizedPath}
+        onClick={onOpen}
+        onContextMenu={(event) => onContextMenu(event, entry.path, false)}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowDown') {
+            event.preventDefault()
+            moveWorkspaceSearchResultFocus(event, 'next')
+          } else if (event.key === 'ArrowUp') {
+            event.preventDefault()
+            moveWorkspaceSearchResultFocus(event, 'previous')
+          } else if (event.key === 'Home') {
+            event.preventDefault()
+            moveWorkspaceSearchResultFocus(event, 'first')
+          } else if (event.key === 'End') {
+            event.preventDefault()
+            moveWorkspaceSearchResultFocus(event, 'last')
+          } else if (event.key === 'Escape') {
+            event.preventDefault()
+            onClearSearch()
+          }
+        }}
+        className={`group mx-2 flex min-h-12 w-[calc(100%-16px)] items-start gap-2 rounded-[7px] px-2.5 py-2 text-left transition-[background-color,transform] duration-150 ease-out active:scale-[0.99] ${
+          active
+            ? 'bg-[var(--color-info-container)] shadow-[inset_3px_0_0_var(--color-info)]'
+            : 'hover:bg-[var(--color-surface-hover)]'
+        }`}
+      >
+        <FileTypeBadge name={entry.name} subtle={!active} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[13px] font-medium text-[var(--color-text-primary)]">
+            {entry.name}
+          </span>
+          <span className="mt-0.5 block truncate font-[var(--font-mono)] text-[10px] text-[var(--color-text-tertiary)]">
+            {parentPath}
+          </span>
+        </span>
+      </button>
+    </div>
+  )
+}
+
 function TreeNode({
   sessionId,
   entry,
@@ -889,6 +1075,7 @@ function TreeNode({
         type="button"
         onClick={() => onOpenFile(entry.path)}
         onContextMenu={(event) => onFileContextMenu(event, entry.path, false)}
+        aria-current={isActive ? 'true' : undefined}
         className={`group mx-2 flex h-8 w-[calc(100%-16px)] items-center gap-2 rounded-[7px] pr-2 text-left transition-colors ${
           isActive
             ? 'bg-[var(--color-surface-selected)] shadow-[inset_0_0_0_1.5px_var(--color-border-focus)]'
@@ -912,7 +1099,7 @@ function TreeNode({
         className="group mx-2 flex h-8 w-[calc(100%-16px)] items-center gap-2 rounded-[7px] pr-2 text-left transition-colors hover:bg-[var(--color-surface-hover)]"
         style={{ paddingLeft: indent }}
       >
-        <span className="material-symbols-outlined shrink-0 text-[18px] text-[var(--color-text-tertiary)] transition-colors group-hover:text-[var(--color-text-primary)]">
+        <span aria-hidden="true" className="material-symbols-outlined shrink-0 text-[18px] text-[var(--color-text-tertiary)] transition-colors group-hover:text-[var(--color-text-primary)]">
           {isVisuallyExpanded ? 'expand_more' : 'chevron_right'}
         </span>
         <span className="min-w-0 truncate text-[15px] font-medium text-[var(--color-text-primary)]">{entry.name}</span>
@@ -985,6 +1172,10 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
   const t = useTranslation()
   const addToast = useUIStore((state) => state.addToast)
   const [filterQuery, setFilterQuery] = useState('')
+  const [workspaceSearch, setWorkspaceSearch] = useState<WorkspaceSearchResult | null>(null)
+  const [workspaceSearchLoading, setWorkspaceSearchLoading] = useState(false)
+  const [workspaceSearchError, setWorkspaceSearchError] = useState<string | null>(null)
+  const [workspaceSearchRevision, setWorkspaceSearchRevision] = useState(0)
   const [isViewMenuOpen, setIsViewMenuOpen] = useState(false)
   const [isNavigatorOpen, setIsNavigatorOpen] = useState(forceVisible)
   const [previewTabContextMenu, setPreviewTabContextMenu] = useState<{ tabId: string; x: number; y: number } | null>(null)
@@ -1021,18 +1212,27 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
     isOpen: false,
     chatState: 'idle',
   })
+  const workspaceSearchRequestIdRef = useRef(0)
+  const filterInputRef = useRef<HTMLInputElement>(null)
+  const previewHeaderRef = useRef<HTMLDivElement>(null)
 
   const rootTree = treeByPath['']
   const rootTreeKey = makeTreeStateKey(sessionId, '')
   const rootTreeLoading = treeLoadingByPath[rootTreeKey] ?? false
   const rootTreeError = treeErrorsByPath[rootTreeKey] ?? null
   const normalizedFilterQuery = normalizeFilterQuery(filterQuery)
-  const expandedPathSet = new Set(expandedPaths)
   const activePreviewTab =
     previewTabs.find((tab) => tab.id === activePreviewTabId) ?? previewTabs[previewTabs.length - 1] ?? null
   const hasPreviewTabs = previewTabs.length > 0
   const isNavigatorVisible = !hasPreviewTabs || isNavigatorOpen
-  const navigatorView = hasPreviewTabs ? 'changed' : activeView
+  const navigatorView = activeView
+  const hasWorkspaceSearch = navigatorView === 'all' && normalizedFilterQuery.length > 0
+  const activeWorkspaceSearch = workspaceSearch
+    && normalizeFilterQuery(workspaceSearch.query) === normalizedFilterQuery
+    ? workspaceSearch
+    : null
+  const displayedWorkspaceSearch = activeWorkspaceSearch ?? workspaceSearch
+  const expandedPathSet = new Set(expandedPaths)
   const activeTreePath = activePreviewTab?.kind === 'file' ? activePreviewTab.path : null
   const activeChangedFile = activePreviewTab
     ? status?.changedFiles.find((file) => file.path === activePreviewTab.path) ?? null
@@ -1051,17 +1251,19 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
       : [],
     [normalizedFilterQuery, rootTree, treeByPath],
   )
-  const visibleEntryCount = navigatorView === 'changed' ? filteredChangedFiles.length : filteredRootEntries.length
-  const totalEntryCount = navigatorView === 'changed'
-    ? status?.changedFiles.length ?? 0
-    : rootTree?.state === 'ok' ? rootTree.entries.length : 0
+  const visibleEntryCount = filteredChangedFiles.length
+  const totalEntryCount = status?.changedFiles.length ?? 0
   const filterSummary = navigatorView === 'changed'
     ? normalizedFilterQuery
       ? t('workspace.filteredFilesCount', { visible: visibleEntryCount, total: totalEntryCount })
       : t('workspace.filesCount', { count: totalEntryCount })
-    : normalizedFilterQuery
-      ? t('workspace.filteredItemsCount', { visible: visibleEntryCount, total: totalEntryCount })
-      : t('workspace.itemsCount', { count: totalEntryCount })
+    : !normalizedFilterQuery || workspaceSearchError
+      ? undefined
+      : workspaceSearchLoading || !activeWorkspaceSearch
+        ? t('workspace.searching')
+        : activeWorkspaceSearch.truncated
+          ? t('workspace.searchResultsTruncated', { count: activeWorkspaceSearch.entries.length })
+          : t('workspace.searchResultsCount', { count: activeWorkspaceSearch.entries.length })
   const activePreviewRequestKey = activePreviewTab
     ? makePreviewStateKey(sessionId, activePreviewTab.id)
     : null
@@ -1099,6 +1301,38 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
   }, [isNavigatorVisible, loadTree, navigatorView, rootTree, rootTreeError, rootTreeLoading, sessionId, shouldRender])
 
   useEffect(() => {
+    const requestId = workspaceSearchRequestIdRef.current + 1
+    workspaceSearchRequestIdRef.current = requestId
+
+    if (!shouldRender || navigatorView !== 'all' || !normalizedFilterQuery) {
+      if (!normalizedFilterQuery) setWorkspaceSearch(null)
+      setWorkspaceSearchLoading(false)
+      setWorkspaceSearchError(null)
+      return
+    }
+
+    setWorkspaceSearchLoading(true)
+    setWorkspaceSearchError(null)
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void sessionsApi.searchWorkspace(sessionId, filterQuery.trim()).then((result) => {
+        if (cancelled || workspaceSearchRequestIdRef.current !== requestId) return
+        setWorkspaceSearch(result)
+        setWorkspaceSearchLoading(false)
+      }).catch((error) => {
+        if (cancelled || workspaceSearchRequestIdRef.current !== requestId) return
+        setWorkspaceSearchLoading(false)
+        setWorkspaceSearchError(error instanceof Error ? error.message : t('workspace.loadError'))
+      })
+    }, WORKSPACE_SEARCH_DEBOUNCE_MS)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [filterQuery, navigatorView, normalizedFilterQuery, sessionId, shouldRender, t, workspaceSearchRevision])
+
+  useEffect(() => {
     if (!previewTabContextMenu && !fileContextMenu) return
     const close = () => {
       setPreviewTabContextMenu(null)
@@ -1131,19 +1365,38 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
     if (activePreviewTab) {
       void openPreview(sessionId, activePreviewTab.path, activePreviewTab.kind)
     }
-    if (navigatorView === 'all') {
+    if (hasWorkspaceSearch) {
+      setWorkspaceSearchRevision((revision) => revision + 1)
+    } else if (navigatorView === 'all') {
       void loadTree(sessionId, '')
     }
+  }
+
+  const focusPreviewAfterOpen = () => {
+    window.setTimeout(() => previewHeaderRef.current?.focus(), 0)
   }
 
   const handleOpenDiff = (path: string) => {
     setIsNavigatorOpen(forceVisible)
     void openPreview(sessionId, path, 'diff')
+    focusPreviewAfterOpen()
   }
 
   const handleOpenFile = (path: string) => {
     setIsNavigatorOpen(forceVisible)
     void openPreview(sessionId, path, 'file')
+    focusPreviewAfterOpen()
+  }
+
+  const clearWorkspaceSearch = () => {
+    setFilterQuery('')
+    window.requestAnimationFrame(() => filterInputRef.current?.focus())
+  }
+
+  const focusFirstSearchResult = () => {
+    document.querySelector<HTMLButtonElement>(
+      `[data-testid="workspace-panel"] [data-workspace-search-result]`,
+    )?.focus()
   }
 
   const addWorkspacePathToChat = (path: string, isDirectory = false) => {
@@ -1302,6 +1555,69 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
   }
 
   const renderAllFilesView = () => {
+    if (hasWorkspaceSearch) {
+      if (workspaceSearchLoading && !displayedWorkspaceSearch) {
+        return <PanelMessage announce={false} icon="progress_activity" message={t('workspace.searching')} />
+      }
+      if (workspaceSearchError && !displayedWorkspaceSearch) {
+        return (
+          <div role="alert" className="mx-3 my-3 rounded-[8px] border border-[var(--color-error)]/20 bg-[var(--color-error)]/6 p-3 text-[12px] text-[var(--color-error)]">
+            <div className="flex items-start gap-2">
+              <CircleAlert size={15} aria-hidden="true" className="mt-0.5 shrink-0" />
+              <span className="min-w-0 flex-1 leading-5">{workspaceSearchError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setWorkspaceSearchRevision((revision) => revision + 1)}
+              className="mt-2 rounded-[6px] border border-[var(--color-error)]/30 px-2 py-1 font-medium hover:bg-[var(--color-error)]/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-error)]/25"
+            >
+              {t('common.retry')}
+            </button>
+          </div>
+        )
+      }
+      if (!displayedWorkspaceSearch) {
+        return <PanelMessage announce={false} icon="progress_activity" message={t('workspace.searching')} />
+      }
+      if (!workspaceSearchLoading && activeWorkspaceSearch?.entries.length === 0) {
+        return <PanelMessage announce={false} icon="search_off" message={t('workspace.noMatchingFiles')} />
+      }
+
+      return (
+        <div
+          role="list"
+          aria-label={t('workspace.searchResults')}
+          aria-busy={workspaceSearchLoading}
+          data-workspace-search-results=""
+          className="space-y-0.5 py-1"
+        >
+          {workspaceSearchError && (
+            <div role="alert" className="mx-3 mb-2 flex items-center gap-2 rounded-[7px] bg-[var(--color-error)]/6 px-2.5 py-2 text-[11px] text-[var(--color-error)]">
+              <CircleAlert size={14} aria-hidden="true" className="shrink-0" />
+              <span className="min-w-0 flex-1 truncate">{workspaceSearchError}</span>
+              <button
+                type="button"
+                onClick={() => setWorkspaceSearchRevision((revision) => revision + 1)}
+                className="shrink-0 rounded-[5px] px-1.5 py-1 font-medium hover:bg-[var(--color-error)]/10"
+              >
+                {t('common.retry')}
+              </button>
+            </div>
+          )}
+          {displayedWorkspaceSearch.entries.map((entry) => (
+            <WorkspaceSearchResultRow
+              key={entry.path}
+              entry={entry}
+              active={activeTreePath === entry.path}
+              onOpen={() => handleOpenFile(entry.path)}
+              onContextMenu={handleFileContextMenu}
+              onClearSearch={clearWorkspaceSearch}
+            />
+          ))}
+        </div>
+      )
+    }
+
     if (rootTreeLoading && !rootTree) {
       return <PanelMessage icon="progress_activity" message={t('common.loading')} />
     }
@@ -1375,8 +1691,10 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
         className="flex min-h-0 flex-1 flex-col"
       >
         <div
+          ref={previewHeaderRef}
+          tabIndex={-1}
           data-testid="workspace-preview-header"
-          className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--color-text-primary)]/10 bg-[var(--color-surface)] px-3 text-[12px]"
+          className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--color-text-primary)]/10 bg-[var(--color-surface)] px-3 text-[12px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-info)]/35"
         >
           <FileText size={15} strokeWidth={1.8} aria-hidden="true" className="shrink-0 text-[var(--color-text-tertiary)]" />
           <span className="min-w-0 truncate font-medium text-[var(--color-text-primary)]">{activePreviewTab.path}</span>
@@ -1400,7 +1718,11 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
             <ToolbarIconButton
               Icon={isNavigatorVisible ? PanelRightClose : PanelRightOpen}
               label={isNavigatorVisible ? t('workspace.hideNavigator') : t('workspace.showNavigator')}
-              onClick={() => setIsNavigatorOpen((open) => !open)}
+              onClick={() => setIsNavigatorOpen((open) => {
+                const nextOpen = !open
+                if (nextOpen) window.requestAnimationFrame(() => filterInputRef.current?.focus())
+                return nextOpen
+              })}
             />
             {!embedded && (
               <ToolbarIconButton Icon={X} label={t('workspace.closePanel')} onClick={() => closePanel(sessionId)} />
@@ -1608,11 +1930,10 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
             data-testid="workspace-file-navigator"
             className={`${hasPreviewTabs ? 'border-l border-[var(--color-text-primary)]/10' : ''} ${hasPreviewTabs && !forceVisible ? 'absolute inset-y-0 right-0 z-20 w-[min(280px,100%)] shadow-[-12px_0_28px_rgba(15,23,42,0.08)]' : ''} flex min-h-0 flex-col bg-[var(--color-surface)]`}
           >
-            {!hasPreviewTabs && (
-              <header
-                data-testid="workspace-file-navigator-header"
-                className="flex h-10 shrink-0 items-center gap-1.5 border-b border-[var(--color-text-primary)]/10 px-3"
-              >
+            <header
+              data-testid="workspace-file-navigator-header"
+              className="flex h-10 shrink-0 items-center gap-1.5 border-b border-[var(--color-text-primary)]/10 px-3"
+            >
               <div className="relative min-w-0">
               <button
                 type="button"
@@ -1625,7 +1946,7 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
                 <span className="truncate">
                   {activeView === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
                 </span>
-                <span className="material-symbols-outlined shrink-0 text-[15px] font-normal text-[var(--color-text-tertiary)]">expand_more</span>
+                <span aria-hidden="true" className="material-symbols-outlined shrink-0 text-[15px] font-normal text-[var(--color-text-tertiary)]">expand_more</span>
               </button>
               {isViewMenuOpen && (
                 <div
@@ -1648,7 +1969,7 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
                           {view === 'changed' ? t('workspace.changedFiles') : t('workspace.allFiles')}
                         </span>
                         {selected && (
-                          <span className="material-symbols-outlined text-[14px] text-[var(--color-brand)]">check</span>
+                          <span aria-hidden="true" className="material-symbols-outlined text-[14px] text-[var(--color-brand)]">check</span>
                         )}
                       </button>
                     )
@@ -1664,13 +1985,16 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
                   )}
                 </div>
               )}
-              </header>
-            )}
+            </header>
 
             <WorkspaceFilterInput
               value={filterQuery}
               onChange={setFilterQuery}
               summary={normalizedFilterQuery ? filterSummary : undefined}
+              mode={navigatorView}
+              loading={hasWorkspaceSearch && workspaceSearchLoading}
+              inputRef={filterInputRef}
+              onFocusFirstResult={hasWorkspaceSearch ? focusFirstSearchResult : undefined}
             />
 
             <div className="min-h-0 flex-1 overflow-auto py-1.5">

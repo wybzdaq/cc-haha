@@ -143,14 +143,32 @@ async function createWorkspaceApiGitRepo(baseDir: string): Promise<string> {
     `workspace-api-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   )
 
+  const javaControllerDir = path.join(
+    workDir,
+    'services',
+    'mental-health-service',
+    'src',
+    'main',
+    'java',
+    'com',
+    'example',
+    'campus',
+    'mentalhealth',
+    'controller',
+  )
   await fs.mkdir(path.join(workDir, 'src'), { recursive: true })
+  await fs.mkdir(javaControllerDir, { recursive: true })
   git(workDir, 'init')
   git(workDir, 'config', 'user.email', 'sessions-api@example.com')
   git(workDir, 'config', 'user.name', 'Sessions API')
 
   await fs.writeFile(path.join(workDir, 'tracked.txt'), 'before\n')
   await fs.writeFile(path.join(workDir, 'src', 'app.ts'), 'export const answer = 42\n')
-  git(workDir, 'add', 'tracked.txt', 'src/app.ts')
+  await fs.writeFile(
+    path.join(javaControllerDir, 'MentalHealthTrendController.java'),
+    'package com.example.campus.mentalhealth.controller;\n\npublic final class MentalHealthTrendController {}\n',
+  )
+  git(workDir, 'add', 'tracked.txt', 'src/app.ts', 'services')
   git(workDir, 'commit', '-m', 'initial')
 
   await fs.writeFile(path.join(workDir, 'tracked.txt'), 'before\nafter\n')
@@ -3370,7 +3388,7 @@ describe('Sessions API', () => {
     )
   })
 
-  it('GET /api/sessions/:id/workspace/status|tree|file|diff should return workspace data', async () => {
+  it('GET /api/sessions/:id/workspace/status|tree|search|file|diff should return workspace data', async () => {
     const workDir = await createWorkspaceApiGitRepo(tmpDir)
     const { sessionId } = await service.createSession(workDir)
 
@@ -3403,9 +3421,25 @@ describe('Sessions API', () => {
       path: '',
     })
     expect(treeBody.entries).toEqual([
+      { name: 'services', path: 'services', isDirectory: true },
       { name: 'src', path: 'src', isDirectory: true },
       { name: 'tracked.txt', path: 'tracked.txt', isDirectory: false },
     ])
+
+    const searchRes = await fetch(
+      `${baseUrl}/api/sessions/${sessionId}/workspace/search?query=${encodeURIComponent('MentalHealthTrendController')}`,
+    )
+    expect(searchRes.status).toBe(200)
+    expect(await searchRes.json()).toMatchObject({
+      state: 'ok',
+      query: 'MentalHealthTrendController',
+      truncated: false,
+      entries: [{
+        name: 'MentalHealthTrendController.java',
+        path: 'services/mental-health-service/src/main/java/com/example/campus/mentalhealth/controller/MentalHealthTrendController.java',
+        isDirectory: false,
+      }],
+    })
 
     const fileRes = await fetch(
       `${baseUrl}/api/sessions/${sessionId}/workspace/file?path=${encodeURIComponent('src/app.ts')}`,
@@ -3711,6 +3745,17 @@ describe('Sessions API', () => {
       expect(await res.json()).toMatchObject({
         error: 'BAD_REQUEST',
       })
+    }
+  })
+
+  it('GET /api/sessions/:id/workspace/search should require a non-empty query', async () => {
+    const workDir = await createWorkspaceApiGitRepo(tmpDir)
+    const { sessionId } = await service.createSession(workDir)
+
+    for (const suffix of ['', '?query=%20%20']) {
+      const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/workspace/search${suffix}`)
+      expect(res.status).toBe(400)
+      expect(await res.json()).toMatchObject({ error: 'BAD_REQUEST' })
     }
   })
 

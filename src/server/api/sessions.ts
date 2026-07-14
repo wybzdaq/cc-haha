@@ -46,6 +46,7 @@ import { findGitRoot } from '../../utils/git.js'
 import { traceCaptureService, trimTraceCallPreviews } from '../services/traceCaptureService.js'
 import { getSubagentRunByTool } from '../services/subagentRunService.js'
 import { isValidPermissionMode } from '../services/settingsService.js'
+import { handleWorkspaceSearchRoute } from './workspaceSearch.js'
 
 const DEFAULT_GIT_INFO_COMMAND_TIMEOUT_MS = 3_000
 
@@ -354,7 +355,7 @@ async function handleSessionWorkspaceRoute(
   url: URL,
   workspaceResource?: string,
 ): Promise<Response> {
-  await requireSessionWorkspace(sessionId)
+  const workDir = await requireSessionWorkspace(sessionId)
 
   switch (workspaceResource) {
     case 'status':
@@ -364,6 +365,8 @@ async function handleSessionWorkspaceRoute(
         sessionId,
         url.searchParams.get('path') || '',
       ))
+    case 'search':
+      return handleWorkspaceSearchRoute(workDir, url)
     case 'file':
       return await runWorkspaceRequest(() => workspaceService.readFile(
         sessionId,

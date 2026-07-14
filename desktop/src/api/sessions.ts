@@ -270,6 +270,13 @@ export type WorkspaceTreeResult = {
   error?: string
 }
 
+export type WorkspaceSearchResult = {
+  state: 'ok'
+  query: string
+  truncated: boolean
+  entries: WorkspaceTreeEntry[]
+}
+
 export type WorkspaceDiffResult = {
   state: 'ok' | 'missing' | 'not_git_repo' | 'error'
   path: string
@@ -390,6 +397,11 @@ export const sessionsApi = {
 
   getWorkspaceTree(sessionId: string, workspacePath = '') {
     return api.get<WorkspaceTreeResult>(buildWorkspacePath(sessionId, 'tree', workspacePath))
+  },
+
+  searchWorkspace(sessionId: string, query: string) {
+    const params = new URLSearchParams({ query })
+    return api.get<WorkspaceSearchResult>(`/api/sessions/${sessionId}/workspace/search?${params}`)
   },
 
   getWorkspaceFile(sessionId: string, workspacePath: string) {

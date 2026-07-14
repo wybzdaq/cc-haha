@@ -421,12 +421,16 @@ describe('TraceSession', () => {
 
   it('refetches messages when only the trace message signature changes', async () => {
     const pendingMessages = baseMessages.filter((message) => message.type !== 'tool_result')
+    let resolveRefreshedMessages!: (value: { messages: MessageEntry[] }) => void
+    const refreshedMessages = new Promise<{ messages: MessageEntry[] }>((resolve) => {
+      resolveRefreshedMessages = resolve
+    })
     vi.mocked(sessionsApi.getTrace)
       .mockResolvedValueOnce({ ...baseTrace, messageSignature: '3:tool-use' })
       .mockResolvedValue({ ...baseTrace, messageSignature: '4:tool-result' })
     vi.mocked(sessionsApi.getMessages)
       .mockResolvedValueOnce({ messages: pendingMessages })
-      .mockResolvedValue({ messages: baseMessages })
+      .mockReturnValue(refreshedMessages)
 
     await renderReady(20)
 
@@ -435,7 +439,8 @@ describe('TraceSession', () => {
     expect(within(screen.getByTestId('trace-detail')).queryByText('file.txt')).not.toBeInTheDocument()
 
     await waitFor(() => expect(sessionsApi.getMessages).toHaveBeenCalledTimes(2))
-    expect(within(screen.getByTestId('trace-detail')).getByText('file.txt')).toBeInTheDocument()
+    resolveRefreshedMessages({ messages: baseMessages })
+    expect(await within(screen.getByTestId('trace-detail')).findByText('file.txt')).toBeInTheDocument()
   })
 
   it('applies poll updates when a call changes without changing row counts', async () => {

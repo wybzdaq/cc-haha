@@ -18,7 +18,7 @@ import {
   normalizeDriveRootPathForPlatform,
 } from '../services/windowsDrivePath.js'
 
-type FilesystemEntry = {
+export type FilesystemEntry = {
   name: string
   path: string
   isDirectory: boolean
@@ -189,15 +189,19 @@ async function handleBrowse(url: URL): Promise<Response> {
   }
 }
 
-async function searchFilesystemEntries(
+export async function searchFilesystemEntries(
   rootPath: string,
   searchQuery: string,
-  options: { includeFiles: boolean; maxResults: number },
+  options: { includeFiles: boolean; includeDirectories?: boolean; maxResults: number },
 ): Promise<FilesystemEntry[]> {
   const normalizedQuery = normalizeSearchText(searchQuery)
   if (!normalizedQuery) return []
 
-  const candidates = await getSearchCandidates(rootPath, options.includeFiles)
+  const candidates = await getSearchCandidates(
+    rootPath,
+    options.includeFiles,
+    options.includeDirectories ?? true,
+  )
   const results = candidates
     .map((entry): ScoredFilesystemEntry | null => {
       const relativePath = entry.relativePath ?? entry.name
@@ -221,7 +225,11 @@ async function searchFilesystemEntries(
     .map(({ score: _score, ...entry }) => entry)
 }
 
-async function getSearchCandidates(rootPath: string, includeFiles: boolean): Promise<FilesystemEntry[]> {
+async function getSearchCandidates(
+  rootPath: string,
+  includeFiles: boolean,
+  includeDirectories: boolean,
+): Promise<FilesystemEntry[]> {
   const files = await getProjectSearchFiles(rootPath)
   const entries = new Map<string, FilesystemEntry>()
 
@@ -229,12 +237,14 @@ async function getSearchCandidates(rootPath: string, includeFiles: boolean): Pro
     const normalizedFile = normalizeRelativePath(filePath)
     if (!normalizedFile || !isRelativeInsideRoot(normalizedFile)) continue
 
-    let currentDir = path.posix.dirname(normalizedFile)
-    while (currentDir !== '.') {
-      addCandidate(entries, rootPath, currentDir, true)
-      const parent = path.posix.dirname(currentDir)
-      if (parent === currentDir) break
-      currentDir = parent
+    if (includeDirectories) {
+      let currentDir = path.posix.dirname(normalizedFile)
+      while (currentDir !== '.') {
+        addCandidate(entries, rootPath, currentDir, true)
+        const parent = path.posix.dirname(currentDir)
+        if (parent === currentDir) break
+        currentDir = parent
+      }
     }
 
     if (includeFiles) {
