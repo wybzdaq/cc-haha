@@ -77,4 +77,35 @@ describe('sessionsApi', () => {
     expect(url).toBe('http://127.0.0.1:3456/api/sessions/session-1/workspace/search?query=Mental+Health+Controller')
     expect(init).toMatchObject({ method: 'GET' })
   })
+
+  it('preserves optional local index progress from session list responses', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      sessions: [],
+      total: 0,
+      index: {
+        mode: 'on',
+        state: 'building',
+        discovered: 12,
+        indexed: 4,
+        degradedSources: 0,
+        databaseBytes: 4096,
+        walBytes: 0,
+        lastUpdatedAt: '2026-07-15T00:00:00.000Z',
+        lastErrorCode: null,
+      },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const result = await sessionsApi.list()
+
+    expect(result.index).toMatchObject({
+      mode: 'on',
+      state: 'building',
+      discovered: 12,
+      indexed: 4,
+    })
+  })
 })

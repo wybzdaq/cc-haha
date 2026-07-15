@@ -44,6 +44,7 @@ import {
 import { useComposerFileDrop } from './useComposerFileDrop'
 import { shouldSubmitOnEnter } from './sendShortcut'
 import type { PermissionMode } from '../../types/settings'
+import { getSessionWorkspaceState } from '../../lib/sessionWorkspace'
 
 type GitInfo = SessionGitInfo
 
@@ -187,7 +188,8 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
 
   const isMemberSession = !!memberInfo
   const isActive = chatState !== 'idle'
-  const isWorkspaceMissing = activeSession?.workDirExists === false
+  const workspaceState = getSessionWorkspaceState(activeSession)
+  const isWorkspaceMissing = workspaceState !== 'available'
   const hasWorkspaceReferences = !isMemberSession && workspaceReferences.length > 0
   const isHeroComposer = variant === 'hero' && !isMemberSession && !compact
   const resolvedWorkDir = activeSession?.workDir || gitInfo?.workDir || undefined
@@ -967,7 +969,9 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     isHeroComposer
       ? t('empty.placeholder')
       : isWorkspaceMissing
-        ? t('chat.placeholderMissing')
+        ? workspaceState === 'worktree_removed'
+          ? t('chat.placeholderWorktreeRemoved')
+          : t('chat.placeholderMissing')
         : isMemberSession
           ? t('teams.memberPlaceholder')
           : t('chat.placeholder')

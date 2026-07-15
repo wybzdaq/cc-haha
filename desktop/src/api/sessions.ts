@@ -1,10 +1,14 @@
 import { api } from './client'
 import type { AgentTaskNotification } from '../types/chat'
-import type { SessionListItem, MessageEntry } from '../types/session'
+import type { LocalIndexStatus, SessionListItem, MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
 import type { TraceCallRecord, TraceSession } from '../types/trace'
 
-type SessionsResponse = { sessions: SessionListItem[]; total: number }
+export type SessionsResponse = {
+  sessions: SessionListItem[]
+  total: number
+  index?: LocalIndexStatus
+}
 type MessagesResponse = {
   messages: MessageEntry[]
   taskNotifications?: AgentTaskNotification[]

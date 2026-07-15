@@ -84,6 +84,7 @@
     "build:preview-agent": "bun run ./scripts/build-preview-agent.ts",
     "prepare:ripgrep": "bun run ./scripts/prepare-ripgrep.ts",
     "build:sidecars": "bun run ./scripts/build-sidecars.ts",
+    "test:compiled-sidecar-smoke": "CC_HAHA_RUN_COMPILED_SIDECAR_SMOKE=1 bun run test -- --run scripts/build-sidecars.test.ts",
     "clean:electron-output": "bun run ./scripts/clean-electron-output.ts",
     "build:macos-arm64": "bash ./scripts/build-macos-arm64.sh",
     "build:windows-x64": "powershell -ExecutionPolicy Bypass -File ./scripts/build-windows.ps1 -Arch x64 -Kind installer",

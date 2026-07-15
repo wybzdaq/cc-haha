@@ -224,6 +224,29 @@ describe('ChatInput file mentions', () => {
     vi.unstubAllGlobals()
   })
 
+  it('explains a cleaned worktree without calling the source project missing', () => {
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: 'Cleaned Worktree',
+        createdAt: '2026-05-01T00:00:00.000Z',
+        modifiedAt: '2026-05-01T00:00:00.000Z',
+        messageCount: 1,
+        projectPath: '/repo-worktree',
+        projectRoot: '/repo',
+        workDir: '/repo/.claude/worktrees/desktop-main-12345678',
+        workDirExists: false,
+        workspaceState: 'worktree_removed',
+      }],
+    })
+
+    render(<ChatInput />)
+
+    expect(screen.getByPlaceholderText(
+      'This temporary workspace was cleaned up. Start a new session in the original project to continue.',
+    )).toBeDisabled()
+  })
+
   it('passes diff metadata to the composer card and clears the reference after send', async () => {
     act(() => {
       useWorkspaceChatContextStore.getState().addReference(sessionId, {
