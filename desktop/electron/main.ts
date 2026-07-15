@@ -4,6 +4,7 @@ import path from 'node:path'
 import { ELECTRON_EVENT_CHANNELS, ELECTRON_INTERNAL_CHANNELS, ELECTRON_IPC_CHANNELS, type ElectronIpcChannel } from './ipc/channels'
 import { isElectronIpcChannel, validateElectronIpcPayload } from './ipc/capabilities'
 import { ElectronServerRuntime } from './services/serverRuntime'
+import { electronHostDiagnosticsFile } from './services/sidecarManager'
 import { openDialog, saveDialog } from './services/dialogs'
 import { openExternalUrl, openSystemPath, openSystemSettingsUrl } from './services/shell'
 import {
@@ -19,11 +20,15 @@ import { createUpdateSmokeUpdaterFromEnv } from './services/updateSmoke'
 import { ElectronTerminalService, type TerminalSpawnInput } from './services/terminal'
 import { ElectronPreviewService, type PreviewBounds } from './services/preview'
 import {
+  configureLocalServerRequestAuth,
+  configurePreviewSessionPermissions,
+  createPreviewSessionPartition,
+  type PreviewLocalAccess,
+} from './services/previewSession'
+import {
   applyStartupPortableMode,
-  detectPortableDir,
   getAppMode,
   setAppMode,
-  type PortableDetection,
 } from './services/appMode'
 import { installMacOsChromiumKeychainPromptGuard } from './services/keychain'
 import { applyWindowsAppUserModelId } from './services/appIdentity'
@@ -141,9 +146,18 @@ function getServerRuntime() {
     desktopRoot: unpackedRoot(),
     appRoot: appRoot(),
     h5DistDir: path.join(unpackedRoot(), 'dist'),
+    diagnosticsFile: electronHostDiagnosticsFile(process.env),
     resolveSystemProxy: (url) => session.defaultSession.resolveProxy(url),
   })
   return serverRuntime
+}
+
+function resolveLocalServerAccess(): PreviewLocalAccess | null {
+  const runtime = getServerRuntime()
+  const serverUrl = runtime.getActiveServerUrl()
+  return serverUrl
+    ? { serverUrl, token: runtime.getLocalAccessToken() }
+    : null
 }
 
 function getUpdaterService() {
@@ -185,11 +199,17 @@ function getPreviewService() {
       const view = new WebContentsView({
         webPreferences: {
           preload: previewPreloadPath(),
+          partition: createPreviewSessionPartition(),
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: true,
         },
       })
+      configurePreviewSessionPermissions(view.webContents.session)
+      configureLocalServerRequestAuth(
+        view.webContents.session.webRequest,
+        resolveLocalServerAccess,
+      )
       installPreviewNavigationGuards(view.webContents, { openExternal: openExternalUrl })
       return view
     },
@@ -261,6 +281,10 @@ function registerIpcHandlers() {
   })
   registerHandler(ELECTRON_IPC_CHANNELS.appGetVersion, () => formatDisplayVersion(app.getVersion()))
   registerHandler(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl, () => getServerRuntime().getServerUrl())
+  registerHandler(
+    ELECTRON_IPC_CHANNELS.runtimeGetLocalAccessToken,
+    () => getServerRuntime().getLocalAccessToken(),
+  )
   registerHandler(ELECTRON_IPC_CHANNELS.commandInvoke, (_event, payload) => handleCommandInvoke(payload))
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardReadText, () => clipboard.readText())
   registerHandler(ELECTRON_IPC_CHANNELS.clipboardWriteText, (_event, payload) => clipboard.writeText(String(payload)))
@@ -336,8 +360,7 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.previewMessage, (event, payload) => getPreviewService().message(payload, event.sender))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeGet, () => getAppMode(app))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeSet, (_event, payload) => setAppMode(app, payload as Parameters<typeof setAppMode>[1]))
-  registerHandler(ELECTRON_IPC_CHANNELS.appModeDetectPortableDir, () => detectPortableDir(app) as PortableDetection)
-  registerHandler(ELECTRON_IPC_CHANNELS.appModePrepareRestart, () => getServerRuntime().stopAll())
+  registerHandler(ELECTRON_IPC_CHANNELS.appModePrepareRestart, () => getServerRuntime().stopAll(true))
   registerHandler(ELECTRON_IPC_CHANNELS.appModeRestart, () => {
     isQuitting = true
     app.relaunch()
@@ -363,6 +386,10 @@ async function createMainWindow() {
       sandbox: true,
     },
   })
+  configureLocalServerRequestAuth(
+    mainWindow.webContents.session.webRequest,
+    resolveLocalServerAccess,
+  )
 
   installMainWindowNavigationGuards(mainWindow.webContents, { openExternal: openExternalUrl })
   installPreviewCleanupOnRendererNavigation(mainWindow.webContents, () => {

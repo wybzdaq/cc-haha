@@ -1,7 +1,7 @@
 {
   "name": "claude-code-desktop",
   "private": true,
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Desktop coding agent workbench for Claude Code Haha.",
   "homepage": "https://github.com/NanmiCoder/cc-haha",
   "author": {
@@ -56,7 +56,8 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh"
     },
     "linux": {
       "target": [
@@ -88,6 +89,7 @@
     "build:windows-x64:dir": "powershell -ExecutionPolicy Bypass -File ./scripts/build-windows.ps1 -Arch x64 -Kind portable-dir",
     "build:windows-arm64": "powershell -ExecutionPolicy Bypass -File ./scripts/build-windows.ps1 -Arch arm64 -Kind installer",
     "build:windows-arm64:dir": "powershell -ExecutionPolicy Bypass -File ./scripts/build-windows.ps1 -Arch arm64 -Kind portable-dir",
+    "test:windows-storage-recovery": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./build/recover-legacy-install-data.ps1 -SelfTest",
     "build:linux-x64": "bash ./scripts/build-linux.sh",
     "build:linux-arm64": "LINUX_ARCH=arm64 bash ./scripts/build-linux.sh",
     "electron:dev": "bun run build:electron && bun run ./scripts/electron-dev.ts",
