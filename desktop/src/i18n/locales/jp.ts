@@ -120,6 +120,11 @@ export const jp: Record<TranslationKey, string> = {
   'openWith.fileType.web': 'Web',
   'openWith.fileType.image': '画像',
   'openWith.fileType.code': 'コード',
+  'openWith.fileType.spreadsheet': 'スプレッドシート',
+  'openWith.fileType.presentation': 'プレゼンテーション',
+  'openWith.fileType.archive': 'アーカイブ',
+  'openWith.fileType.audio': 'オーディオ',
+  'openWith.fileType.video': 'ビデオ',
   'openWith.fileType.file': 'ファイル',
 
   // ─── Assistant Output Targets ──────────────────────
@@ -209,6 +214,8 @@ export const jp: Record<TranslationKey, string> = {
   'workspace.diffReview.diffChanged': '差分が更新されました。このコメントを送信するには行を選択し直してください。',
   'workspace.diffReview.collapsedSelection': '選択した行は折りたたまれたプレビューの範囲外です。表示中の行を選択し直してください。',
   'attachments.remove': '{name} を削除',
+  'attachments.open': '{name} を開く',
+  'attachments.openFailed': '{name} を開けませんでした。ファイルが移動または削除された可能性があります。',
 
   // ─── Status Bar ──────────────────────────────────────
   'status.connected': '接続済み',

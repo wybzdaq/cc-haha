@@ -118,6 +118,11 @@ export const en = {
   'openWith.fileType.web': 'Web',
   'openWith.fileType.image': 'Image',
   'openWith.fileType.code': 'Code',
+  'openWith.fileType.spreadsheet': 'Spreadsheet',
+  'openWith.fileType.presentation': 'Presentation',
+  'openWith.fileType.archive': 'Archive',
+  'openWith.fileType.audio': 'Audio',
+  'openWith.fileType.video': 'Video',
   'openWith.fileType.file': 'File',
 
   // ─── Assistant Output Targets ──────────────────────
@@ -207,6 +212,8 @@ export const en = {
   'workspace.diffReview.diffChanged': 'Diff changed. Select lines again to submit this comment.',
   'workspace.diffReview.collapsedSelection': 'Selection is outside the collapsed preview. Select visible lines again to submit this comment.',
   'attachments.remove': 'Remove {name}',
+  'attachments.open': 'Open {name}',
+  'attachments.openFailed': 'Could not open {name}. The file may have been moved or deleted.',
 
   // ─── Status Bar ──────────────────────────────────────
   'status.connected': 'Connected',

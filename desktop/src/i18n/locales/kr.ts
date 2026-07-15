@@ -120,6 +120,11 @@ export const kr: Record<TranslationKey, string> = {
   'openWith.fileType.web': '웹',
   'openWith.fileType.image': '이미지',
   'openWith.fileType.code': '코드',
+  'openWith.fileType.spreadsheet': '스프레드시트',
+  'openWith.fileType.presentation': '프레젠테이션',
+  'openWith.fileType.archive': '압축 파일',
+  'openWith.fileType.audio': '오디오',
+  'openWith.fileType.video': '비디오',
   'openWith.fileType.file': '파일',
 
   // ─── Assistant Output Targets ──────────────────────
@@ -209,6 +214,8 @@ export const kr: Record<TranslationKey, string> = {
   'workspace.diffReview.diffChanged': 'Diff가 변경되었습니다. 이 댓글을 제출하려면 줄을 다시 선택하세요.',
   'workspace.diffReview.collapsedSelection': '선택한 줄이 접힌 미리보기 범위 밖에 있습니다. 표시된 줄을 다시 선택하세요.',
   'attachments.remove': '{name} 제거',
+  'attachments.open': '{name} 열기',
+  'attachments.openFailed': '{name}을(를) 열 수 없습니다. 파일이 이동되었거나 삭제되었을 수 있습니다.',
 
   // ─── Status Bar ──────────────────────────────────────
   'status.connected': '연결됨',

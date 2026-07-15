@@ -120,6 +120,11 @@ export const zh: Record<TranslationKey, string> = {
   'openWith.fileType.web': '網頁',
   'openWith.fileType.image': '圖片',
   'openWith.fileType.code': '程式碼',
+  'openWith.fileType.spreadsheet': '試算表',
+  'openWith.fileType.presentation': '簡報',
+  'openWith.fileType.archive': '壓縮檔',
+  'openWith.fileType.audio': '音訊',
+  'openWith.fileType.video': '影片',
   'openWith.fileType.file': '檔案',
 
   // ─── Assistant Output Targets ──────────────────────
@@ -209,6 +214,8 @@ export const zh: Record<TranslationKey, string> = {
   'workspace.diffReview.diffChanged': '差異已更新。請重新選擇行以提交此評論。',
   'workspace.diffReview.collapsedSelection': '所選行不在收合後的預覽中。請重新選擇可見行以提交此評論。',
   'attachments.remove': '移除 {name}',
+  'attachments.open': '開啟 {name}',
+  'attachments.openFailed': '無法開啟 {name}，檔案可能已被移動或刪除。',
 
   // ─── Status Bar ──────────────────────────────────────
   'status.connected': '已連線',
