@@ -19,8 +19,10 @@ import { useNavigation } from '@react-navigation/native'
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack'
 import { Ionicons } from '@expo/vector-icons'
 import { checkConnection, initBaseUrl } from '../api/client'
+import { filesystemApi, type RemoteFilesystemEntry } from '../api/filesystem'
 import { sessionsApi } from '../api/sessions'
 import { DEFAULT_WORK_DIR } from '../constants/config'
+import { canBrowseParent, directoryEntriesOnly } from '../lib/folderPicker'
 import {
   chooseDefaultWorkDir,
   runForegroundConnection,
@@ -66,6 +68,12 @@ export default function SessionListScreen() {
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([])
   const [recentProjectsLoading, setRecentProjectsLoading] = useState(false)
   const [creatingSession, setCreatingSession] = useState(false)
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false)
+  const [folderCurrentPath, setFolderCurrentPath] = useState('')
+  const [folderParentPath, setFolderParentPath] = useState('')
+  const [folderEntries, setFolderEntries] = useState<RemoteFilesystemEntry[]>([])
+  const [folderLoading, setFolderLoading] = useState(false)
+  const [folderError, setFolderError] = useState('')
   const [connectionStatus, setConnectionStatus] = useState<ForegroundConnectionStatus>('checking')
   const [connectionMessage, setConnectionMessage] = useState('Connecting to Windows desktop...')
   const appStateRef = useRef<MobileAppState | null>(null)
@@ -161,12 +169,41 @@ export default function SessionListScreen() {
 
   const openNewSession = async () => {
     setNewSessionOpen(true)
+    setFolderPickerOpen(false)
+    setFolderError('')
     const projects = await loadRecentProjects()
     setWorkDirDraft(chooseDefaultWorkDir({
       selectedProjectPath: selectedProject?.path,
       recentProjects: projects,
       fallbackWorkDir: DEFAULT_WORK_DIR,
     }))
+  }
+
+  const loadFolder = async (path?: string) => {
+    setFolderLoading(true)
+    setFolderError('')
+    try {
+      const listing = await filesystemApi.browse(path)
+      setFolderCurrentPath(listing.currentPath)
+      setFolderParentPath(listing.parentPath)
+      setFolderEntries(directoryEntriesOnly(listing.entries))
+    } catch (error) {
+      setFolderEntries([])
+      setFolderError((error as Error).message || 'Failed to read this folder')
+    } finally {
+      setFolderLoading(false)
+    }
+  }
+
+  const openFolderPicker = () => {
+    setFolderPickerOpen(true)
+    void loadFolder(workDirDraft)
+  }
+
+  const handleUseCurrentFolder = () => {
+    if (!folderCurrentPath) return
+    setWorkDirDraft(folderCurrentPath)
+    setFolderPickerOpen(false)
   }
 
   const handleCreateSession = async (workDir = workDirDraft) => {
@@ -413,21 +450,114 @@ export default function SessionListScreen() {
             </Text>
 
             <Text style={styles.inputLabel}>Windows folder path</Text>
-            <TextInput
-              value={workDirDraft}
-              onChangeText={setWorkDirDraft}
-              placeholder="D:\\Code\\Ai\\cc-haha"
-              autoCapitalize="none"
-              autoCorrect={false}
-              style={styles.pathInput}
-            />
+            <View style={styles.pathInputRow}>
+              <TextInput
+                value={workDirDraft}
+                onChangeText={setWorkDirDraft}
+                placeholder="D:\\Code\\Ai\\cc-haha"
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={styles.pathInput}
+              />
+              <TouchableOpacity
+                accessibilityLabel="Browse Windows folders"
+                style={styles.browseButton}
+                onPress={openFolderPicker}
+              >
+                <Ionicons name="folder-open-outline" size={21} color="#172033" />
+              </TouchableOpacity>
+            </View>
+
+            {folderPickerOpen ? (
+              <View style={styles.folderPickerPanel}>
+                <View style={styles.folderPickerHeader}>
+                  <View style={styles.folderPathBlock}>
+                    <Text style={styles.folderPickerTitle}>Computer folders</Text>
+                    <Text style={styles.folderPathText} numberOfLines={1}>
+                      {folderCurrentPath || workDirDraft || 'Windows home'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    accessibilityLabel="Close folder picker"
+                    style={styles.folderIconButton}
+                    onPress={() => setFolderPickerOpen(false)}
+                  >
+                    <Ionicons name="close-outline" size={22} color="#52627A" />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.folderToolbar}>
+                  <TouchableOpacity
+                    style={[
+                      styles.folderToolbarButton,
+                      !canBrowseParent(folderCurrentPath, folderParentPath) && styles.folderToolbarButtonDisabled,
+                    ]}
+                    disabled={!canBrowseParent(folderCurrentPath, folderParentPath) || folderLoading}
+                    onPress={() => loadFolder(folderParentPath)}
+                  >
+                    <Ionicons name="arrow-up-outline" size={16} color="#172033" />
+                    <Text style={styles.folderToolbarText}>Parent</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.folderToolbarButton}
+                    disabled={folderLoading}
+                    onPress={() => loadFolder(folderCurrentPath || workDirDraft)}
+                  >
+                    <Ionicons name="refresh-outline" size={16} color="#172033" />
+                    <Text style={styles.folderToolbarText}>Refresh</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.folderToolbarButton, styles.folderUseButton]}
+                    disabled={!folderCurrentPath}
+                    onPress={handleUseCurrentFolder}
+                  >
+                    <Ionicons name="checkmark-outline" size={16} color="#FFFFFF" />
+                    <Text style={styles.folderUseButtonText}>Use</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {folderLoading ? (
+                  <View style={styles.folderLoadingRow}>
+                    <ActivityIndicator size="small" color="#6539C9" />
+                    <Text style={styles.folderHintText}>Reading this folder...</Text>
+                  </View>
+                ) : folderError ? (
+                  <View style={styles.folderErrorBox}>
+                    <Text style={styles.folderErrorText}>{folderError}</Text>
+                    <TouchableOpacity onPress={() => loadFolder(undefined)}>
+                      <Text style={styles.folderErrorAction}>Open Windows home</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <ScrollView style={styles.folderList} keyboardShouldPersistTaps="handled">
+                    {folderEntries.length === 0 ? (
+                      <Text style={styles.folderHintText}>No child folders here.</Text>
+                    ) : null}
+                    {folderEntries.map((entry) => (
+                      <TouchableOpacity
+                        key={entry.path}
+                        style={styles.folderRow}
+                        onPress={() => loadFolder(entry.path)}
+                      >
+                        <Ionicons name="folder-outline" size={18} color="#52627A" />
+                        <Text style={styles.folderRowText} numberOfLines={1}>{entry.name}</Text>
+                        <Ionicons name="chevron-forward-outline" size={18} color="#9BA8B7" />
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                )}
+              </View>
+            ) : null}
 
             <View style={styles.modalSectionHeader}>
               <Text style={styles.recentTitle}>Recent projects</Text>
               {recentProjectsLoading ? <ActivityIndicator size="small" color="#6539C9" /> : null}
             </View>
 
-            <ScrollView style={styles.recentList} keyboardShouldPersistTaps="handled">
+            <ScrollView
+              style={[styles.recentList, folderPickerOpen && styles.recentListCompact]}
+              keyboardShouldPersistTaps="handled"
+            >
               {recentProjects.length === 0 && !recentProjectsLoading ? (
                 <Text style={styles.noRecentText}>No recent projects from Windows yet.</Text>
               ) : null}
@@ -813,6 +943,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   pathInput: {
+    flex: 1,
     minHeight: 46,
     borderRadius: 10,
     borderWidth: 1,
@@ -821,6 +952,136 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     color: '#172033',
     fontSize: 14,
+  },
+  pathInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  browseButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#D7E0EA',
+    backgroundColor: '#EEF3F8',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  folderPickerPanel: {
+    marginTop: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#DDE6EF',
+    backgroundColor: '#F8FBFD',
+    padding: 12,
+  },
+  folderPickerHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  folderPathBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  folderPickerTitle: {
+    color: '#172033',
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  folderPathText: {
+    marginTop: 3,
+    color: '#607089',
+    fontSize: 12,
+  },
+  folderIconButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E8EFF6',
+  },
+  folderToolbar: {
+    marginTop: 10,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  folderToolbarButton: {
+    minHeight: 34,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    borderRadius: 8,
+    backgroundColor: '#E8EFF6',
+    paddingHorizontal: 10,
+  },
+  folderToolbarButtonDisabled: {
+    opacity: 0.45,
+  },
+  folderToolbarText: {
+    color: '#172033',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  folderUseButton: {
+    marginLeft: 'auto',
+    backgroundColor: '#172033',
+  },
+  folderUseButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  folderLoadingRow: {
+    minHeight: 76,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  folderList: {
+    marginTop: 8,
+    maxHeight: 180,
+  },
+  folderRow: {
+    minHeight: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#DFE8F1',
+  },
+  folderRowText: {
+    flex: 1,
+    color: '#172033',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  folderHintText: {
+    color: '#607089',
+    fontSize: 13,
+    lineHeight: 20,
+    paddingVertical: 10,
+  },
+  folderErrorBox: {
+    marginTop: 10,
+    borderRadius: 8,
+    backgroundColor: '#FFF7F5',
+    padding: 10,
+  },
+  folderErrorText: {
+    color: '#A33A2E',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  folderErrorAction: {
+    marginTop: 6,
+    color: '#172033',
+    fontSize: 12,
+    fontWeight: '900',
   },
   modalSectionHeader: {
     marginTop: 16,
@@ -837,6 +1098,9 @@ const styles = StyleSheet.create({
   },
   recentList: {
     maxHeight: 240,
+  },
+  recentListCompact: {
+    maxHeight: 120,
   },
   noRecentText: {
     color: '#607089',
