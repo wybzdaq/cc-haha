@@ -179,6 +179,30 @@ describe('ConversationService', () => {
     )
   }
 
+  function installNetworkTestSession(
+    service: any,
+    sessionId: string,
+    sent: string[],
+    networkDerivedFirstTokenTimeout = true,
+  ) {
+    const session = {
+      outputCallbacks: [],
+      networkRoutingFingerprint: '',
+      networkDerivedFirstTokenTimeout,
+      sdkSocket: {
+        send(line: string) {
+          sent.push(line)
+        },
+      },
+      pendingOutbound: [],
+      usesOfficialOAuth: false,
+      officialOAuthToken: null,
+      pendingPermissionRequests: new Map(),
+    }
+    service.sessions.set(sessionId, session)
+    return session
+  }
+
   test('keeps inherited provider env when no desktop provider config exists', async () => {
     const service = new ConversationService() as any
     const env = (await service.buildChildEnv('D:\\workspace\\code\\myself_code\\cc-haha')) as Record<string, string>
@@ -326,8 +350,37 @@ describe('ConversationService', () => {
     expect(env.API_TIMEOUT_MS).toBe('180000')
     expect(env.HTTP_PROXY).toBe('http://127.0.0.1:7890')
     expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:7890')
+    expect(env.ALL_PROXY).toBe('http://127.0.0.1:7890')
+    expect(env.all_proxy).toBe('http://127.0.0.1:7890')
     expect(env.NO_PROXY).toContain('127.0.0.1')
     expect(env.no_proxy).toContain('localhost')
+  })
+
+  test('buildChildEnv routes system mode through the host-managed dynamic bridge', async () => {
+    const originalBridgeUrl = process.env.CC_HAHA_SYSTEM_PROXY_URL
+    process.env.CC_HAHA_SYSTEM_PROXY_URL = 'http://127.0.0.1:17890'
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({
+        network: {
+          proxy: { mode: 'system', url: '' },
+        },
+      }),
+      'utf-8',
+    )
+
+    try {
+      const service = new ConversationService() as any
+      const env = (await service.buildChildEnv('/tmp')) as Record<string, string>
+
+      expect(env.HTTP_PROXY).toBe('http://127.0.0.1:17890')
+      expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:17890')
+      expect(env.ALL_PROXY).toBe('http://127.0.0.1:17890')
+      expect(env.all_proxy).toBe('http://127.0.0.1:17890')
+    } finally {
+      if (originalBridgeUrl === undefined) delete process.env.CC_HAHA_SYSTEM_PROXY_URL
+      else process.env.CC_HAHA_SYSTEM_PROXY_URL = originalBridgeUrl
+    }
   })
 
   test('buildChildEnv ties the first-token watchdog to the user request timeout so slow prefill is not killed early (#826)', async () => {
@@ -436,6 +489,117 @@ describe('ConversationService', () => {
     expect(JSON.parse(sent[0]!).type).toBe('update_environment_variables')
     expect(JSON.parse(sent[0]!).variables.CLAUDE_CODE_OAUTH_TOKEN).toBe('fresh-after-wake-token')
     expect(JSON.parse(sent[1]!).type).toBe('user')
+  })
+
+  test('sendMessage hot-applies direct to system routing before the next user turn', async () => {
+    const originalBridgeUrl = process.env.CC_HAHA_SYSTEM_PROXY_URL
+    process.env.CC_HAHA_SYSTEM_PROXY_URL = 'http://127.0.0.1:17890'
+    try {
+      await fs.writeFile(
+        path.join(tmpDir, 'settings.json'),
+        JSON.stringify({ network: { proxy: { mode: 'direct', url: '' } } }),
+        'utf-8',
+      )
+      const service = new ConversationService() as any
+      const sent: string[] = []
+      const session = installNetworkTestSession(service, 'direct-to-system', sent)
+      await service.refreshNetworkEnvironmentBeforeTurn('direct-to-system', session)
+
+      await fs.writeFile(
+        path.join(tmpDir, 'settings.json'),
+        JSON.stringify({ network: { proxy: { mode: 'system', url: '' } } }),
+        'utf-8',
+      )
+
+      expect(await service.sendMessage('direct-to-system', 'use system proxy')).toBe(true)
+      expect(sent).toHaveLength(2)
+      const update = JSON.parse(sent[0]!)
+      expect(update.type).toBe('update_environment_variables')
+      expect(update.variables).toMatchObject({
+        HTTP_PROXY: 'http://127.0.0.1:17890',
+        HTTPS_PROXY: 'http://127.0.0.1:17890',
+        http_proxy: 'http://127.0.0.1:17890',
+        https_proxy: 'http://127.0.0.1:17890',
+        ALL_PROXY: 'http://127.0.0.1:17890',
+        all_proxy: 'http://127.0.0.1:17890',
+        API_TIMEOUT_MS: '600000',
+        CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS: '600000',
+      })
+      expect(update.variables.NO_PROXY).toContain('127.0.0.1')
+      expect(update.variables.no_proxy).toContain('localhost')
+      expect(JSON.parse(sent[1]!).type).toBe('user')
+    } finally {
+      if (originalBridgeUrl === undefined) delete process.env.CC_HAHA_SYSTEM_PROXY_URL
+      else process.env.CC_HAHA_SYSTEM_PROXY_URL = originalBridgeUrl
+    }
+  })
+
+  test('sendMessage hot-applies manual proxy and timeout changes before the next user turn', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({
+        network: {
+          aiRequestTimeoutMs: 600_000,
+          proxy: { mode: 'manual', url: 'http://127.0.0.1:17891' },
+        },
+      }),
+      'utf-8',
+    )
+    const service = new ConversationService() as any
+    const sent: string[] = []
+    const session = installNetworkTestSession(service, 'manual-change', sent)
+    await service.refreshNetworkEnvironmentBeforeTurn('manual-change', session)
+
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({
+        network: {
+          aiRequestTimeoutMs: 180_000,
+          proxy: { mode: 'manual', url: 'http://127.0.0.1:17892' },
+        },
+      }),
+      'utf-8',
+    )
+
+    expect(await service.sendMessage('manual-change', 'use changed proxy')).toBe(true)
+    expect(sent).toHaveLength(2)
+    const update = JSON.parse(sent[0]!)
+    expect(update.type).toBe('update_environment_variables')
+    expect(update.variables).toMatchObject({
+      HTTP_PROXY: 'http://127.0.0.1:17892',
+      HTTPS_PROXY: 'http://127.0.0.1:17892',
+      ALL_PROXY: 'http://127.0.0.1:17892',
+      all_proxy: 'http://127.0.0.1:17892',
+      API_TIMEOUT_MS: '180000',
+      CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS: '180000',
+    })
+    expect(JSON.parse(sent[1]!).type).toBe('user')
+  })
+
+  test('sendMessage does not resend network env when the system bridge fingerprint is unchanged', async () => {
+    const originalBridgeUrl = process.env.CC_HAHA_SYSTEM_PROXY_URL
+    process.env.CC_HAHA_SYSTEM_PROXY_URL = 'http://127.0.0.1:17893'
+    try {
+      await fs.writeFile(
+        path.join(tmpDir, 'settings.json'),
+        JSON.stringify({ network: { proxy: { mode: 'system', url: '' } } }),
+        'utf-8',
+      )
+      const service = new ConversationService() as any
+      const sent: string[] = []
+      const session = installNetworkTestSession(service, 'unchanged-system', sent)
+      await service.refreshNetworkEnvironmentBeforeTurn('unchanged-system', session)
+
+      // PAC/system rules are resolved dynamically inside this stable bridge URL.
+      // Their changes must not churn the CLI environment between turns.
+      expect(await service.sendMessage('unchanged-system', 'same bridge')).toBe(true)
+
+      expect(sent).toHaveLength(1)
+      expect(JSON.parse(sent[0]!).type).toBe('user')
+    } finally {
+      if (originalBridgeUrl === undefined) delete process.env.CC_HAHA_SYSTEM_PROXY_URL
+      else process.env.CC_HAHA_SYSTEM_PROXY_URL = originalBridgeUrl
+    }
   })
 
   test('buildChildEnv does NOT inject CLAUDE_CODE_OAUTH_TOKEN when not official mode', async () => {

@@ -152,7 +152,7 @@ const DEFAULT_UPDATE_PROXY_SETTINGS: UpdateProxySettings = {
 const DEFAULT_NETWORK_SETTINGS: NetworkSettings = {
   aiRequestTimeoutMs: 600_000,
   proxy: {
-    mode: 'direct',
+    mode: 'system',
     url: '',
   },
 }
@@ -664,9 +664,9 @@ function normalizeNetworkSettings(
     : DEFAULT_NETWORK_SETTINGS.aiRequestTimeoutMs
   const proxyMode = settings?.proxy?.mode === 'manual'
     ? 'manual'
-    : settings?.proxy?.mode === 'system'
-      ? 'system'
-      : 'direct'
+    : settings?.proxy?.mode === 'direct'
+      ? 'direct'
+      : 'system'
 
   return {
     aiRequestTimeoutMs: timeout,

@@ -24,6 +24,10 @@ import {
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
 import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
 import { diagnosticsService } from './diagnosticsService.js'
+import {
+  buildNetworkEnvironment,
+  loadNetworkSettings,
+} from './networkSettings.js'
 import { resolveLocalIndexMode } from './localIndex/config.js'
 import {
   captureScheduledRunReadModelTarget,
@@ -869,6 +873,10 @@ export class CronScheduler {
         explicitProviderEnv?.ANTHROPIC_MODEL ||
         cleanEnv.ANTHROPIC_MODEL,
     )
+    const networkEnv = buildNetworkEnvironment(
+      await loadNetworkSettings(),
+      cleanEnv,
+    )
 
     return {
       ...cleanEnv,
@@ -887,6 +895,7 @@ export class CronScheduler {
       ...(this.shouldMarkManagedOAuth(task.providerId)
         ? await this.buildOfficialOAuthEnv()
         : {}),
+      ...networkEnv,
       ...attributionHeaderEnv,
     }
   }

@@ -5,7 +5,9 @@ import path from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SidecarChild, SidecarPlan } from './sidecarManager'
+import { SYSTEM_PROXY_ERROR_ENV } from './sidecarManager'
 import { ElectronServerRuntime } from './serverRuntime'
+import type { SystemProxyBridgeLike } from './systemProxyBridge'
 
 const sidecarMocks = {
   nextPort: 49321,
@@ -38,12 +40,19 @@ class FakeSidecarChild extends EventEmitter {
   readonly kill = vi.fn()
 }
 
-function createRuntime(options: { appRoot?: string, diagnosticsFile?: string } = {}) {
+function createRuntime(options: {
+  appRoot?: string
+  diagnosticsFile?: string
+  env?: NodeJS.ProcessEnv
+  resolveSystemProxy?: (url: string) => Promise<string>
+  proxyBridge?: SystemProxyBridgeLike
+} = {}) {
   return new ElectronServerRuntime({
     desktopRoot: '/isolated/desktop',
     appRoot: options.appRoot,
     diagnosticsFile: options.diagnosticsFile,
-    env: { CLAUDE_CONFIG_DIR: isolatedConfigDir },
+    env: { CLAUDE_CONFIG_DIR: isolatedConfigDir, ...options.env },
+    resolveSystemProxy: options.resolveSystemProxy,
     deps: {
       appendHostDiagnostic: sidecarMocks.appendHostDiagnostic,
       preferredServerPorts: () => [],
@@ -51,6 +60,9 @@ function createRuntime(options: { appRoot?: string, diagnosticsFile?: string } =
       spawnSidecar: sidecarMocks.spawnSidecar,
       waitForServer: async () => await sidecarMocks.waitForServerImpl(),
       writeLastServerPort: () => undefined,
+      ...(options.proxyBridge
+        ? { createSystemProxyBridge: () => options.proxyBridge! }
+        : {}),
     },
   })
 }
@@ -138,6 +150,99 @@ describe('ElectronServerRuntime', () => {
       .filter(plan => plan.args[0] === 'adapters')) {
       expect(adapter.env.CC_HAHA_LOCAL_ACCESS_TOKEN).toBe(token)
     }
+  })
+
+  it('gives the server only the dynamic bridge URL while adapters explicitly inherit it', async () => {
+    const bridge = {
+      start: vi.fn(async () => 'http://127.0.0.1:49123'),
+      stop: vi.fn(async () => undefined),
+    }
+    const runtime = createRuntime({
+      env: {
+        HTTP_PROXY: 'http://stale.example:8080',
+        HTTPS_PROXY: 'http://stale.example:8080',
+        ALL_PROXY: 'socks5://stale.example:1080',
+        all_proxy: 'socks5://stale.example:1080',
+      },
+      resolveSystemProxy: async () => 'DIRECT',
+      proxyBridge: bridge,
+    })
+
+    await runtime.startServer()
+
+    const serverEnv = sidecarMocks.serverPlans[0]!.env
+    expect(serverEnv.CC_HAHA_SYSTEM_PROXY_URL).toBe('http://127.0.0.1:49123')
+    expect(serverEnv.HTTP_PROXY).toBeUndefined()
+    expect(serverEnv.HTTPS_PROXY).toBeUndefined()
+    expect(serverEnv.ALL_PROXY).toBeUndefined()
+    expect(serverEnv.all_proxy).toBeUndefined()
+    const adapterPlans = sidecarMocks.spawnSidecar.mock.calls
+      .map(([plan]) => plan)
+      .filter(plan => plan.args[0] === 'adapters')
+    expect(adapterPlans).toHaveLength(5)
+    for (const plan of adapterPlans) {
+      expect(plan.env.HTTP_PROXY).toBe('http://127.0.0.1:49123')
+      expect(plan.env.HTTPS_PROXY).toBe('http://127.0.0.1:49123')
+      expect(plan.env.ALL_PROXY).toBe('http://127.0.0.1:49123')
+      expect(plan.env.all_proxy).toBe('http://127.0.0.1:49123')
+    }
+
+    runtime.stopAll()
+    expect(bridge.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not spawn a server when stopAll races with proxy bridge startup', async () => {
+    let releaseBridge!: (url: string) => void
+    const bridge = {
+      start: vi.fn(() => new Promise<string>(resolve => { releaseBridge = resolve })),
+      stop: vi.fn(async () => undefined),
+    }
+    const runtime = createRuntime({
+      resolveSystemProxy: async () => 'DIRECT',
+      proxyBridge: bridge,
+    })
+
+    const starting = runtime.startServer()
+    for (let attempt = 0; attempt < 10 && bridge.start.mock.calls.length === 0; attempt++) {
+      await Promise.resolve()
+    }
+    expect(bridge.start).toHaveBeenCalledTimes(1)
+    runtime.stopAll()
+    releaseBridge('http://127.0.0.1:49123')
+
+    await expect(starting).rejects.toThrow('server startup stopped')
+    expect(sidecarMocks.spawnSidecar).not.toHaveBeenCalled()
+    expect(bridge.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes a sanitized bridge startup failure to the server without silently using direct mode', async () => {
+    const bridge = {
+      start: vi.fn(async () => {
+        throw new Error('failed via https://user:password@proxy.example/path with sk-secret12345678')
+      }),
+      stop: vi.fn(async () => undefined),
+    }
+    const runtime = createRuntime({
+      env: {
+        HTTP_PROXY: 'http://stale.example:8080',
+        HTTPS_PROXY: 'http://stale.example:8080',
+        ALL_PROXY: 'socks5://stale.example:1080',
+      },
+      resolveSystemProxy: async () => 'DIRECT',
+      proxyBridge: bridge,
+    })
+
+    await runtime.startServer()
+
+    const serverEnv = sidecarMocks.serverPlans[0]!.env
+    expect(serverEnv.HTTP_PROXY).toBeUndefined()
+    expect(serverEnv.HTTPS_PROXY).toBeUndefined()
+    expect(serverEnv.ALL_PROXY).toBeUndefined()
+    expect(serverEnv.CC_HAHA_SYSTEM_PROXY_URL).toBeUndefined()
+    expect(serverEnv[SYSTEM_PROXY_ERROR_ENV]).toContain('System proxy bridge unavailable: failed via')
+    expect(serverEnv[SYSTEM_PROXY_ERROR_ENV]).not.toContain('password')
+    expect(serverEnv[SYSTEM_PROXY_ERROR_ENV]).not.toContain('sk-secret')
+    expect(sidecarMocks.serverChildren).toHaveLength(1)
   })
 
   it('persists a server startup failure through the sanitized host-log boundary', async () => {
