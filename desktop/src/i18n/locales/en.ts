@@ -205,6 +205,7 @@ export const en = {
   'workspace.localComment': 'Local comment',
   'workspace.commentLine': 'Comment line {line}',
   'workspace.commentLineTarget': 'Line {line}',
+  'workspace.commentLineRangeTarget': 'Lines {start}–{end}',
   'workspace.commentPlaceholder': 'Describe what should change here...',
   'workspace.addCommentToChat': 'Add comment',
   'workspace.diffReview.commentLineAria': 'Comment on {path} {side} line {line}',

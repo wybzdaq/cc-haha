@@ -207,6 +207,7 @@ export const zh: Record<TranslationKey, string> = {
   'workspace.localComment': '本地评论',
   'workspace.commentLine': '评论第 {line} 行',
   'workspace.commentLineTarget': '第 {line} 行',
+  'workspace.commentLineRangeTarget': '第 {start}–{end} 行',
   'workspace.commentPlaceholder': '描述你希望这里怎么改...',
   'workspace.addCommentToChat': '添加评论',
   'workspace.diffReview.commentLineAria': '评论 {path} 的{side}侧第 {line} 行',

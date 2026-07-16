@@ -2247,6 +2247,82 @@ describe('WorkspacePanel', () => {
     ])
   })
 
+  it('adds a Shift-selected line range comment from a code preview to the chat context', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-line-range-comment': {
+          isOpen: true,
+          activeView: 'all',
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-line-range-comment': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-line-range-comment': [{
+          id: 'file:src/App.tsx',
+          path: 'src/App.tsx',
+          kind: 'file',
+          title: 'App.tsx',
+          language: 'tsx',
+          content: 'const title = "Todo"\nconst count = 1\nexport default title',
+          state: 'ok',
+          size: 64,
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-line-range-comment': 'file:src/App.tsx',
+      },
+    }))
+
+    const view = await renderPanel('session-line-range-comment')
+    const firstLine = view.getByRole('button', { name: 'Comment line 1' })
+    const secondLine = view.getByRole('button', { name: 'Comment line 2' })
+    const thirdLine = view.getByRole('button', { name: 'Comment line 3' })
+
+    await clickElement(firstLine)
+    await act(async () => {
+      fireEvent.click(thirdLine, { shiftKey: true })
+      await Promise.resolve()
+    })
+
+    expect(firstLine.getAttribute('aria-pressed')).toBe('true')
+    expect(secondLine.getAttribute('aria-pressed')).toBe('true')
+    expect(thirdLine.getAttribute('aria-pressed')).toBe('true')
+    expect(view.getByText('Lines 1–3')).toBeTruthy()
+
+    const textarea = view.getByPlaceholderText('Describe what should change here...')
+    await act(() => {
+      fireEvent.change(textarea, { target: { value: 'Extract this setup' } })
+    })
+    await clickElement(view.getByRole('button', { name: 'Add comment' }))
+
+    expect(useWorkspaceChatContextStore.getState().referencesBySession['session-line-range-comment']).toMatchObject([
+      {
+        kind: 'code-comment',
+        path: 'src/App.tsx',
+        absolutePath: '/repo/src/App.tsx',
+        name: 'App.tsx',
+        lineStart: 1,
+        lineEnd: 3,
+        note: 'Extract this setup',
+        quote: 'const title = "Todo"\nconst count = 1\nexport default title',
+      },
+    ])
+  })
+
   it('adds a side-aware diff comment, keeps the diff open, and focuses the composer', async () => {
     await setWorkspaceState((state) => ({
       ...state,

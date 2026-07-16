@@ -207,6 +207,7 @@ export const kr: Record<TranslationKey, string> = {
   'workspace.localComment': '로컬 댓글',
   'workspace.commentLine': '{line}번째 줄에 댓글',
   'workspace.commentLineTarget': '{line}번째 줄',
+  'workspace.commentLineRangeTarget': '{start}~{end}번째 줄',
   'workspace.commentPlaceholder': '여기서 무엇을 변경해야 하는지 설명하세요...',
   'workspace.addCommentToChat': '댓글 추가',
   'workspace.diffReview.commentLineAria': '{path}의 {side} 쪽 {line}번 줄에 댓글 달기',

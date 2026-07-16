@@ -207,6 +207,7 @@ export const jp: Record<TranslationKey, string> = {
   'workspace.localComment': 'ローカルコメント',
   'workspace.commentLine': '{line} 行目にコメント',
   'workspace.commentLineTarget': '{line} 行目',
+  'workspace.commentLineRangeTarget': '{start}–{end} 行目',
   'workspace.commentPlaceholder': 'ここで何を変更すべきか説明してください...',
   'workspace.addCommentToChat': 'コメントを追加',
   'workspace.diffReview.commentLineAria': '{path} の{side}側 {line} 行目にコメント',

@@ -532,26 +532,30 @@ function CodeSurface({
 }: {
   value: string
   language: string
-  onAddLineComment: (line: number, note: string, quote: string) => void
+  onAddLineComment: (lineStart: number, lineEnd: number, note: string, quote: string) => void
   onAddSelection: (selection: WorkspaceTextSelection) => void
 }) {
   const t = useTranslation()
   const surfaceRef = useRef<HTMLDivElement>(null)
   const selectionMenuRef = useRef<HTMLButtonElement>(null)
-  const [commentLine, setCommentLine] = useState<number | null>(null)
+  const [commentRange, setCommentRange] = useState<{ anchorLine: number; focusLine: number } | null>(null)
   const [commentDraft, setCommentDraft] = useState('')
   const [showAllLines, setShowAllLines] = useState(false)
   const [selectionMenu, setSelectionMenu] = useState<FloatingSelectionMenuState | null>(null)
   const [shikiTokensByLine, setShikiTokensByLine] = useState<WorkspaceDiffHighlightToken[][] | null>(null)
   const lines = value.split('\n')
   const visibleLines = showAllLines ? lines : lines.slice(0, WORKSPACE_PREVIEW_LINE_LIMIT)
-  const activeQuote = commentLine ? visibleLines[commentLine - 1] ?? '' : ''
+  const commentLineStart = commentRange ? Math.min(commentRange.anchorLine, commentRange.focusLine) : null
+  const commentLineEnd = commentRange ? Math.max(commentRange.anchorLine, commentRange.focusLine) : null
+  const activeQuote = commentLineStart && commentLineEnd
+    ? visibleLines.slice(commentLineStart - 1, commentLineEnd).join('\n')
+    : ''
   const usePlainLargePreview = showAllLines && lines.length > WORKSPACE_PREVIEW_LINE_LIMIT
   const visibleCode = usePlainLargePreview ? '' : visibleLines.join('\n')
 
   useEffect(() => {
     setShowAllLines(false)
-    setCommentLine(null)
+    setCommentRange(null)
     setCommentDraft('')
     setSelectionMenu(null)
   }, [language, value])
@@ -588,9 +592,9 @@ function CodeSurface({
   })
 
   const submitLineComment = () => {
-    if (!commentLine || !commentDraft.trim()) return
-    onAddLineComment(commentLine, commentDraft.trim(), activeQuote)
-    setCommentLine(null)
+    if (!commentLineStart || !commentLineEnd || !commentDraft.trim()) return
+    onAddLineComment(commentLineStart, commentLineEnd, commentDraft.trim(), activeQuote)
+    setCommentRange(null)
     setCommentDraft('')
   }
 
@@ -619,7 +623,7 @@ function CodeSurface({
   }
 
   const renderLineCommentEditor = (lineNumber: number) => {
-    if (commentLine !== lineNumber) return null
+    if (!commentLineStart || commentLineEnd !== lineNumber) return null
 
     return (
       <div className="grid grid-cols-[48px_minmax(0,720px)] gap-3 bg-[var(--color-brand)]/10 px-3 py-2">
@@ -629,7 +633,9 @@ function CodeSurface({
             <span className="material-symbols-outlined text-[15px] text-[var(--color-text-tertiary)]">chat_bubble</span>
             <span className="text-[12px] font-semibold text-[var(--color-text-primary)]">{t('workspace.localComment')}</span>
             <span className="ml-auto text-[11px] text-[var(--color-text-tertiary)]">
-              {t('workspace.commentLineTarget', { line: lineNumber })}
+              {commentLineStart === commentLineEnd
+                ? t('workspace.commentLineTarget', { line: commentLineStart })
+                : t('workspace.commentLineRangeTarget', { start: commentLineStart, end: commentLineEnd })}
             </span>
           </div>
           <textarea
@@ -644,7 +650,7 @@ function CodeSurface({
             <button
               type="button"
               onClick={() => {
-                setCommentLine(null)
+                setCommentRange(null)
                 setCommentDraft('')
               }}
               className="rounded-[7px] px-2.5 py-1 text-[12px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]"
@@ -665,19 +671,45 @@ function CodeSurface({
     )
   }
 
-  const renderLineNumberButton = (lineNumber: number) => (
-    <button
-      type="button"
-      aria-label={t('workspace.commentLine', { line: lineNumber })}
-      onClick={() => {
-        setCommentLine(lineNumber)
-        setCommentDraft('')
-      }}
-      className="select-none text-right text-[11px] text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-brand)] focus-visible:outline-none focus-visible:text-[var(--color-brand)]"
-    >
-      {lineNumber}
-    </button>
+  const isCommentLineSelected = (lineNumber: number) => (
+    commentLineStart !== null
+    && commentLineEnd !== null
+    && lineNumber >= commentLineStart
+    && lineNumber <= commentLineEnd
   )
+
+  const lineRowClassName = (lineNumber: number) => (
+    `group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 ${
+      isCommentLineSelected(lineNumber)
+        ? 'bg-[var(--color-info-container)]'
+        : 'hover:bg-[var(--color-surface-hover)]'
+    }`
+  )
+
+  const renderLineNumberButton = (lineNumber: number) => {
+    const selected = isCommentLineSelected(lineNumber)
+    return (
+      <button
+        type="button"
+        aria-label={t('workspace.commentLine', { line: lineNumber })}
+        aria-pressed={selected}
+        onClick={(event) => {
+          const extendRange = event.shiftKey && commentRange !== null
+          setCommentRange(extendRange
+            ? { ...commentRange, focusLine: lineNumber }
+            : { anchorLine: lineNumber, focusLine: lineNumber })
+          if (!extendRange) setCommentDraft('')
+        }}
+        className={`select-none text-right text-[11px] transition-colors focus-visible:outline-none ${
+          selected
+            ? 'font-semibold text-[var(--color-info)]'
+            : 'text-[var(--color-text-tertiary)] hover:text-[var(--color-brand)] focus-visible:text-[var(--color-brand)]'
+        }`}
+      >
+        {lineNumber}
+      </button>
+    )
+  }
 
   return (
     <div
@@ -701,7 +733,7 @@ function CodeSurface({
               return (
                 <div key={lineNumber}>
                   <div
-                    className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]"
+                    className={lineRowClassName(lineNumber)}
                     data-workspace-line-number={lineNumber}
                   >
                     {renderLineNumberButton(lineNumber)}
@@ -726,7 +758,7 @@ function CodeSurface({
                 <div key={lineNumber}>
                   <div
                     data-workspace-line-number={lineNumber}
-                    className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]"
+                    className={lineRowClassName(lineNumber)}
                   >
                     {renderLineNumberButton(lineNumber)}
                     <span className="whitespace-pre pr-6">
@@ -768,7 +800,7 @@ function CodeSurface({
                       <div
                         {...lineProps}
                         data-workspace-line-number={lineNumber}
-                        className="group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]"
+                        className={lineRowClassName(lineNumber)}
                       >
                         {renderLineNumberButton(lineNumber)}
                         <span className="whitespace-pre pr-6">
@@ -1409,14 +1441,20 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
     })
   }
 
-  const addLineCommentToChat = (path: string, line: number, note: string, quote: string) => {
+  const addLineCommentToChat = (
+    path: string,
+    lineStart: number,
+    lineEnd: number,
+    note: string,
+    quote: string,
+  ) => {
     addWorkspaceReference(sessionId, {
       kind: 'code-comment',
       path,
       absolutePath: resolveWorkspaceAttachmentPath(status?.workDir, path),
       name: path.split('/').pop() || path,
-      lineStart: line,
-      lineEnd: line,
+      lineStart,
+      lineEnd,
       note,
       quote,
     })
@@ -1776,7 +1814,9 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
           <CodeSurface
             value={activePreviewTab.content ?? ''}
             language={activePreviewTab.language ?? 'text'}
-            onAddLineComment={(line, note, quote) => addLineCommentToChat(activePreviewTab.path, line, note, quote)}
+            onAddLineComment={(lineStart, lineEnd, note, quote) => (
+              addLineCommentToChat(activePreviewTab.path, lineStart, lineEnd, note, quote)
+            )}
             onAddSelection={(selection) => addSelectionToChat(activePreviewTab.path, selection)}
           />
         ) : (
