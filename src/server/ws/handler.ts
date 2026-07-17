@@ -375,6 +375,12 @@ export const handleWebSocket = {
     // screen. Defer cleanup until the turn completes, then apply the idle
     // grace period. Sessions that are already idle go straight to the timer.
     if (isSessionTurnActive(sessionId)) {
+      // A turn blocked on permission cannot finish without user input. Keep the
+      // completion watcher for early cleanup, but also enforce the existing
+      // pending-permission maximum so an abandoned prompt cannot pin the CLI.
+      if (conversationService.getPendingPermissionRequests(sessionId).length > 0) {
+        scheduleDisconnectCleanup(sessionId)
+      }
       console.log(`[WS] Session ${sessionId} still running after disconnect; keeping CLI alive until the turn finishes`)
       watchTurnCompletionForCleanup(sessionId)
       return

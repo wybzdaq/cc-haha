@@ -455,6 +455,39 @@ describe('WebSocket handler session isolation', () => {
     expect(setTimeoutSpy.mock.calls[0]?.[1]).toBeGreaterThan(30_000)
   })
 
+  it('bounds an active turn waiting on permission after the last client disconnects', () => {
+    const sessionId = `active-permission-disconnect-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(() => 0 as any)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([
+      {
+        requestId: 'request-bash-1',
+        toolName: 'Bash',
+        input: { command: 'echo hello' },
+      },
+    ])
+    let turnCompleteCallback: ((cliMsg: any) => void) | null = null
+    spyOn(conversationService, 'onOutput').mockImplementation((_sid, callback) => {
+      turnCompleteCallback = callback
+    })
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    const stopSession = spyOn(conversationService, 'stopSession').mockImplementation(() => {})
+
+    handleWebSocket.open(ws)
+    __markActiveTurnForTests(sessionId)
+    setTimeoutSpy.mockClear()
+
+    handleWebSocket.close(ws, 1006, 'permission prompt abandoned')
+
+    expect(setTimeoutSpy).toHaveBeenCalledTimes(1)
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(30 * 60_000)
+    expect(turnCompleteCallback).not.toBeNull()
+
+    const expirePermissionWait = setTimeoutSpy.mock.calls[0]?.[0] as (() => void) | undefined
+    expirePermissionWait?.()
+    expect(stopSession).toHaveBeenCalledWith(sessionId)
+  })
+
   it('does not forward prewarm startup status to a reconnecting client', async () => {
     const sessionId = `prewarm-reconnect-${crypto.randomUUID()}`
     const second = makeClientSocket(sessionId)
