@@ -2081,9 +2081,10 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         stopGeneration(resolvedSessionId)
       }
 
+      const checkpointTarget = confirmTurnCard.checkpoint.target
       const result = await sessionsApi.rewind(resolvedSessionId, {
-        targetUserMessageId: target.messageId,
-        userMessageIndex: target.userMessageIndex,
+        targetUserMessageId: checkpointTarget.targetUserMessageId,
+        userMessageIndex: checkpointTarget.userMessageIndex,
         expectedContent: target.expectedContent,
       })
 

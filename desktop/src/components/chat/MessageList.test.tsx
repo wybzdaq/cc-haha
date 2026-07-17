@@ -4687,6 +4687,79 @@ describe('MessageList nested tool calls', () => {
     })
   })
 
+  it('rewinds a live turn with the authoritative checkpoint id when the local UI id differs', async () => {
+    vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
+      checkpoints: [
+        {
+          target: {
+            targetUserMessageId: 'transcript-user-1',
+            userMessageIndex: 0,
+            userMessageCount: 1,
+          },
+          code: {
+            available: true,
+            filesChanged: ['src/live.ts'],
+            insertions: 1,
+            deletions: 0,
+          },
+        },
+      ],
+    })
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue({
+      target: {
+        targetUserMessageId: 'transcript-user-1',
+        userMessageIndex: 0,
+        userMessageCount: 1,
+      },
+      conversation: {
+        messagesRemoved: 2,
+      },
+      code: {
+        available: true,
+        filesChanged: ['src/live.ts'],
+        insertions: 1,
+        deletions: 0,
+      },
+    })
+
+    useChatStore.setState({
+      reloadHistory: vi.fn().mockResolvedValue(undefined),
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'local-user-temp-id',
+              type: 'user_text',
+              content: '实时这一轮',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: 'done',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    await screen.findByText('live.ts')
+    fireEvent.click(screen.getByRole('button', { name: 'Undo current turn changes' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Undo current turn?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Undo current turn' }))
+
+    await waitFor(() => {
+      expect(rewind).toHaveBeenCalledWith(ACTIVE_TAB, {
+        targetUserMessageId: 'transcript-user-1',
+        userMessageIndex: 0,
+        expectedContent: '实时这一轮',
+      })
+    })
+  })
+
   it('keeps turn change cards anchored when the only response item is filtered from rendering', async () => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
       checkpoints: [
