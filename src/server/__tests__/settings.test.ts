@@ -710,6 +710,21 @@ describe('Models API', () => {
     ])
   })
 
+  it('GET /api/models/current should use the configured user env model without a runtime override', async () => {
+    await new SettingsService().updateUserSettings({
+      env: { ANTHROPIC_MODEL: 'claude-sonnet-from-settings' },
+    })
+    delete process.env.ANTHROPIC_MODEL
+
+    const { req, url, segments } = makeRequest('GET', '/api/models/current')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      model: { id: 'claude-sonnet-from-settings' },
+    })
+  })
+
   it('GET /api/models/current should return default model when not set', async () => {
     const { req, url, segments } = makeRequest('GET', '/api/models/current')
     const res = await handleModelsApi(req, url, segments)

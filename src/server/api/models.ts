@@ -309,7 +309,10 @@ async function handleCurrentModel(req: Request): Promise<Response> {
     const explicitModel = (settings.model as string) || ''
     const contextTier = (settings.modelContext as string) || undefined
     const env = (settings.env as Record<string, string>) || {}
-    const envModel = process.env.ANTHROPIC_MODEL?.trim() || ''
+    const runtimeEnvModel = process.env.ANTHROPIC_MODEL?.trim() || ''
+    const settingsEnvModel = typeof env.ANTHROPIC_MODEL === 'string'
+      ? env.ANTHROPIC_MODEL.trim()
+      : ''
 
     let currentModelId: string
     let currentModelName: string
@@ -334,7 +337,7 @@ async function handleCurrentModel(req: Request): Promise<Response> {
       }
     } else {
       // No provider — use settings model with context tier
-      currentModelId = explicitModel || envModel || DEFAULT_MODEL
+      currentModelId = explicitModel || runtimeEnvModel || settingsEnvModel || DEFAULT_MODEL
       currentModelName = currentModelId
     }
 
