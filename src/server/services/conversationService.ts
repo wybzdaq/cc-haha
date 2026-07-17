@@ -56,6 +56,9 @@ import {
 const MAX_CAPTURED_PROCESS_LINES = 80
 const MAX_CAPTURED_SDK_MESSAGES = 40
 const MAX_CAPTURED_SDK_SUMMARY = 20
+export const MAX_CAPTURED_SDK_MESSAGE_BYTES = 64 * 1024
+export const MAX_CAPTURED_SDK_TOTAL_BYTES = 512 * 1024
+const MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES = 4 * 1024
 const CONTROL_READY_POLL_MS = 50
 const AUTO_MEMORY_DIRNAME = 'memory'
 export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
@@ -143,6 +146,7 @@ type SessionProcess = {
   stderrLines: string[]
   outputDrain: Promise<void>
   sdkMessages: any[]
+  sdkMessageBytes?: number
   initMessage: any | null
   usesOfficialOAuth: boolean
   officialOAuthToken: string | null
@@ -407,6 +411,7 @@ export class ConversationService {
       stderrLines: [],
       outputDrain: Promise.resolve(),
       sdkMessages: [],
+      sdkMessageBytes: 0,
       initMessage: null,
       usesOfficialOAuth,
       officialOAuthToken: childEnv.CLAUDE_CODE_OAUTH_TOKEN ?? null,
@@ -887,10 +892,7 @@ export class ConversationService {
     for (const line of lines) {
       try {
         const msg = JSON.parse(line)
-        session.sdkMessages.push(msg)
-        if (session.sdkMessages.length > MAX_CAPTURED_SDK_MESSAGES) {
-          session.sdkMessages.splice(0, session.sdkMessages.length - MAX_CAPTURED_SDK_MESSAGES)
-        }
+        this.retainSdkMessage(session, msg, Buffer.byteLength(line, 'utf-8'))
         const sdkError = this.extractSdkErrorEvent(msg)
         if (sdkError) {
           void diagnosticsService.recordEvent({
@@ -968,6 +970,95 @@ export class ConversationService {
         )
       }
     }
+  }
+
+  private retainSdkMessage(
+    session: SessionProcess,
+    message: any,
+    rawBytes: number,
+  ): void {
+    const retainedMessage = rawBytes <= MAX_CAPTURED_SDK_MESSAGE_BYTES
+      ? message
+      : this.compactSdkMessageForRetention(message, rawBytes)
+    const retainedBytes = this.capturedSdkMessageBytes(retainedMessage)
+    let totalBytes = session.sdkMessageBytes
+      ?? session.sdkMessages.reduce(
+        (total, existing) => total + this.capturedSdkMessageBytes(existing),
+        0,
+      )
+
+    session.sdkMessages.push(retainedMessage)
+    totalBytes += retainedBytes
+    while (
+      session.sdkMessages.length > MAX_CAPTURED_SDK_MESSAGES
+      || totalBytes > MAX_CAPTURED_SDK_TOTAL_BYTES
+    ) {
+      const removed = session.sdkMessages.shift()
+      if (removed === undefined) break
+      totalBytes -= this.capturedSdkMessageBytes(removed)
+    }
+    session.sdkMessageBytes = Math.max(0, totalBytes)
+  }
+
+  private capturedSdkMessageBytes(message: any): number {
+    return Buffer.byteLength(JSON.stringify(message), 'utf-8')
+  }
+
+  private compactSdkMessageForRetention(message: any, originalBytes: number): Record<string, unknown> {
+    if (!message || typeof message !== 'object') {
+      return { type: 'unknown', truncated: true, originalBytes }
+    }
+
+    const compact: Record<string, unknown> = {
+      type: typeof message.type === 'string' ? message.type : 'unknown',
+      truncated: true,
+      originalBytes,
+    }
+    if (typeof message.subtype === 'string') compact.subtype = message.subtype
+    if (typeof message.is_error === 'boolean') compact.is_error = message.is_error
+    if (typeof message.isApiErrorMessage === 'boolean') {
+      compact.isApiErrorMessage = message.isApiErrorMessage
+    }
+    for (const field of ['status', 'error', 'result'] as const) {
+      const value = this.truncateSdkDiagnosticText(message[field])
+      if (value !== undefined) compact[field] = value
+    }
+    if (Array.isArray(message.errors)) {
+      compact.errors = message.errors
+        .slice(0, 5)
+        .map((value: unknown) => this.truncateSdkDiagnosticText(value))
+        .filter((value: string | undefined): value is string => value !== undefined)
+    }
+
+    const assistantText = this.extractAssistantText(message)
+    if (assistantText) {
+      compact.message = {
+        content: [{
+          type: 'text',
+          text: this.truncateSdkDiagnosticText(assistantText),
+        }],
+      }
+    } else {
+      const messageText = this.truncateSdkDiagnosticText(message.message)
+      if (messageText !== undefined) compact.message = messageText
+    }
+    return compact
+  }
+
+  private truncateSdkDiagnosticText(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined
+    if (Buffer.byteLength(value, 'utf-8') <= MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES) {
+      return value
+    }
+    const prefixBytes = Buffer.from(
+      value.slice(0, MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES),
+      'utf-8',
+    )
+    const truncated = prefixBytes
+      .subarray(0, MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES)
+      .toString('utf-8')
+      .replace(/\uFFFD$/, '')
+    return `${truncated}\n[truncated]`
   }
 
   stopSession(sessionId: string): void {

@@ -11,7 +11,13 @@ import * as path from 'path'
 import * as os from 'os'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { ConversationService, ConversationStartupError, conversationService } from '../services/conversationService.js'
+import {
+  ConversationService,
+  ConversationStartupError,
+  MAX_CAPTURED_SDK_MESSAGE_BYTES,
+  MAX_CAPTURED_SDK_TOTAL_BYTES,
+  conversationService,
+} from '../services/conversationService.js'
 import { SessionService, sessionService } from '../services/sessionService.js'
 import { ProviderService } from '../services/providerService.js'
 import { resetTerminalShellEnvironmentCacheForTests } from '../../utils/terminalShellEnvironment.js'
@@ -629,6 +635,80 @@ describe('ConversationService', () => {
       claude_code_version: 'test-version',
       slash_commands: ['help', 'context'],
     })
+  })
+
+  it('should bound retained SDK payload bytes without truncating live callbacks', () => {
+    const svc = new ConversationService()
+    const liveMessages: any[] = []
+    const oversizedText = 'x'.repeat(MAX_CAPTURED_SDK_MESSAGE_BYTES * 4)
+
+    ;(svc as any).sessions.set('session-sdk-byte-limit', {
+      proc: { pid: 1 },
+      outputCallbacks: [(message: any) => liveMessages.push(message)],
+      workDir: process.cwd(),
+      permissionMode: 'default',
+      sdkToken: 'token',
+      sdkSocket: null,
+      pendingOutbound: [],
+      stderrLines: [],
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    ;(svc as any).handleSdkPayload('session-sdk-byte-limit', JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: oversizedText }],
+      },
+    }))
+
+    expect(liveMessages).toHaveLength(1)
+    expect(liveMessages[0].message.content[0].text).toBe(oversizedText)
+    const retained = svc.getRecentSdkMessages('session-sdk-byte-limit')
+    expect(retained).toHaveLength(1)
+    expect(retained[0]).toMatchObject({
+      type: 'assistant',
+      truncated: true,
+      message: {
+        content: [{ type: 'text' }],
+      },
+    })
+    expect(retained[0].message.content[0].text).toEndWith('[truncated]')
+    expect(Buffer.byteLength(JSON.stringify(retained[0]), 'utf-8'))
+      .toBeLessThanOrEqual(MAX_CAPTURED_SDK_MESSAGE_BYTES)
+  })
+
+  it('should cap the total byte size of recent SDK diagnostics', () => {
+    const svc = new ConversationService()
+    let callbackCount = 0
+
+    ;(svc as any).sessions.set('session-sdk-total-byte-limit', {
+      proc: { pid: 1 },
+      outputCallbacks: [() => { callbackCount += 1 }],
+      workDir: process.cwd(),
+      permissionMode: 'default',
+      sdkToken: 'token',
+      sdkSocket: null,
+      pendingOutbound: [],
+      stderrLines: [],
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    for (let index = 0; index < 40; index++) {
+      ;(svc as any).handleSdkPayload('session-sdk-total-byte-limit', JSON.stringify({
+        type: 'stream_event',
+        index,
+        output: `${index}:${'y'.repeat(32 * 1024)}`,
+      }))
+    }
+
+    const retainedBytes = svc.getRecentSdkMessages('session-sdk-total-byte-limit')
+      .reduce((total, message) => total + Buffer.byteLength(JSON.stringify(message), 'utf-8'), 0)
+    expect(callbackCount).toBe(40)
+    expect(retainedBytes).toBeLessThanOrEqual(MAX_CAPTURED_SDK_TOTAL_BYTES)
   })
 
   it('should expose live SDK permission requests for reconnecting clients', () => {
