@@ -488,6 +488,39 @@ describe('WebSocket handler session isolation', () => {
     expect(stopSession).toHaveBeenCalledWith(sessionId)
   })
 
+  it('starts the permission cleanup bound when the prompt arrives after disconnect', () => {
+    const sessionId = `late-permission-disconnect-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(() => 0 as any)
+    const pendingRequests = spyOn(conversationService, 'getPendingPermissionRequests')
+      .mockReturnValue([])
+    let turnOutputCallback: ((cliMsg: any) => void) | null = null
+    spyOn(conversationService, 'onOutput').mockImplementation((_sid, callback) => {
+      turnOutputCallback = callback
+    })
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+
+    handleWebSocket.open(ws)
+    __markActiveTurnForTests(sessionId)
+    setTimeoutSpy.mockClear()
+    handleWebSocket.close(ws, 1006, 'renderer closed before permission prompt')
+
+    expect(setTimeoutSpy).not.toHaveBeenCalled()
+    pendingRequests.mockReturnValue([{
+      requestId: 'late-request-1',
+      toolName: 'Bash',
+      input: { command: 'echo later' },
+    }])
+    ;(turnOutputCallback as ((cliMsg: any) => void) | null)?.({
+      type: 'control_request',
+      request_id: 'late-request-1',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash' },
+    })
+
+    expect(setTimeoutSpy).toHaveBeenCalledTimes(1)
+    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(30 * 60_000)
+  })
+
   it('does not forward prewarm startup status to a reconnecting client', async () => {
     const sessionId = `prewarm-reconnect-${crypto.randomUUID()}`
     const second = makeClientSocket(sessionId)

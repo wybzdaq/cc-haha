@@ -2304,6 +2304,17 @@ function watchTurnCompletionForCleanup(sessionId: string): void {
   cancelSessionDisconnectWatcher(sessionId)
 
   const onComplete = (cliMsg: any) => {
+    if (
+      cliMsg?.type === 'control_request' &&
+      cliMsg.request?.subtype === 'can_use_tool' &&
+      !hasActiveClients(sessionId)
+    ) {
+      // The permission request may arrive after the renderer disconnected.
+      // ConversationService records it before notifying this callback, so the
+      // cleanup delay resolves to the bounded pending-permission window.
+      scheduleDisconnectCleanup(sessionId)
+      return
+    }
     if (cliMsg?.type !== 'result') return
     cancelSessionDisconnectWatcher(sessionId)
     // The turn finished while still unobserved — fall back to the idle timer.
