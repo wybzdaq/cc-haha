@@ -693,7 +693,7 @@ describe('buildSessionActivityModel', () => {
       expect.objectContaining({ label: '新轮次任务', status: 'completed' }),
       expect.objectContaining({
         label: 'Earlier tasks',
-        status: 'completed',
+        status: 'stopped',
         taskHistory: { completed: 1, total: 2, turnCount: 1 },
       }),
     ])

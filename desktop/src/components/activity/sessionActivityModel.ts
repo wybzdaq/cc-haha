@@ -534,7 +534,7 @@ function buildHistoricalTasksRow(groups: TaskTurnRows[]): ActivityRow | null {
     id: `task-history-${groups[0]?.turn.id ?? 'turn'}-${groups.length}-${rows.length}`,
     section: 'tasks',
     label: 'Earlier tasks',
-    status: 'completed',
+    status: completed === rows.length ? 'completed' : 'stopped',
     taskHistory: {
       completed,
       total: rows.length,
