@@ -23,6 +23,7 @@ import { useUIStore } from '../../stores/uiStore'
 import { formatExactMessageTimestamp, formatMessageHoverTime } from '../../lib/formatMessageTimestamp'
 import type { UIMessage } from '../../types/chat'
 import type { PerSessionState } from '../../stores/chatStore'
+import { FindInPageModal } from '../search/FindInPageModal'
 
 const ACTIVE_TAB = 'active-tab'
 
@@ -283,6 +284,68 @@ describe('MessageList nested tool calls', () => {
     for (const item of container.querySelectorAll('[data-virtual-message-item]')) {
       expect((item as HTMLElement).className).not.toContain('chat-render-item--cv')
     }
+  })
+
+  it('finds, mounts, navigates, and highlights matches outside a 120-item virtual window', async () => {
+    const highlights = new Map<string, { ranges: Range[]; priority?: number }>()
+    class TestHighlight {
+      ranges: Range[] = []
+      priority?: number
+
+      add(range: Range) {
+        this.ranges.push(range)
+      }
+    }
+    vi.stubGlobal('CSS', { highlights })
+    vi.stubGlobal('Highlight', TestHighlight)
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: Array.from({ length: 130 }, (_, index) => ({
+            id: `assistant-${index}`,
+            type: 'assistant_text' as const,
+            content: index === 0 || index === 64
+              ? `Virtual history needle ${index}`
+              : `Virtual history filler ${index}`,
+            timestamp: index,
+          })),
+        }),
+      },
+    })
+
+    const { container } = render(
+      <>
+        <MessageList />
+        <FindInPageModal open onClose={() => {}} />
+      </>,
+    )
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 15_000
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 16_000 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value },
+    })
+
+    expect(screen.queryByText('Virtual history needle 0')).toBeNull()
+    expect(screen.queryByText('Virtual history needle 64')).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'Virtual history needle' } })
+
+    await waitFor(() => expect(screen.getByText('1 / 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Virtual history needle 0')).toBeTruthy())
+    expect(scrollTop).toBe(0)
+    expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-0')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next match' }))
+
+    await waitFor(() => expect(screen.getByText('2 / 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Virtual history needle 64')).toBeTruthy())
+    expect(scrollTop).toBeGreaterThan(0)
+    expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-64')
   })
 
   it('keeps small transcripts fully mounted without deferred browser painting', () => {

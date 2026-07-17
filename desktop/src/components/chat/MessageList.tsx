@@ -40,6 +40,7 @@ import {
   getMetricsForSession,
   type VirtualRenderItemMetric,
 } from './virtualHeightCache'
+import { registerConversationFindController } from '../search/conversationFindBridge'
 
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type ToolResult = Extract<UIMessage, { type: 'tool_result' }>
@@ -1013,6 +1014,13 @@ type VirtualTranscriptWindow = {
   totalHeight: number
 }
 
+type ConversationFindMatch = {
+  renderIndex: number
+  renderItemKey: string
+  occurrenceIndex: number
+  query: string
+}
+
 const sessionScrollSnapshots = new Map<string, SessionScrollSnapshot>()
 
 function isNearScrollBottom(element: HTMLElement) {
@@ -1068,6 +1076,158 @@ function clampNumber(value: number, min: number, max: number) {
 
 function getRenderItemKey(item: RenderItem) {
   return item.kind === 'tool_group' ? item.id : item.message.id
+}
+
+function appendSearchableUnknownStrings(value: unknown, output: string[], depth = 0) {
+  if (typeof value === 'string') {
+    output.push(value)
+    return
+  }
+  if (!value || depth > 3) return
+  if (Array.isArray(value)) {
+    for (const item of value) appendSearchableUnknownStrings(item, output, depth + 1)
+    return
+  }
+  if (!isRecordValue(value)) return
+  for (const item of Object.values(value)) appendSearchableUnknownStrings(item, output, depth + 1)
+}
+
+function getMessageSearchSegments(message: UIMessage, toolResultMap: Map<string, ToolResult>) {
+  const segments: string[] = []
+  switch (message.type) {
+    case 'user_text':
+    case 'assistant_text':
+    case 'thinking':
+    case 'system':
+      segments.push(message.content)
+      break
+    case 'tool_use':
+      segments.push(message.toolName)
+      appendSearchableUnknownStrings(message.input, segments)
+      appendSearchableUnknownStrings(toolResultMap.get(message.toolUseId)?.content, segments)
+      break
+    case 'tool_result':
+      appendSearchableUnknownStrings(message.content, segments)
+      break
+    case 'permission_request':
+      segments.push(message.toolName, message.description ?? '')
+      appendSearchableUnknownStrings(message.input, segments)
+      break
+    case 'error':
+      segments.push(message.message, message.code)
+      break
+    case 'compact_summary':
+      segments.push(message.title, message.summary ?? '')
+      break
+    case 'goal_event':
+      segments.push(message.objective ?? '', message.message ?? '')
+      break
+    case 'memory_event':
+      segments.push(message.message ?? '')
+      for (const file of message.files) segments.push(file.path, file.summary ?? '')
+      break
+    case 'background_task':
+      appendSearchableUnknownStrings(message.task, segments)
+      break
+    case 'task_summary':
+      for (const task of message.tasks) segments.push(task.subject, task.activeForm ?? '')
+      break
+  }
+  return segments
+}
+
+function findConversationMatches(
+  renderItems: RenderItem[],
+  toolResultMap: Map<string, ToolResult>,
+  query: string,
+): ConversationFindMatch[] {
+  const needle = query.toLocaleLowerCase()
+  if (!needle) return []
+  const matches: ConversationFindMatch[] = []
+
+  renderItems.forEach((item, renderIndex) => {
+    const segments = item.kind === 'message'
+      ? getMessageSearchSegments(item.message, toolResultMap)
+      : item.toolCalls.flatMap((toolCall) => getMessageSearchSegments(toolCall, toolResultMap))
+    let occurrenceIndex = 0
+    for (const segment of segments) {
+      const text = segment.toLocaleLowerCase()
+      let offset = text.indexOf(needle)
+      while (offset !== -1) {
+        matches.push({
+          renderIndex,
+          renderItemKey: getRenderItemKey(item),
+          occurrenceIndex,
+          query,
+        })
+        occurrenceIndex += 1
+        offset = text.indexOf(needle, offset + needle.length)
+      }
+    }
+  })
+
+  return matches
+}
+
+function collectConversationFindRanges(root: Node, query: string) {
+  const ranges: Range[] = []
+  const needle = query.toLocaleLowerCase()
+  if (!needle) return ranges
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT
+      if (node.parentElement?.closest('[data-find-bar], script, style, noscript, .material-symbols-outlined')) {
+        return NodeFilter.FILTER_REJECT
+      }
+      return NodeFilter.FILTER_ACCEPT
+    },
+  })
+
+  let textNode = walker.nextNode() as Text | null
+  while (textNode) {
+    const text = textNode.nodeValue?.toLocaleLowerCase() ?? ''
+    let offset = text.indexOf(needle)
+    while (offset !== -1) {
+      const range = document.createRange()
+      range.setStart(textNode, offset)
+      range.setEnd(textNode, offset + needle.length)
+      ranges.push(range)
+      offset = text.indexOf(needle, offset + needle.length)
+    }
+    textNode = walker.nextNode() as Text | null
+  }
+  return ranges
+}
+
+function clearConversationFindHighlights() {
+  const highlights = (globalThis.CSS as any)?.highlights as Map<string, unknown> | undefined
+  highlights?.delete('cc-find-results')
+  highlights?.delete('cc-find-active')
+}
+
+function paintConversationFindHighlights(root: HTMLElement, match: ConversationFindMatch) {
+  const highlights = (globalThis.CSS as any)?.highlights as Map<string, unknown> | undefined
+  const HighlightCtor = (globalThis as any).Highlight
+  if (!highlights || !HighlightCtor) return
+
+  const resultRanges = collectConversationFindRanges(root, match.query)
+  const target = Array.from(root.querySelectorAll<HTMLElement>('[data-chat-render-item-key]'))
+    .find((node) => node.dataset.chatRenderItemKey === match.renderItemKey)
+  const targetRanges = target ? collectConversationFindRanges(target, match.query) : []
+  const activeRange = targetRanges[Math.min(match.occurrenceIndex, Math.max(0, targetRanges.length - 1))]
+
+  const results = new HighlightCtor()
+  for (const range of resultRanges) results.add(range)
+  highlights.set('cc-find-results', results)
+
+  if (activeRange) {
+    const active = new HighlightCtor()
+    active.add(activeRange)
+    active.priority = 1
+    highlights.set('cc-find-active', active)
+  } else {
+    highlights.delete('cc-find-active')
+  }
 }
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {
@@ -1508,6 +1668,8 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   })
   const [measuredItemsVersion, setMeasuredItemsVersion] = useState(0)
   const [highlightedNavigationItemKey, setHighlightedNavigationItemKey] = useState<string | null>(null)
+  const [activeConversationFindMatch, setActiveConversationFindMatch] = useState<ConversationFindMatch | null>(null)
+  const conversationFindMatchesRef = useRef<ConversationFindMatch[]>([])
   const [messageListWidth, setMessageListWidth] = useState<number | null>(null)
   const branchActionsDisabled =
     isMemberSession ||
@@ -1530,6 +1692,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     if (workspaceOriginRestoreFrameRef.current !== null) {
       cancelAnimationFrame(workspaceOriginRestoreFrameRef.current)
     }
+    clearConversationFindHighlights()
   }, [])
 
   useLayoutEffect(() => {
@@ -2252,6 +2415,65 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     virtualTranscriptWindow.totalHeight,
     virtualViewport.viewportHeight,
   ])
+
+  const navigateToConversationFindMatch = useCallback((match: ConversationFindMatch) => {
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    const viewportHeight = container.clientHeight || virtualViewport.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT
+    const targetScrollTop = clampNumber(
+      (virtualTranscriptWindow.offsets[match.renderIndex] ?? 0) - viewportHeight * CONVERSATION_NAVIGATION_READING_ANCHOR_RATIO,
+      0,
+      Math.max(0, virtualTranscriptWindow.totalHeight - viewportHeight),
+    )
+
+    setActiveConversationFindMatch(match)
+    shouldAutoScrollRef.current = false
+    setShowJumpToLatest(true)
+    ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
+    ignoreProgrammaticScrollTopRef.current = targetScrollTop
+    setScrollTopWithoutLayoutRead(container, targetScrollTop)
+    setVirtualViewport({ scrollTop: targetScrollTop, viewportHeight })
+  }, [virtualTranscriptWindow.offsets, virtualTranscriptWindow.totalHeight, virtualViewport.viewportHeight])
+
+  useEffect(() => {
+    if (!resolvedSessionId || resolvedSessionId !== activeTabId) return
+
+    return registerConversationFindController({
+      search(query) {
+        const matches = findConversationMatches(renderItems, toolResultMap, query)
+        conversationFindMatchesRef.current = matches
+        const firstMatch = matches[0]
+        if (firstMatch) {
+          navigateToConversationFindMatch(firstMatch)
+        } else {
+          setActiveConversationFindMatch(null)
+          clearConversationFindHighlights()
+        }
+        return matches.length
+      },
+      navigate(index) {
+        const match = conversationFindMatchesRef.current[index]
+        if (match) navigateToConversationFindMatch(match)
+      },
+      clear() {
+        conversationFindMatchesRef.current = []
+        setActiveConversationFindMatch(null)
+        clearConversationFindHighlights()
+      },
+    })
+  }, [activeTabId, navigateToConversationFindMatch, renderItems, resolvedSessionId, toolResultMap])
+
+  useLayoutEffect(() => {
+    if (!activeConversationFindMatch) {
+      clearConversationFindHighlights()
+      return
+    }
+
+    const root = scrollContentRef.current
+    if (!root) return
+    paintConversationFindHighlights(root, activeConversationFindMatch)
+  }, [activeConversationFindMatch, virtualTranscriptWindow.items])
 
   const restoreWorkspacePanelOrigin = useCallback((origin: WorkspacePanelOrigin, attempt = 0) => {
     const container = scrollContainerRef.current

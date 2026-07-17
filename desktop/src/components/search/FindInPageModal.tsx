@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react'
+import { getConversationFindController, type ConversationFindController } from './conversationFindBridge'
 
 // JS-based scoped find-in-page. We walk text nodes in the document body EXCLUDING the
 // sidebar (.sidebar-panel) and this find bar ([data-find-bar]), then highlight matches
@@ -26,10 +27,13 @@ export function FindInPageModal({ open, onClose }: Props) {
   const [activeIndex, setActiveIndex] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const rangesRef = useRef<Range[]>([])
+  const conversationControllerRef = useRef<ConversationFindController | null>(null)
 
   // Focus + reset whenever the bar opens; clear highlights when it closes.
   useEffect(() => {
     if (!open) {
+      conversationControllerRef.current?.clear()
+      conversationControllerRef.current = null
       clearHighlights()
       return
     }
@@ -49,18 +53,34 @@ export function FindInPageModal({ open, onClose }: Props) {
   }, [query])
 
   // Clear highlights on unmount.
-  useEffect(() => () => clearHighlights(), [])
+  useEffect(() => () => {
+    conversationControllerRef.current?.clear()
+    clearHighlights()
+  }, [])
 
   // Run (or clear) the search once the query settles.
   useEffect(() => {
     const q = debouncedQuery.trim()
     if (!q) {
+      conversationControllerRef.current?.clear()
+      conversationControllerRef.current = null
       clearHighlights()
       rangesRef.current = []
       setCount(0)
       setActiveIndex(0)
       return
     }
+    const conversationController = getConversationFindController()
+    if (conversationController) {
+      clearHighlights()
+      rangesRef.current = []
+      conversationControllerRef.current = conversationController
+      const matchCount = conversationController.search(q)
+      setCount(matchCount)
+      setActiveIndex(0)
+      return
+    }
+    conversationControllerRef.current = null
     const ranges = collectRanges(q)
     rangesRef.current = ranges
     setCount(ranges.length)
@@ -70,6 +90,15 @@ export function FindInPageModal({ open, onClose }: Props) {
 
   // Next/previous — immediate, uses live state.
   function step(forward: boolean) {
+    const conversationController = getConversationFindController() ?? conversationControllerRef.current
+    if (conversationController && count > 0) {
+      const nextConversationIndex = forward
+        ? (activeIndex + 1) % count
+        : (activeIndex - 1 + count) % count
+      setActiveIndex(nextConversationIndex)
+      conversationController.navigate(nextConversationIndex)
+      return
+    }
     const ranges = rangesRef.current
     if (ranges.length === 0) return
     const next = forward ? (activeIndex + 1) % ranges.length : (activeIndex - 1 + ranges.length) % ranges.length
