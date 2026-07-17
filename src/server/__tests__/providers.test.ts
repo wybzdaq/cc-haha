@@ -129,7 +129,10 @@ function blockNextTraceAppend() {
 async function settlesBeforeBlockedTraceWrite<T>(promise: Promise<T>): Promise<T | null> {
   return Promise.race([
     promise,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), 50)),
+    // The trace hook is already blocked, so this timeout is only a failure
+    // bound. Keep it generous enough that a busy CI worker cannot masquerade
+    // as response/trace coupling.
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
   ])
 }
 
