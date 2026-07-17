@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, afterEach, spyOn } from 'bun:test'
 import * as fs from 'fs/promises'
+import { readFileSync } from 'node:fs'
 import * as path from 'path'
 import * as os from 'os'
 import { execFileSync } from 'node:child_process'
@@ -5514,4 +5515,195 @@ describe('WebSocket Chat Integration', () => {
       })
     }
   }, 20_000)
+
+  it('should persist a completed turn before a runtime restart resumes the next turn (#1033)', async () => {
+    const requestBodies: Array<Record<string, any>> = []
+    const sseEvent = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    const upstream = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        const body = await request.json() as Record<string, any>
+        requestBodies.push(body)
+        const serialized = JSON.stringify(body)
+        const responseText = serialized.includes('SECOND_TURN_1033')
+          ? 'SECOND_REPLY_1033'
+          : serialized.includes('FIRST_TURN_1033')
+            ? 'FIRST_REPLY_1033'
+            : 'AUXILIARY_REPLY_1033'
+        const responseBody = [
+          sseEvent('message_start', {
+            type: 'message_start',
+            message: {
+              id: `msg_${requestBodies.length}`,
+              type: 'message',
+              role: 'assistant',
+              model: 'resume-model',
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 10, output_tokens: 0 },
+            },
+          }),
+          sseEvent('content_block_start', {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'text', text: '' },
+          }),
+          sseEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: responseText },
+          }),
+          sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }),
+          sseEvent('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            usage: { output_tokens: 3 },
+          }),
+          sseEvent('message_stop', { type: 'message_stop' }),
+        ].join('')
+        return new Response(responseBody, {
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      },
+    })
+    const providerService = new ProviderService()
+    const provider = await providerService.addProvider({
+      presetId: 'custom',
+      name: 'Issue 1033 resume provider',
+      apiKey: 'loopback-test-key',
+      baseUrl: `http://127.0.0.1:${upstream.port}`,
+      apiFormat: 'anthropic',
+      models: {
+        main: 'resume-model-a',
+        haiku: 'resume-model-a',
+        sonnet: 'resume-model-a',
+        opus: 'resume-model-a',
+      },
+    })
+    await providerService.activateProvider(provider.id)
+
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'issue-1033-resume-'))
+    const originalCliPathForTest = process.env.CLAUDE_CLI_PATH
+    const originalResumeTranscriptPath = process.env.MOCK_SDK_RESUME_TRANSCRIPT_PATH
+    const originalResumeUpstreamUrl = process.env.MOCK_SDK_RESUME_UPSTREAM_URL
+    const originalStartSession = conversationService.startSession.bind(conversationService)
+    const launchTranscriptCounts: number[] = []
+    let sessionId: string | undefined
+    let transcriptAtFirstCompletion = ''
+
+    process.env.CLAUDE_CLI_PATH = fileURLToPath(
+      new URL('./fixtures/mock-sdk-cli.ts', import.meta.url),
+    )
+    conversationService.startSession = (async function patchedStartSession(
+      sid: string,
+      sessionWorkDir: string,
+      sdkUrl: string,
+      options?: { permissionMode?: string; model?: string; effort?: string; thinking?: 'enabled' | 'adaptive' | 'disabled'; providerId?: string | null },
+    ) {
+      const launchInfo = await sessionService.getSessionLaunchInfo(sid)
+      launchTranscriptCounts.push(launchInfo?.transcriptMessageCount ?? 0)
+      return originalStartSession(sid, sessionWorkDir, sdkUrl, options)
+    }) as typeof conversationService.startSession
+
+    try {
+      const createRes = await fetch(`${baseUrl}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workDir }),
+      })
+      expect(createRes.status).toBe(201)
+      ;({ sessionId } = await createRes.json() as { sessionId: string })
+      const transcriptPath = (await sessionService.findSessionFile(sessionId))?.filePath
+      expect(transcriptPath).toBeTruthy()
+      process.env.MOCK_SDK_RESUME_TRANSCRIPT_PATH = transcriptPath!
+      process.env.MOCK_SDK_RESUME_UPSTREAM_URL = `http://127.0.0.1:${upstream.port}/v1/messages`
+
+      const ws = new WebSocket(`${wsUrl}/ws/${sessionId}`)
+      let phase: 'boot' | 'first' | 'switching' | 'second' | 'done' = 'boot'
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.close()
+          reject(new Error(`Timed out waiting for issue #1033 resume flow in phase ${phase}`))
+        }, 60_000)
+
+        ws.onmessage = (event) => {
+          const message = JSON.parse(event.data as string)
+          if (message.type === 'error') {
+            clearTimeout(timeout)
+            ws.close()
+            reject(new Error(`${message.code}: ${message.message}`))
+            return
+          }
+          if (message.type === 'connected' && phase === 'boot') {
+            phase = 'first'
+            ws.send(JSON.stringify({
+              type: 'set_runtime_config',
+              providerId: provider.id,
+              modelId: 'resume-model-a',
+            }))
+            ws.send(JSON.stringify({
+              type: 'user_message',
+              content: 'FIRST_TURN_1033 remember cobalt-orchid',
+            }))
+            return
+          }
+          if (message.type === 'message_complete' && phase === 'first') {
+            transcriptAtFirstCompletion = readFileSync(transcriptPath!, 'utf-8')
+            phase = 'switching'
+            ws.send(JSON.stringify({
+              type: 'set_runtime_config',
+              providerId: provider.id,
+              modelId: 'resume-model-b',
+            }))
+            return
+          }
+          if (message.type === 'status' && message.state === 'idle' && phase === 'switching') {
+            phase = 'second'
+            ws.send(JSON.stringify({
+              type: 'user_message',
+              content: 'SECOND_TURN_1033 recall the marker',
+            }))
+            return
+          }
+          if (message.type === 'message_complete' && phase === 'second') {
+            clearTimeout(timeout)
+            phase = 'done'
+            ws.close()
+            resolve()
+          }
+        }
+        ws.onerror = () => {
+          clearTimeout(timeout)
+          reject(new Error(`WebSocket failed for issue #1033 session ${sessionId}`))
+        }
+      })
+
+      const secondRequest = requestBodies.find((body) =>
+        JSON.stringify(body).includes('SECOND_TURN_1033'),
+      )
+      const serializedSecondRequest = JSON.stringify(secondRequest)
+      expect(transcriptAtFirstCompletion).toContain('FIRST_TURN_1033')
+      expect(transcriptAtFirstCompletion).toContain('FIRST_REPLY_1033')
+      expect(launchTranscriptCounts).toEqual([0, 2])
+      expect(serializedSecondRequest).toContain('FIRST_TURN_1033')
+      expect(serializedSecondRequest).toContain('cobalt-orchid')
+      expect(serializedSecondRequest).toContain('FIRST_REPLY_1033')
+    } finally {
+      conversationService.startSession = originalStartSession
+      if (sessionId) conversationService.stopSession(sessionId)
+      if (originalCliPathForTest === undefined) delete process.env.CLAUDE_CLI_PATH
+      else process.env.CLAUDE_CLI_PATH = originalCliPathForTest
+      if (originalResumeTranscriptPath === undefined) delete process.env.MOCK_SDK_RESUME_TRANSCRIPT_PATH
+      else process.env.MOCK_SDK_RESUME_TRANSCRIPT_PATH = originalResumeTranscriptPath
+      if (originalResumeUpstreamUrl === undefined) delete process.env.MOCK_SDK_RESUME_UPSTREAM_URL
+      else process.env.MOCK_SDK_RESUME_UPSTREAM_URL = originalResumeUpstreamUrl
+      await providerService.activateOfficial()
+      await providerService.deleteProvider(provider.id)
+      upstream.stop(true)
+      await fs.rm(workDir, { recursive: true, force: true })
+    }
+  }, 70_000)
 })

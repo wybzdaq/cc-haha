@@ -1449,7 +1449,13 @@ export class ConversationService {
       CALLER_DIR: workDir,
       PWD: workDir,
       ...(sdkUrl
-        ? { CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop' }
+        ? {
+            // Runtime config changes restart the SDK child as soon as its result
+            // arrives. Flush the completed turn first so the replacement can
+            // reliably choose --resume and load the context (#1033).
+            CLAUDE_CODE_EAGER_FLUSH: cleanEnv.CLAUDE_CODE_EAGER_FLUSH || '1',
+            CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop',
+          }
         : {}),
       ...(sdkUrl && traceCaptureEnabled
         ? { CC_HAHA_TRACE_API_CALLS: '1' }
