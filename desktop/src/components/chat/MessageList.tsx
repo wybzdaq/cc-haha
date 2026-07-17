@@ -1021,6 +1021,8 @@ type ConversationFindMatch = {
   query: string
 }
 
+const MAX_CONVERSATION_FIND_MATCHES = 1_000
+
 const sessionScrollSnapshots = new Map<string, SessionScrollSnapshot>()
 
 function isNearScrollBottom(element: HTMLElement) {
@@ -1078,67 +1080,8 @@ function getRenderItemKey(item: RenderItem) {
   return item.kind === 'tool_group' ? item.id : item.message.id
 }
 
-function appendSearchableUnknownStrings(value: unknown, output: string[], depth = 0) {
-  if (typeof value === 'string') {
-    output.push(value)
-    return
-  }
-  if (!value || depth > 3) return
-  if (Array.isArray(value)) {
-    for (const item of value) appendSearchableUnknownStrings(item, output, depth + 1)
-    return
-  }
-  if (!isRecordValue(value)) return
-  for (const item of Object.values(value)) appendSearchableUnknownStrings(item, output, depth + 1)
-}
-
-function getMessageSearchSegments(message: UIMessage, toolResultMap: Map<string, ToolResult>) {
-  const segments: string[] = []
-  switch (message.type) {
-    case 'user_text':
-    case 'assistant_text':
-    case 'thinking':
-    case 'system':
-      segments.push(message.content)
-      break
-    case 'tool_use':
-      segments.push(message.toolName)
-      appendSearchableUnknownStrings(message.input, segments)
-      appendSearchableUnknownStrings(toolResultMap.get(message.toolUseId)?.content, segments)
-      break
-    case 'tool_result':
-      appendSearchableUnknownStrings(message.content, segments)
-      break
-    case 'permission_request':
-      segments.push(message.toolName, message.description ?? '')
-      appendSearchableUnknownStrings(message.input, segments)
-      break
-    case 'error':
-      segments.push(message.message, message.code)
-      break
-    case 'compact_summary':
-      segments.push(message.title, message.summary ?? '')
-      break
-    case 'goal_event':
-      segments.push(message.objective ?? '', message.message ?? '')
-      break
-    case 'memory_event':
-      segments.push(message.message ?? '')
-      for (const file of message.files) segments.push(file.path, file.summary ?? '')
-      break
-    case 'background_task':
-      appendSearchableUnknownStrings(message.task, segments)
-      break
-    case 'task_summary':
-      for (const task of message.tasks) segments.push(task.subject, task.activeForm ?? '')
-      break
-  }
-  return segments
-}
-
 function findConversationMatches(
   renderItems: RenderItem[],
-  toolResultMap: Map<string, ToolResult>,
   query: string,
 ): ConversationFindMatch[] {
   const needle = query.toLocaleLowerCase()
@@ -1146,23 +1089,21 @@ function findConversationMatches(
   const matches: ConversationFindMatch[] = []
 
   renderItems.forEach((item, renderIndex) => {
-    const segments = item.kind === 'message'
-      ? getMessageSearchSegments(item.message, toolResultMap)
-      : item.toolCalls.flatMap((toolCall) => getMessageSearchSegments(toolCall, toolResultMap))
+    if (matches.length >= MAX_CONVERSATION_FIND_MATCHES || item.kind !== 'message') return
+    const message = item.message
+    if (message.type !== 'user_text' && message.type !== 'assistant_text') return
     let occurrenceIndex = 0
-    for (const segment of segments) {
-      const text = segment.toLocaleLowerCase()
-      let offset = text.indexOf(needle)
-      while (offset !== -1) {
-        matches.push({
-          renderIndex,
-          renderItemKey: getRenderItemKey(item),
-          occurrenceIndex,
-          query,
-        })
-        occurrenceIndex += 1
-        offset = text.indexOf(needle, offset + needle.length)
-      }
+    const text = message.content.toLocaleLowerCase()
+    let offset = text.indexOf(needle)
+    while (offset !== -1 && matches.length < MAX_CONVERSATION_FIND_MATCHES) {
+      matches.push({
+        renderIndex,
+        renderItemKey: getRenderItemKey(item),
+        occurrenceIndex,
+        query,
+      })
+      occurrenceIndex += 1
+      offset = text.indexOf(needle, offset + needle.length)
     }
   })
 
@@ -2435,17 +2376,19 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     setScrollTopWithoutLayoutRead(container, targetScrollTop)
     setVirtualViewport({ scrollTop: targetScrollTop, viewportHeight })
   }, [virtualTranscriptWindow.offsets, virtualTranscriptWindow.totalHeight, virtualViewport.viewportHeight])
+  const navigateToConversationFindMatchRef = useRef(navigateToConversationFindMatch)
+  navigateToConversationFindMatchRef.current = navigateToConversationFindMatch
 
   useEffect(() => {
     if (!resolvedSessionId || resolvedSessionId !== activeTabId) return
 
     return registerConversationFindController({
       search(query) {
-        const matches = findConversationMatches(renderItems, toolResultMap, query)
+        const matches = findConversationMatches(renderItems, query)
         conversationFindMatchesRef.current = matches
         const firstMatch = matches[0]
         if (firstMatch) {
-          navigateToConversationFindMatch(firstMatch)
+          navigateToConversationFindMatchRef.current(firstMatch)
         } else {
           setActiveConversationFindMatch(null)
           clearConversationFindHighlights()
@@ -2454,7 +2397,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       },
       navigate(index) {
         const match = conversationFindMatchesRef.current[index]
-        if (match) navigateToConversationFindMatch(match)
+        if (match) navigateToConversationFindMatchRef.current(match)
       },
       clear() {
         conversationFindMatchesRef.current = []
@@ -2462,7 +2405,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         clearConversationFindHighlights()
       },
     })
-  }, [activeTabId, navigateToConversationFindMatch, renderItems, resolvedSessionId, toolResultMap])
+  }, [activeTabId, renderItems, resolvedSessionId])
 
   useLayoutEffect(() => {
     if (!activeConversationFindMatch) {

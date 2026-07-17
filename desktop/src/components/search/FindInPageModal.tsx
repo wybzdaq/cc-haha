@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react'
-import { getConversationFindController, type ConversationFindController } from './conversationFindBridge'
+import {
+  getConversationFindController,
+  subscribeConversationFindController,
+  type ConversationFindController,
+} from './conversationFindBridge'
 
 // JS-based scoped find-in-page. We walk text nodes in the document body EXCLUDING the
 // sidebar (.sidebar-panel) and this find bar ([data-find-bar]), then highlight matches
@@ -28,6 +32,11 @@ export function FindInPageModal({ open, onClose }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
   const rangesRef = useRef<Range[]>([])
   const conversationControllerRef = useRef<ConversationFindController | null>(null)
+  const conversationController = useSyncExternalStore(
+    subscribeConversationFindController,
+    getConversationFindController,
+    getConversationFindController,
+  )
 
   // Focus + reset whenever the bar opens; clear highlights when it closes.
   useEffect(() => {
@@ -70,7 +79,19 @@ export function FindInPageModal({ open, onClose }: Props) {
       setActiveIndex(0)
       return
     }
-    const conversationController = getConversationFindController()
+    // A visible workspace/activity/settings surface takes precedence over the
+    // chat behind it. When no non-chat content matches, use the conversation
+    // index so virtualized messages remain searchable.
+    const ranges = collectRanges(q, conversationController ? '.chat-scroll-area' : undefined)
+    if (ranges.length > 0) {
+      conversationControllerRef.current?.clear()
+      conversationControllerRef.current = null
+      rangesRef.current = ranges
+      setCount(ranges.length)
+      setActiveIndex(0)
+      paint(ranges, 0)
+      return
+    }
     if (conversationController) {
       clearHighlights()
       rangesRef.current = []
@@ -81,22 +102,21 @@ export function FindInPageModal({ open, onClose }: Props) {
       return
     }
     conversationControllerRef.current = null
-    const ranges = collectRanges(q)
     rangesRef.current = ranges
     setCount(ranges.length)
     setActiveIndex(0)
     paint(ranges, 0)
-  }, [debouncedQuery])
+  }, [conversationController, debouncedQuery])
 
   // Next/previous — immediate, uses live state.
   function step(forward: boolean) {
-    const conversationController = getConversationFindController() ?? conversationControllerRef.current
-    if (conversationController && count > 0) {
+    const activeConversationController = conversationController ?? conversationControllerRef.current
+    if (activeConversationController && count > 0 && rangesRef.current.length === 0) {
       const nextConversationIndex = forward
         ? (activeIndex + 1) % count
         : (activeIndex - 1 + count) % count
       setActiveIndex(nextConversationIndex)
-      conversationController.navigate(nextConversationIndex)
+      activeConversationController.navigate(nextConversationIndex)
       return
     }
     const ranges = rangesRef.current
@@ -177,7 +197,7 @@ export function FindInPageModal({ open, onClose }: Props) {
 // ---- search core (module scope, no React state) ----
 
 /** Walk visible text nodes outside skipped subtrees; return a Range per case-insensitive match. */
-function collectRanges(q: string): Range[] {
+function collectRanges(q: string, additionalSkipClosest?: string): Range[] {
   const ranges: Range[] = []
   const needle = q.toLowerCase()
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
@@ -185,6 +205,7 @@ function collectRanges(q: string): Range[] {
       const parent = node.parentElement
       if (!parent || !node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT
       if (parent.closest(SKIP_CLOSEST)) return NodeFilter.FILTER_REJECT
+      if (additionalSkipClosest && parent.closest(additionalSkipClosest)) return NodeFilter.FILTER_REJECT
       return NodeFilter.FILTER_ACCEPT
     },
   })

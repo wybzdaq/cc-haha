@@ -338,7 +338,7 @@ describe('MessageList nested tool calls', () => {
     await waitFor(() => expect(screen.getByText('1 / 2')).toBeTruthy())
     await waitFor(() => expect(screen.getByText('Virtual history needle 0')).toBeTruthy())
     expect(scrollTop).toBe(0)
-    expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-0')
+    await waitFor(() => expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-0'))
 
     fireEvent.click(screen.getByRole('button', { name: 'Next match' }))
 
@@ -346,6 +346,45 @@ describe('MessageList nested tool calls', () => {
     await waitFor(() => expect(screen.getByText('Virtual history needle 64')).toBeTruthy())
     expect(scrollTop).toBeGreaterThan(0)
     expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-64')
+  })
+
+  it('bounds semantic conversation matches and ignores hidden tool payloads', async () => {
+    vi.stubGlobal('CSS', { highlights: new Map() })
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'assistant-many-matches',
+              type: 'assistant_text',
+              content: 'boundedneedle '.repeat(1_100),
+              timestamp: 1,
+            },
+            {
+              id: 'hidden-tool-payload',
+              type: 'tool_result',
+              toolUseId: 'tool-1',
+              content: 'hiddenpayloadneedle '.repeat(10_000),
+              isError: false,
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(
+      <>
+        <MessageList />
+        <FindInPageModal open onClose={() => {}} />
+      </>,
+    )
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'boundedneedle' } })
+    await waitFor(() => expect(screen.getByText('1 / 1000')).toBeTruthy())
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'hiddenpayloadneedle' } })
+    await waitFor(() => expect(screen.getByText('0')).toBeTruthy())
   })
 
   it('keeps small transcripts fully mounted without deferred browser painting', () => {
