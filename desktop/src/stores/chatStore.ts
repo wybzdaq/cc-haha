@@ -747,10 +747,7 @@ function shouldSuppressTaskNotificationResponse(session: PerSessionState): boole
   const lastMessage = session.messages[session.messages.length - 1]
   const hasVisibleActiveOutput =
     session.streamingText.trim().length > 0 ||
-    Boolean(session.activeToolUseId) ||
-    session.chatState === 'streaming' ||
-    session.chatState === 'tool_executing' ||
-    session.chatState === 'permission_pending'
+    Boolean(session.activeToolUseId)
   return !hasVisibleActiveOutput && lastMessage?.type !== 'user_text'
 }
 
