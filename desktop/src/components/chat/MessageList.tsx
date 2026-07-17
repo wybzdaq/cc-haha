@@ -40,7 +40,11 @@ import {
   getMetricsForSession,
   type VirtualRenderItemMetric,
 } from './virtualHeightCache'
-import { registerConversationFindController } from '../search/conversationFindBridge'
+import {
+  notifyConversationFindContentChanged,
+  registerConversationFindController,
+  type ConversationFindController,
+} from '../search/conversationFindBridge'
 
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
 type ToolResult = Extract<UIMessage, { type: 'tool_result' }>
@@ -1022,6 +1026,7 @@ type ConversationFindMatch = {
 }
 
 const MAX_CONVERSATION_FIND_MATCHES = 1_000
+const CONVERSATION_FIND_CONTENT_REFRESH_MS = 80
 
 const sessionScrollSnapshots = new Map<string, SessionScrollSnapshot>()
 
@@ -1082,6 +1087,7 @@ function getRenderItemKey(item: RenderItem) {
 
 function findConversationMatches(
   renderItems: RenderItem[],
+  streamingText: string,
   query: string,
 ): ConversationFindMatch[] {
   const needle = query.toLocaleLowerCase()
@@ -1107,6 +1113,22 @@ function findConversationMatches(
     }
   })
 
+  if (matches.length < MAX_CONVERSATION_FIND_MATCHES && streamingText.trim()) {
+    const text = streamingText.toLocaleLowerCase()
+    let occurrenceIndex = 0
+    let offset = text.indexOf(needle)
+    while (offset !== -1 && matches.length < MAX_CONVERSATION_FIND_MATCHES) {
+      matches.push({
+        renderIndex: renderItems.length,
+        renderItemKey: STREAMING_ASSISTANT_NAVIGATION_KEY,
+        occurrenceIndex,
+        query,
+      })
+      occurrenceIndex += 1
+      offset = text.indexOf(needle, offset + needle.length)
+    }
+  }
+
   return matches
 }
 
@@ -1128,13 +1150,14 @@ function collectConversationFindRanges(root: Node, query: string) {
   while (textNode) {
     const text = textNode.nodeValue?.toLocaleLowerCase() ?? ''
     let offset = text.indexOf(needle)
-    while (offset !== -1) {
+    while (offset !== -1 && ranges.length < MAX_CONVERSATION_FIND_MATCHES) {
       const range = document.createRange()
       range.setStart(textNode, offset)
       range.setEnd(textNode, offset + needle.length)
       ranges.push(range)
       offset = text.indexOf(needle, offset + needle.length)
     }
+    if (ranges.length >= MAX_CONVERSATION_FIND_MATCHES) break
     textNode = walker.nextNode() as Text | null
   }
   return ranges
@@ -1154,7 +1177,9 @@ function paintConversationFindHighlights(root: HTMLElement, match: ConversationF
   const resultRanges = collectConversationFindRanges(root, match.query)
   const target = Array.from(root.querySelectorAll<HTMLElement>('[data-chat-render-item-key]'))
     .find((node) => node.dataset.chatRenderItemKey === match.renderItemKey)
-  const targetRanges = target ? collectConversationFindRanges(target, match.query) : []
+  const targetRanges = target
+    ? resultRanges.filter((range) => target.contains(range.startContainer))
+    : []
   const activeRange = targetRanges[Math.min(match.occurrenceIndex, Math.max(0, targetRanges.length - 1))]
 
   const results = new HighlightCtor()
@@ -1584,6 +1609,8 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   const measureFlushFrameRef = useRef<number | null>(null)
   const navigationHighlightTimerRef = useRef<number | null>(null)
   const workspaceOriginRestoreFrameRef = useRef<number | null>(null)
+  const conversationFindRefreshTimerRef = useRef<number | null>(null)
+  const conversationFindLastRefreshAtRef = useRef(0)
   const workspaceOriginSessionRef = useRef(resolvedSessionId)
   const lastAutoScrollAtRef = useRef(0)
   const lastContentResizeFollowHeightRef = useRef<number | null>(null)
@@ -1632,6 +1659,9 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     }
     if (workspaceOriginRestoreFrameRef.current !== null) {
       cancelAnimationFrame(workspaceOriginRestoreFrameRef.current)
+    }
+    if (conversationFindRefreshTimerRef.current !== null) {
+      window.clearTimeout(conversationFindRefreshTimerRef.current)
     }
     clearConversationFindHighlights()
   }, [])
@@ -2362,8 +2392,9 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     if (!container) return
 
     const viewportHeight = container.clientHeight || virtualViewport.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT
+    const targetOffset = virtualTranscriptWindow.offsets[match.renderIndex] ?? virtualTranscriptWindow.totalHeight
     const targetScrollTop = clampNumber(
-      (virtualTranscriptWindow.offsets[match.renderIndex] ?? 0) - viewportHeight * CONVERSATION_NAVIGATION_READING_ANCHOR_RATIO,
+      targetOffset - viewportHeight * CONVERSATION_NAVIGATION_READING_ANCHOR_RATIO,
       0,
       Math.max(0, virtualTranscriptWindow.totalHeight - viewportHeight),
     )
@@ -2378,17 +2409,26 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   }, [virtualTranscriptWindow.offsets, virtualTranscriptWindow.totalHeight, virtualViewport.viewportHeight])
   const navigateToConversationFindMatchRef = useRef(navigateToConversationFindMatch)
   navigateToConversationFindMatchRef.current = navigateToConversationFindMatch
+  const conversationFindRenderItemsRef = useRef(renderItems)
+  conversationFindRenderItemsRef.current = renderItems
+  const conversationFindStreamingTextRef = useRef(streamingText)
+  conversationFindStreamingTextRef.current = streamingText
+  const conversationFindControllerRef = useRef<ConversationFindController | null>(null)
 
   useEffect(() => {
     if (!resolvedSessionId || resolvedSessionId !== activeTabId) return
 
-    return registerConversationFindController({
-      search(query) {
-        const matches = findConversationMatches(renderItems, query)
+    const controller: ConversationFindController = {
+      search(query, preferredIndex = 0) {
+        const matches = findConversationMatches(
+          conversationFindRenderItemsRef.current,
+          conversationFindStreamingTextRef.current,
+          query,
+        )
         conversationFindMatchesRef.current = matches
-        const firstMatch = matches[0]
-        if (firstMatch) {
-          navigateToConversationFindMatchRef.current(firstMatch)
+        const selectedMatch = matches[Math.min(preferredIndex, Math.max(0, matches.length - 1))]
+        if (selectedMatch) {
+          navigateToConversationFindMatchRef.current(selectedMatch)
         } else {
           setActiveConversationFindMatch(null)
           clearConversationFindHighlights()
@@ -2404,8 +2444,34 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         setActiveConversationFindMatch(null)
         clearConversationFindHighlights()
       },
-    })
-  }, [activeTabId, renderItems, resolvedSessionId])
+    }
+    conversationFindControllerRef.current = controller
+    const unregister = registerConversationFindController(controller)
+    return () => {
+      if (conversationFindControllerRef.current === controller) {
+        conversationFindControllerRef.current = null
+      }
+      unregister()
+    }
+  }, [activeTabId, resolvedSessionId])
+
+  useEffect(() => {
+    const controller = conversationFindControllerRef.current
+    if (!controller) return
+    const notify = () => {
+      conversationFindRefreshTimerRef.current = null
+      conversationFindLastRefreshAtRef.current = performance.now()
+      notifyConversationFindContentChanged(controller)
+    }
+    if (conversationFindRefreshTimerRef.current !== null) return
+    const remainingDelay = CONVERSATION_FIND_CONTENT_REFRESH_MS -
+      (performance.now() - conversationFindLastRefreshAtRef.current)
+    if (remainingDelay <= 0) {
+      notify()
+      return
+    }
+    conversationFindRefreshTimerRef.current = window.setTimeout(notify, remainingDelay)
+  }, [renderItems, streamingText])
 
   useLayoutEffect(() => {
     if (!activeConversationFindMatch) {

@@ -1,13 +1,15 @@
 export type ConversationFindController = {
-  search: (query: string) => number
+  search: (query: string, preferredIndex?: number) => number
   navigate: (index: number) => void
   clear: () => void
 }
 
 let activeController: ConversationFindController | null = null
+let revision = 0
 const listeners = new Set<() => void>()
 
 function notifyControllerChanged() {
+  revision += 1
   for (const listener of listeners) listener()
 }
 
@@ -23,6 +25,14 @@ export function registerConversationFindController(controller: ConversationFindC
 
 export function getConversationFindController() {
   return activeController
+}
+
+export function getConversationFindRevision() {
+  return revision
+}
+
+export function notifyConversationFindContentChanged(controller: ConversationFindController) {
+  if (activeController === controller) notifyControllerChanged()
 }
 
 export function subscribeConversationFindController(listener: () => void) {

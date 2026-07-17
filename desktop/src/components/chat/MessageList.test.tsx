@@ -299,17 +299,18 @@ describe('MessageList nested tool calls', () => {
     vi.stubGlobal('CSS', { highlights })
     vi.stubGlobal('Highlight', TestHighlight)
 
+    const messages = Array.from({ length: 130 }, (_, index) => ({
+      id: `assistant-${index}`,
+      type: 'assistant_text' as const,
+      content: index === 0 || index === 64
+        ? `Virtual history needle ${index}`
+        : `Virtual history filler ${index}`,
+      timestamp: index,
+    }))
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
-          messages: Array.from({ length: 130 }, (_, index) => ({
-            id: `assistant-${index}`,
-            type: 'assistant_text' as const,
-            content: index === 0 || index === 64
-              ? `Virtual history needle ${index}`
-              : `Virtual history filler ${index}`,
-            timestamp: index,
-          })),
+          messages,
         }),
       },
     })
@@ -346,10 +347,36 @@ describe('MessageList nested tool calls', () => {
     await waitFor(() => expect(screen.getByText('Virtual history needle 64')).toBeTruthy())
     expect(scrollTop).toBeGreaterThan(0)
     expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-64')
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages: [...messages, {
+              id: 'assistant-new-tail',
+              type: 'assistant_text',
+              content: 'new Virtual history needle response',
+              timestamp: 131,
+            }],
+          }),
+        },
+      })
+    })
+    await waitFor(() => expect(screen.getByText('2 / 3')).toBeTruthy())
+    expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-64')
   })
 
   it('bounds semantic conversation matches and ignores hidden tool payloads', async () => {
-    vi.stubGlobal('CSS', { highlights: new Map() })
+    const highlights = new Map<string, { ranges: Range[] }>()
+    class TestHighlight {
+      ranges: Range[] = []
+
+      add(range: Range) {
+        this.ranges.push(range)
+      }
+    }
+    vi.stubGlobal('CSS', { highlights })
+    vi.stubGlobal('Highlight', TestHighlight)
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -382,9 +409,73 @@ describe('MessageList nested tool calls', () => {
 
     fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'boundedneedle' } })
     await waitFor(() => expect(screen.getByText('1 / 1000')).toBeTruthy())
+    await waitFor(() => expect(highlights.get('cc-find-results')?.ranges).toHaveLength(1_000))
 
     fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'hiddenpayloadneedle' } })
     await waitFor(() => expect(screen.getByText('0')).toBeTruthy())
+  })
+
+  it('finds the current streaming assistant response', async () => {
+    const highlights = new Map<string, { ranges: Range[] }>()
+    class TestHighlight {
+      ranges: Range[] = []
+
+      add(range: Range) {
+        this.ranges.push(range)
+      }
+    }
+    vi.stubGlobal('CSS', { highlights })
+    vi.stubGlobal('Highlight', TestHighlight)
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'streaming',
+          streamingText: 'Current streaming response without the target',
+        }),
+      },
+    })
+
+    render(
+      <>
+        <MessageList />
+        <FindInPageModal open onClose={() => {}} />
+      </>,
+    )
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'late streaming needle' } })
+
+    await waitFor(() => expect(screen.getByText('0')).toBeTruthy())
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            chatState: 'streaming',
+            streamingText: 'Current late streaming needle',
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => expect(screen.getByText('1 / 1')).toBeTruthy())
+    await waitFor(() => expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('streaming-assistant-message'))
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages: [{
+              id: 'assistant-completed-stream',
+              type: 'assistant_text',
+              content: 'Current late streaming needle',
+              timestamp: 2,
+            }],
+            chatState: 'idle',
+            streamingText: '',
+          }),
+        },
+      })
+    })
+    await waitFor(() => expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-completed-stream'))
   })
 
   it('keeps small transcripts fully mounted without deferred browser painting', () => {
