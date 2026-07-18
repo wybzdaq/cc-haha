@@ -20,7 +20,10 @@ import {
   conversationService,
 } from '../services/conversationService.js'
 import { computerUseApprovalService } from '../services/computerUseApprovalService.js'
-import { sessionService } from '../services/sessionService.js'
+import {
+  sessionService,
+  type SessionTaskNotification,
+} from '../services/sessionService.js'
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
 import { isOpenAIOfficialProviderId } from '../services/openaiOfficialProvider.js'
@@ -208,6 +211,7 @@ const clientOutputCallbacks = new Map<
     callback: (cliMsg: any) => void
   }
 >()
+const taskNotificationPersistence = new Map<string, Map<string, Promise<void>>>()
 
 export const handleWebSocket = {
   open(ws: ServerWebSocket<WebSocketData>) {
@@ -374,7 +378,7 @@ export const handleWebSocket = {
     // background (issue #764) — never kill it just because a phone locked its
     // screen. Defer cleanup until the turn completes, then apply the idle
     // grace period. Sessions that are already idle go straight to the timer.
-    if (isSessionTurnActive(sessionId)) {
+    if (hasPendingOrActiveUserTurn(sessionId)) {
       // A turn blocked on permission cannot finish without user input. Keep the
       // completion watcher for early cleanup, but also enforce the existing
       // pending-permission maximum so an abandoned prompt cannot pin the CLI.
@@ -523,6 +527,13 @@ async function handleUserMessage(
     },
   })
   const removeActiveTurnOutputCallback = bindActiveUserTurnCompletion(ws, sessionId, activeTurn)
+
+  // The renderer may have left while the CLI was still starting, before this
+  // turn could flip messageSent=true. The disconnect handler cannot attach an
+  // effective output watcher until the ConversationService session exists, so
+  // refresh it here, immediately before sending the turn, to observe a
+  // permission request that arrives after the disconnect.
+  refreshDisconnectedTurnCleanupWatcher(sessionId)
 
   const sent = await conversationService.sendMessage(
     sessionId,
@@ -1418,6 +1429,7 @@ function cleanupSessionRuntimeState(sessionId: string) {
   runtimeTransitionPromises.delete(sessionId)
   sessionStartupPromises.delete(sessionId)
   lastResolvedStartupWorkDirs.delete(sessionId)
+  taskNotificationPersistence.delete(sessionId)
   clearPrewarmState(sessionId)
 }
 
@@ -2253,19 +2265,11 @@ function getDisconnectCleanupDelayMs(sessionId: string): number {
 }
 
 /**
- * Whether the session is mid-turn (a user message was sent and no result has
- * arrived yet). Such a turn must not be killed on disconnect.
- */
-function isSessionTurnActive(sessionId: string): boolean {
-  return activeUserTurns.get(sessionId)?.messageSent === true
-}
-
-/**
  * Whether a user turn has been registered for this session and not yet settled,
  * INCLUDING the CLI-startup window before messageSent flips true. handleUserMessage
  * registers the turn in its synchronous prefix (activeUserTurns.set), well before
- * the message is actually sent. Unlike isSessionTurnActive, this is not blind to
- * that window, so the prewarm idle timer can neither arm on nor fire against a
+ * the message is actually sent. Checking the registration is not blind to that
+ * window, so the prewarm idle timer can neither arm on nor fire against a
  * session a user turn has already claimed — even when a concurrent
  * prewarm_session/user_message flush inverts their ordering.
  */
@@ -2327,6 +2331,23 @@ function watchTurnCompletionForCleanup(sessionId: string): void {
   sessionDisconnectWatchers.set(sessionId, () => {
     conversationService.removeOutputCallback(sessionId, onComplete)
   })
+}
+
+/**
+ * Re-arm the disconnect watcher once CLI startup has completed. A client can
+ * leave during the startup window, when the user turn is registered but the
+ * ConversationService session (and therefore its output callback list) does
+ * not exist yet.
+ */
+function refreshDisconnectedTurnCleanupWatcher(sessionId: string): void {
+  if (hasActiveClients(sessionId) || !hasPendingOrActiveUserTurn(sessionId)) return
+
+  const pendingTimer = sessionCleanupTimers.get(sessionId)
+  if (pendingTimer) {
+    clearTimeout(pendingTimer)
+    sessionCleanupTimers.delete(sessionId)
+  }
+  watchTurnCompletionForCleanup(sessionId)
 }
 
 /** Remove any pending turn-completion watcher for a session. */
@@ -2662,6 +2683,66 @@ function removeClientOutputCallback(ws: ServerWebSocket<WebSocketData>): void {
   clientOutputCallbacks.delete(ws)
 }
 
+function normalizeCliTaskNotification(cliMsg: any): SessionTaskNotification | null {
+  if (cliMsg?.type !== 'system' || cliMsg.subtype !== 'task_notification') return null
+  const toolUseId = typeof cliMsg.tool_use_id === 'string' && cliMsg.tool_use_id
+    ? cliMsg.tool_use_id
+    : null
+  const rawStatus = cliMsg.status
+  const status = rawStatus === 'killed' ? 'stopped' : rawStatus
+  if (
+    !toolUseId ||
+    (status !== 'completed' && status !== 'failed' && status !== 'stopped')
+  ) {
+    return null
+  }
+
+  const optionalString = (value: unknown) =>
+    typeof value === 'string' && value ? value : undefined
+  return {
+    taskId: optionalString(cliMsg.task_id) ?? toolUseId,
+    toolUseId,
+    status,
+    ...(optionalString(cliMsg.summary) ? { summary: optionalString(cliMsg.summary) } : {}),
+    ...(optionalString(cliMsg.result) ? { result: optionalString(cliMsg.result) } : {}),
+    ...(optionalString(cliMsg.output_file) ? { outputFile: optionalString(cliMsg.output_file) } : {}),
+    timestamp: optionalString(cliMsg.timestamp) ?? new Date().toISOString(),
+  }
+}
+
+function persistCliTaskNotification(
+  sessionId: string,
+  cliMsg: any,
+): Promise<void> | null {
+  const notification = normalizeCliTaskNotification(cliMsg)
+  if (!notification) return null
+
+  let sessionWrites = taskNotificationPersistence.get(sessionId)
+  if (!sessionWrites) {
+    sessionWrites = new Map()
+    taskNotificationPersistence.set(sessionId, sessionWrites)
+  }
+  const eventKey = typeof cliMsg.uuid === 'string' && cliMsg.uuid
+    ? cliMsg.uuid
+    : JSON.stringify(notification)
+  const existing = sessionWrites.get(eventKey)
+  if (existing) return existing
+
+  const write = sessionService.appendSessionTaskNotification(sessionId, notification)
+    .catch((error) => {
+      sessionWrites?.delete(eventKey)
+      console.warn(
+        `[WS] Failed to persist task notification for ${sessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    })
+  sessionWrites.set(eventKey, write)
+  return write
+}
+
+export const __persistCliTaskNotificationForTests = persistCliTaskNotification
+
 function bindAllClientSessionOutputs(
   sessionId: string,
   options?: {
@@ -2699,12 +2780,30 @@ function bindClientSessionOutput(
       return
     }
 
-    handleCliPermissionModeBroadcast(sessionId, cliMsg)
-    const serverMsgs = translateCliMessage(cliMsg, sessionId)
-    for (const msg of serverMsgs) {
-      sendMessage(ws, msg)
+    const forward = () => {
+      handleCliPermissionModeBroadcast(sessionId, cliMsg)
+      const serverMsgs = translateCliMessage(cliMsg, sessionId)
+      for (const msg of serverMsgs) {
+        sendMessage(ws, msg)
+      }
     }
 
+    const persistence = persistCliTaskNotification(sessionId, cliMsg)
+    if (persistence) {
+      void persistence
+        .then(() => {
+          if (activeSessions.get(sessionId)?.has(ws)) forward()
+        })
+        .catch((error) => {
+          console.warn(
+            `[WS] Failed to forward persisted task notification for ${sessionId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          )
+        })
+      return
+    }
+    forward()
   }
 
   clientOutputCallbacks.set(ws, { sessionId, callback })
@@ -3159,6 +3258,7 @@ export function __resetWebSocketHandlerStateForTests(): void {
   for (const remove of sessionDisconnectWatchers.values()) remove()
   activeSessions.clear()
   clientOutputCallbacks.clear()
+  taskNotificationPersistence.clear()
   sessionCleanupTimers.clear()
   sessionDisconnectWatchers.clear()
   prewarmPendingSessions.clear()
@@ -3177,10 +3277,15 @@ export function __markActiveTurnForTests(sessionId: string): void {
 
 /**
  * Test hook: register a user turn still in the pre-send (messageSent:false)
- * window — i.e. the CLI-startup window that isSessionTurnActive is blind to.
+ * window — i.e. the CLI-startup window before messageSent becomes true.
  */
 export function __registerPendingUserTurnForTests(sessionId: string): void {
   activeUserTurns.set(sessionId, { messageSent: false })
+}
+
+/** Test hook: simulate CLI startup completing after the last client left. */
+export function __refreshDisconnectedTurnCleanupWatcherForTests(sessionId: string): void {
+  refreshDisconnectedTurnCleanupWatcher(sessionId)
 }
 
 /** Test hook: arm the prewarm idle timer for a session, as markPrewarmed does. */
