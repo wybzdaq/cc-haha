@@ -782,13 +782,27 @@ function Run-SelfTest {
     }
     Assert-SelfTest -Condition $volumeAliasFailed -Message 'extended volume alias did not fail closed'
 
-    $shortAliasFailed = $false
+    $possibleShortAliasFailed = $false
     try {
-      Resolve-CanonicalPath -Path (Join-Path ([IO.Path]::GetPathRoot($testRoot)) 'PROGRA~1') | Out-Null
+      Resolve-CanonicalPath -Path (Join-Path $testRoot 'MISSIN~1') | Out-Null
     } catch {
-      $shortAliasFailed = $_.Exception.Message.Contains('8.3 path alias')
+      $possibleShortAliasFailed = $_.Exception.Message.Contains('8.3 path alias')
     }
-    Assert-SelfTest -Condition $shortAliasFailed -Message 'possible 8.3 alias did not fail closed'
+    Assert-SelfTest -Condition $possibleShortAliasFailed -Message 'possible 8.3 alias did not fail closed'
+
+    $existingShortAlias = Join-Path ([IO.Path]::GetPathRoot($testRoot)) 'PROGRA~1'
+    if ([IO.Directory]::Exists($existingShortAlias) -or [IO.File]::Exists($existingShortAlias)) {
+      $existingShortAliasFailed = $false
+      try {
+        Resolve-CanonicalPath -Path $existingShortAlias | Out-Null
+      } catch {
+        $existingShortAliasFailed = (
+          $_.Exception.Message.Contains('Alternate path alias') -or
+          $_.Exception.Message.Contains('8.3 path alias')
+        )
+      }
+      Assert-SelfTest -Condition $existingShortAliasFailed -Message 'existing 8.3 alias did not fail closed'
+    }
 
     $legalTildePath = Join-Path $testRoot 'project~notes'
     New-Item -ItemType Directory -Path $legalTildePath | Out-Null
