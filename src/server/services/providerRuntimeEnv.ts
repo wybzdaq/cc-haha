@@ -29,12 +29,15 @@ import {
   isGrokOfficialProviderId,
 } from './grokOfficialProvider.js'
 
+export const DISABLE_OFFICIAL_CLAUDE_ENV_KEY = 'CLAUDE_CODE_DISABLE_OFFICIAL_CLAUDE'
+
 export const MANAGED_PROVIDER_ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ENABLE_TOOL_SEARCH',
   'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
+  DISABLE_OFFICIAL_CLAUDE_ENV_KEY,
   'ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
@@ -378,6 +381,7 @@ export function buildProviderManagedEnv(
     ...(provider.disableExperimentalBetas === true && {
       CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     }),
+    [DISABLE_OFFICIAL_CLAUDE_ENV_KEY]: '1',
     ANTHROPIC_BASE_URL: baseUrl,
     ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
     ANTHROPIC_MODEL: runtimeModels.main,
@@ -443,7 +447,10 @@ export function mergeActiveProviderManagedEnv(
 ): Record<string, string> {
   const activeProviderEnv = readActiveProviderManagedEnv(configDir, options)
   if (!activeProviderEnv) {
-    return settingsEnv
+    return {
+      ...settingsEnv,
+      [DISABLE_OFFICIAL_CLAUDE_ENV_KEY]: settingsEnv[DISABLE_OFFICIAL_CLAUDE_ENV_KEY] || '1',
+    }
   }
 
   const cleanedEnv = { ...settingsEnv }

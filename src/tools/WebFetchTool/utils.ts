@@ -12,6 +12,7 @@ import {
   isBinaryContentType,
   persistBinaryContent,
 } from '../../utils/mcpOutputStorage.js'
+import { isEssentialTrafficOnly } from '../../utils/privacyLevel.js'
 import { getSettings_DEPRECATED } from '../../utils/settings/settings.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { isPreapprovedHost } from './preapproved.js'
@@ -80,6 +81,10 @@ const DOMAIN_CHECK_CACHE = new LRUCache<string, true>({
 export function shouldSkipWebFetchPreflight(
   settings: { skipWebFetchPreflight?: boolean } = getSettings_DEPRECATED(),
 ): boolean {
+  if (isEssentialTrafficOnly()) {
+    return true
+  }
+
   if (settings.skipWebFetchPreflight !== undefined) {
     return settings.skipWebFetchPreflight
   }

@@ -36,6 +36,10 @@ export function isEnvTruthy(envVar: string | boolean | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(normalizedValue)
 }
 
+export function isOfficialClaudeDisabled(): boolean {
+  return isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_OFFICIAL_CLAUDE)
+}
+
 export function isEnvDefinedFalsy(
   envVar: string | boolean | undefined,
 ): boolean {

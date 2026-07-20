@@ -53,6 +53,7 @@ import {
   getClaudeConfigHomeDir,
   isBareMode,
   isEnvTruthy,
+  isOfficialClaudeDisabled,
   isRunningOnHomespace,
 } from './envUtils.js'
 import { errorMessage } from './errors.js'
@@ -101,6 +102,7 @@ function isManagedOAuthContext(): boolean {
 export function isAnthropicAuthEnabled(): boolean {
   // --bare: API-key-only, never OAuth.
   if (isBareMode()) return false
+  if (isOfficialClaudeDisabled()) return false
 
   // `claude ssh` remote: ANTHROPIC_UNIX_SOCKET tunnels API calls through a
   // local auth-injecting proxy. The launcher sets CLAUDE_CODE_OAUTH_TOKEN as a

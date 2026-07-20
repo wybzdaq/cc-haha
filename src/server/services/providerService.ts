@@ -34,6 +34,7 @@ import {
 import {
   buildProviderAuthEnv,
   buildProviderManagedEnv,
+  DISABLE_OFFICIAL_CLAUDE_ENV_KEY,
   getManagedEnvKeys,
   getPresetAuthStrategy,
   getPresetDefaultEnv,
@@ -418,9 +419,12 @@ export class ProviderService {
       }
 
       if (Object.keys(env).length === 0) {
-        delete nextSettings.env
+        nextSettings.env = { [DISABLE_OFFICIAL_CLAUDE_ENV_KEY]: '1' }
       } else {
-        nextSettings.env = env
+        nextSettings.env = {
+          ...env,
+          [DISABLE_OFFICIAL_CLAUDE_ENV_KEY]: env[DISABLE_OFFICIAL_CLAUDE_ENV_KEY] || '1',
+        }
       }
 
       return {

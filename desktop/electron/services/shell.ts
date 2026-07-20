@@ -4,6 +4,11 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ALLOWED_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:'])
+const CLAUDE_EXTERNAL_HOST_SUFFIXES = [
+  'anthropic.com',
+  'claude.ai',
+  'claude.com',
+]
 const ALLOWED_SYSTEM_SETTINGS_URLS = new Set([
   'ms-settings:notifications',
   'x-apple.systempreferences:com.apple.preference.notifications',
@@ -31,7 +36,18 @@ export function normalizeExternalUrl(target: string): string {
   if (!ALLOWED_EXTERNAL_PROTOCOLS.has(url.protocol)) {
     throw new Error(`Unsupported external URL scheme: ${url.protocol}`)
   }
+  if (isNonessentialClaudeExternalUrlBlocked(url)) {
+    throw new Error('Claude/Anthropic external URLs are disabled by CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')
+  }
   return url.toString()
+}
+
+function isNonessentialClaudeExternalUrlBlocked(url: URL) {
+  if (!process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC) return false
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+  return CLAUDE_EXTERNAL_HOST_SUFFIXES.some(
+    (host) => url.hostname === host || url.hostname.endsWith(`.${host}`),
+  )
 }
 
 /**

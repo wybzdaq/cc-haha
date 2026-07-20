@@ -17,6 +17,7 @@ import { logEvent } from '../../services/analytics/index.js'
 import { logForDebugging } from '../debug.js'
 import { parseZipModes, unzipFile } from '../dxt/zip.js'
 import { errorMessage, getErrnoCode } from '../errors.js'
+import { isEssentialTrafficOnly } from '../privacyLevel.js'
 
 type SafeString = AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
 
@@ -60,6 +61,13 @@ export async function fetchOfficialMarketplaceFromGcs(
     logForDebugging(
       `fetchOfficialMarketplaceFromGcs: refusing path outside cache dir: ${installLocation}`,
       { level: 'error' },
+    )
+    return null
+  }
+
+  if (isEssentialTrafficOnly()) {
+    logForDebugging(
+      'fetchOfficialMarketplaceFromGcs: skipping because nonessential traffic is disabled',
     )
     return null
   }

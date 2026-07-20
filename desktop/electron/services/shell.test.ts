@@ -1,15 +1,28 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expandTildePath, normalizeExternalUrl, normalizeOpenPath, normalizeSystemSettingsUrl } from './shell'
 
 describe('Electron shell service', () => {
+  afterEach(() => {
+    delete process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  })
+
   it('allows only explicit external URL schemes', () => {
     expect(normalizeExternalUrl('https://example.com/path')).toBe('https://example.com/path')
     expect(normalizeExternalUrl('mailto:support@example.com')).toBe('mailto:support@example.com')
     expect(() => normalizeExternalUrl('file:///tmp/report.md')).toThrow('Unsupported external URL scheme')
     expect(() => normalizeExternalUrl('/tmp/report.md')).toThrow('absolute URLs')
+  })
+
+  it('blocks Claude and Anthropic external URLs when nonessential traffic is disabled', () => {
+    process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+
+    expect(() => normalizeExternalUrl('https://claude.ai/settings')).toThrow('Claude/Anthropic external URLs')
+    expect(() => normalizeExternalUrl('https://code.claude.com/docs/en/overview')).toThrow('Claude/Anthropic external URLs')
+    expect(() => normalizeExternalUrl('https://www.anthropic.com/news')).toThrow('Claude/Anthropic external URLs')
+    expect(normalizeExternalUrl('https://example.com/path')).toBe('https://example.com/path')
   })
 
   it('allows only existing non-executable file-system paths for openPath', () => {

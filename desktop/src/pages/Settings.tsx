@@ -50,15 +50,6 @@ import { TraceList } from './TraceList'
 import { ActivitySettings } from './ActivitySettings'
 import { MemorySettings } from './MemorySettings'
 import { useUIStore } from '../stores/uiStore'
-import { ClaudeOfficialLogin } from '../components/settings/ClaudeOfficialLogin'
-import { ChatGPTOfficialLogin } from '../components/settings/ChatGPTOfficialLogin'
-import { GrokOfficialLogin } from '../components/settings/GrokOfficialLogin'
-import {
-  BUILT_IN_PROVIDER_IDS,
-  CLAUDE_OFFICIAL_PROVIDER_ID,
-  OPENAI_OFFICIAL_PROVIDER_ID,
-} from '../constants/openaiOfficialProvider'
-import { GROK_OFFICIAL_PROVIDER_ID } from '../constants/grokOfficialProvider'
 import { useUpdateStore } from '../stores/updateStore'
 import { getBaseUrl } from '../api/client'
 import { formatBytes } from '../lib/formatBytes'
@@ -279,16 +270,10 @@ function TabButton({ icon, label, active, onClick }: { icon: string; label: stri
 // ─── Provider Settings ──────────────────────────────────────
 
 type ProviderListItem =
-  | { id: typeof CLAUDE_OFFICIAL_PROVIDER_ID; kind: 'claude-official' }
-  | { id: typeof OPENAI_OFFICIAL_PROVIDER_ID; kind: 'openai-official' }
-  | { id: typeof GROK_OFFICIAL_PROVIDER_ID; kind: 'grok-official' }
-  | { id: string; kind: 'saved'; provider: SavedProvider }
+  { id: string; kind: 'saved'; provider: SavedProvider }
 
 function defaultProviderOrder(providers: SavedProvider[]): string[] {
-  return [
-    ...providers.map((provider) => provider.id),
-    ...BUILT_IN_PROVIDER_IDS,
-  ]
+  return providers.map((provider) => provider.id)
 }
 
 function normalizeProviderOrder(providerOrder: string[] | undefined, providers: SavedProvider[]): string[] {
@@ -325,29 +310,14 @@ function buildProviderListItems(
       { id: provider.id, kind: 'saved', provider } satisfies ProviderListItem,
     ]),
   )
-  const items = new Map<string, ProviderListItem>([
-    [CLAUDE_OFFICIAL_PROVIDER_ID, { id: CLAUDE_OFFICIAL_PROVIDER_ID, kind: 'claude-official' }],
-    [OPENAI_OFFICIAL_PROVIDER_ID, { id: OPENAI_OFFICIAL_PROVIDER_ID, kind: 'openai-official' }],
-    [GROK_OFFICIAL_PROVIDER_ID, { id: GROK_OFFICIAL_PROVIDER_ID, kind: 'grok-official' }],
-    ...savedItems,
-  ])
 
   return normalizeProviderOrder(providerOrder, providers)
-    .map((id) => items.get(id))
+    .map((id) => savedItems.get(id))
     .filter((item): item is ProviderListItem => item !== undefined)
 }
 
 function providerItemTestId(item: ProviderListItem): string {
-  switch (item.kind) {
-    case 'claude-official':
-      return 'claude-official-provider'
-    case 'openai-official':
-      return 'openai-official-provider'
-    case 'grok-official':
-      return 'grok-official-provider'
-    case 'saved':
-      return `provider-${item.provider.id}`
-  }
+  return `provider-${item.provider.id}`
 }
 
 function ProviderSettings() {
@@ -355,7 +325,6 @@ function ProviderSettings() {
     providers,
     providerOrder,
     activeId,
-    hasLoadedProviders,
     presets,
     isLoading,
     isPresetsLoading,
@@ -364,7 +333,6 @@ function ProviderSettings() {
     deleteProvider,
     reorderProviders,
     activateProvider,
-    activateOfficial,
     testProvider,
   } = useProviderStore()
   const fetchSettings = useSettingsStore((s) => s.fetchAll)
@@ -426,11 +394,6 @@ function ProviderSettings() {
     await fetchSettings()
   }
 
-  const handleActivateOfficial = async () => {
-    await activateOfficial()
-    await fetchSettings()
-  }
-
   const providerItems = useMemo(
     () => buildProviderListItems(providers, providerOrder),
     [providerOrder, providers],
@@ -447,10 +410,6 @@ function ProviderSettings() {
 
     void reorderProviders(arrayMove(ids, oldIndex, newIndex))
   }
-
-  const isClaudeOfficialActive = hasLoadedProviders && activeId === null
-  const isOpenAIOfficialActive = hasLoadedProviders && activeId === OPENAI_OFFICIAL_PROVIDER_ID
-  const isGrokOfficialActive = hasLoadedProviders && activeId === GROK_OFFICIAL_PROVIDER_ID
 
   return (
     <div className="max-w-2xl">
@@ -476,72 +435,6 @@ function ProviderSettings() {
         >
           <div className="flex flex-col gap-2">
             {providerItems.map((item) => {
-              if (item.kind === 'claude-official') {
-                return (
-                  <SortableProviderCard
-                    key={item.id}
-                    item={item}
-                    isActive={isClaudeOfficialActive}
-                    dragLabel={t('settings.providers.dragToReorder')}
-                    onActivate={!isClaudeOfficialActive ? handleActivateOfficial : undefined}
-                    title={t('settings.providers.officialName')}
-                    subtitle={t('settings.providers.officialDesc')}
-                    badges={isClaudeOfficialActive ? (
-                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
-                    ) : null}
-                    details={isClaudeOfficialActive ? (
-                      <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
-                        <ClaudeOfficialLogin />
-                      </div>
-                    ) : null}
-                  />
-                )
-              }
-
-              if (item.kind === 'openai-official') {
-                return (
-                  <SortableProviderCard
-                    key={item.id}
-                    item={item}
-                    isActive={isOpenAIOfficialActive}
-                    dragLabel={t('settings.providers.dragToReorder')}
-                    onActivate={!isOpenAIOfficialActive ? () => handleActivate(OPENAI_OFFICIAL_PROVIDER_ID) : undefined}
-                    title={t('settings.providers.openaiOfficialName')}
-                    subtitle={t('settings.providers.openaiOfficialDesc')}
-                    badges={isOpenAIOfficialActive ? (
-                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
-                    ) : null}
-                    details={isOpenAIOfficialActive ? (
-                      <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
-                        <ChatGPTOfficialLogin />
-                      </div>
-                    ) : null}
-                  />
-                )
-              }
-
-              if (item.kind === 'grok-official') {
-                return (
-                  <SortableProviderCard
-                    key={item.id}
-                    item={item}
-                    isActive={isGrokOfficialActive}
-                    dragLabel={t('settings.providers.dragToReorder')}
-                    onActivate={!isGrokOfficialActive ? () => handleActivate(GROK_OFFICIAL_PROVIDER_ID) : undefined}
-                    title={t('settings.providers.grokOfficialName')}
-                    subtitle={t('settings.providers.grokOfficialDesc')}
-                    badges={isGrokOfficialActive ? (
-                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
-                    ) : null}
-                    details={isGrokOfficialActive ? (
-                      <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
-                        <GrokOfficialLogin />
-                      </div>
-                    ) : null}
-                  />
-                )
-              }
-
               const provider = item.provider
               const isActive = activeId === provider.id
               const test = testResults[provider.id]
@@ -751,6 +644,7 @@ function requirePreset(preset: ProviderPreset | undefined): ProviderPreset {
 const AUTO_COMPACT_WINDOW_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW'
 const MODEL_CONTEXT_WINDOWS_ENV_KEY = 'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS'
 const DISABLE_EXPERIMENTAL_BETAS_ENV_KEY = 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'
+const DISABLE_OFFICIAL_CLAUDE_ENV_KEY = 'CLAUDE_CODE_DISABLE_OFFICIAL_CLAUDE'
 const MODEL_CONTEXT_WINDOW_MIN = 16000
 const MODEL_CONTEXT_WINDOW_MAX = 10000000
 const MODEL_1M_CONTEXT_WINDOW = 1000000
@@ -1168,6 +1062,7 @@ function updateSettingsJsonProviderConnection(
     delete env.ANTHROPIC_AUTH_TOKEN
     applyToolSearchEnv(env, apiFormat, toolSearchEnabled)
     applyDisableExperimentalBetasEnv(env, disableExperimentalBetas)
+    env[DISABLE_OFFICIAL_CLAUDE_ENV_KEY] = '1'
     env.ANTHROPIC_BASE_URL = apiFormat !== 'anthropic' ? proxyBaseUrl : baseUrl
     Object.assign(env, buildSettingsJsonAuthEnv(apiFormat, authStrategy, apiKey, preset))
     parsed.env = env
@@ -1284,6 +1179,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
             ? { [MODEL_CONTEXT_WINDOWS_ENV_KEY]: JSON.stringify(modelContextWindows) }
             : {}),
           ANTHROPIC_BASE_URL: needsProxy ? providerProxyBaseUrl : baseUrl,
+          [DISABLE_OFFICIAL_CLAUDE_ENV_KEY]: '1',
           ...buildSettingsJsonAuthEnv(apiFormat, authStrategy, apiKey, selectedPreset),
           ANTHROPIC_MODEL: runtimeModels.main,
           ANTHROPIC_DEFAULT_HAIKU_MODEL: runtimeModels.haiku,

@@ -1600,55 +1600,47 @@ describe('Settings > Providers tab', () => {
     expect(screen.queryByTestId('chatgpt-official-login')).not.toBeInTheDocument()
   })
 
-  it('shows official OAuth status only after official provider is confirmed active', () => {
+  it('keeps Claude official OAuth hidden after providers finish loading', () => {
     providerStoreState.providers = []
     providerStoreState.activeId = null
     providerStoreState.hasLoadedProviders = true
 
     render(<Settings />)
 
-    expect(screen.getByTestId('claude-official-login')).toBeInTheDocument()
+    expect(screen.queryByTestId('claude-official-login')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('claude-official-provider')).not.toBeInTheDocument()
   })
 
-  it('shows ChatGPT Official as the active built-in provider', () => {
+  it('keeps ChatGPT official provider hidden even when persisted as active', () => {
     providerStoreState.providers = []
     providerStoreState.activeId = 'openai-official'
     providerStoreState.hasLoadedProviders = true
 
     render(<Settings />)
 
-    const openAIProvider = screen.getByTestId('openai-official-provider')
-    expect(within(openAIProvider).getByText('ChatGPT Official')).toBeInTheDocument()
-    expect(within(openAIProvider).getByText('Default')).toBeInTheDocument()
-    expect(screen.getByTestId('chatgpt-official-login')).toBeInTheDocument()
+    expect(screen.queryByTestId('openai-official-provider')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('chatgpt-official-login')).not.toBeInTheDocument()
     expect(screen.queryByTestId('claude-official-login')).not.toBeInTheDocument()
   })
 
-  it('shows Grok Official as the active built-in provider', () => {
+  it('keeps Grok official provider hidden even when persisted as active', () => {
     providerStoreState.providers = []
     providerStoreState.activeId = 'grok-official'
 
     render(<Settings />)
 
-    const provider = screen.getByTestId('grok-official-provider')
-    expect(within(provider).getByText('Grok Official')).toBeInTheDocument()
-    expect(within(provider).getByText('Default')).toBeInTheDocument()
-    expect(screen.getByTestId('grok-official-login')).toBeInTheDocument()
+    expect(screen.queryByTestId('grok-official-provider')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('grok-official-login')).not.toBeInTheDocument()
   })
 
-  it('renders saved and official providers in the stored sortable order', () => {
+  it('renders saved providers in the stored sortable order', () => {
     providerStoreState.providerOrder = ['provider-1', 'openai-official', 'claude-official']
 
     render(<Settings />)
 
     const rows = screen.getAllByRole('button', { name: 'Drag to reorder' })
       .map((handle) => handle.closest('[data-testid]')?.getAttribute('data-testid'))
-    expect(rows).toEqual([
-      'provider-provider-1',
-      'openai-official-provider',
-      'claude-official-provider',
-      'grok-official-provider',
-    ])
+    expect(rows).toEqual(['provider-provider-1'])
   })
 
   it('falls back to the default provider order when stored order is missing', () => {
@@ -1658,12 +1650,7 @@ describe('Settings > Providers tab', () => {
 
     const rows = screen.getAllByRole('button', { name: 'Drag to reorder' })
       .map((handle) => handle.closest('[data-testid]')?.getAttribute('data-testid'))
-    expect(rows).toEqual([
-      'provider-provider-1',
-      'claude-official-provider',
-      'openai-official-provider',
-      'grok-official-provider',
-    ])
+    expect(rows).toEqual(['provider-provider-1'])
   })
 
   it('requires confirmation before deleting a provider', async () => {
